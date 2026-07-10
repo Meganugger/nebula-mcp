@@ -1,0 +1,53 @@
+[package]
+name = "nebula-mcp-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Nebula MCP server: a production, general-purpose autonomous software-engineering backend exposed over the Model Context Protocol (stdio and remote HTTP)."
+default-run = "nebula-mcp"
+
+[lib]
+name = "nebula_mcp_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nebula-mcp"
+path = "src/main.rs"
+
+[features]
+default = []
+# Forwards to nebula-mcp-core's OpenTelemetry export support.
+otel = ["nebula-mcp-core/otel"]
+
+[dependencies]
+nebula-mcp-protocol = { path = "../protocol" }
+nebula-mcp-core = { path = "../core" }
+nebula-mcp-tools = { path = "../tools" }
+
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+clap = { version = "4.5", features = ["derive", "env"] }
+dashmap = { workspace = true }
+uuid = { workspace = true }
+walkdir = { workspace = true }
+base64 = "0.22"
+notify = { workspace = true }
+notify-debouncer-mini = { workspace = true }
+
+# Remote HTTP (MCP Streamable HTTP) transport.
+axum = { version = "0.7", features = ["json", "tokio", "http1"] }
+async-stream = "0.3"
+futures = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }
+which = { workspace = true }
+reqwest = { workspace = true }

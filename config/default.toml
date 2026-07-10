@@ -1,0 +1,130 @@
+# Nebula MCP server configuration.
+#
+# This is a complete, documented example. Copy it, tighten the allowlists to
+# your environment, and launch with:
+#
+#     nebula-mcp run --config path/to/nebula-mcp.toml            # stdio
+#     nebula-mcp run --config path/to/nebula-mcp.toml --http     # remote URL
+#
+# Security note: the allowlists below are EMPTY-DENY by default. A tool can only
+# touch a path that matches `allowed_paths` (and not `denied_paths`), and can
+# only execute a program named in `allowed_commands`. There is no wildcard
+# "allow everything" switch by design.
+
+[server]
+# Advertised over the MCP `initialize` handshake.
+name = "nebula-mcp"
+# `version` defaults to the crate version; override only if you must.
+# version = "0.1.0"
+# Instructions surfaced to the model on initialize.
+instructions = "Nebula MCP: a general-purpose autonomous software-engineering backend for building, testing and shipping any program."
+# Maximum tool calls executed concurrently.
+max_concurrent_calls = 16
+
+[logging]
+# error | warn | info | debug | trace, or an env-filter directive such as
+# "nebula_mcp=debug,info".
+level = "info"
+# json | pretty. JSON is recommended for machine ingestion.
+format = "json"
+# Directory for rotating file logs. Comment out to log only to stderr.
+# directory = "C:\\ProgramData\\nebula-mcp\\logs"
+file_prefix = "nebula-mcp"
+# minutely | hourly | daily | never
+rotation = "daily"
+# OTLP/gRPC endpoint for OpenTelemetry trace export. Requires the `otel` build
+# feature; ignored (with a warning) otherwise.
+# otel_endpoint = "http://127.0.0.1:4317"
+emit_metrics = true
+
+# ---------------------------------------------------------------------------
+# Remote HTTP transport (MCP Streamable HTTP). Disabled by default. Enable it
+# to expose the server by a URL that you paste into an AI platform. Because
+# this grants a remote agent control of this machine (subject to the [security]
+# allowlists below), it is authenticated by default.
+# ---------------------------------------------------------------------------
+[transport.http]
+enabled = false
+# Bind loopback for same-machine use, or 0.0.0.0:<port> behind a TLS reverse
+# proxy / tunnel (ngrok, Cloudflare Tunnel, Tailscale Funnel, ...) to expose it.
+bind = "127.0.0.1:8765"
+# The single MCP endpoint path clients POST/GET against.
+path = "/mcp"
+# Bearer tokens accepted in `Authorization: Bearer <token>`. Prefer supplying
+# these via the NEBULA_MCP_AUTH_TOKEN env var or `--auth-token` rather than
+# committing them here.
+auth_tokens = []
+# Require a valid bearer token on every request. The server refuses to start on
+# a non-loopback bind with this set to false.
+require_auth = true
+# Exact-match Origin allow-list for browser clients (DNS-rebinding guard).
+# Leave empty for native (non-browser) clients that send no Origin header.
+allowed_origins = []
+# Maximum accepted request body size, in bytes (16 MiB).
+max_body_bytes = 16777216
+
+[security]
+# Glob patterns of paths tools may access. `**` spans path separators.
+# Examples: ["C:\\src\\**", "/home/me/projects/**"]
+allowed_paths = [
+    # "C:\\src\\**",
+    # "/home/me/projects/**",
+]
+# Patterns always denied, even if matched by allowed_paths. Sensible secret
+# patterns are denied out of the box; add your own.
+denied_paths = [
+    "**/.ssh/**",
+    "**/.aws/**",
+    "**/.gnupg/**",
+    "**/*.pem",
+    "**/*.key",
+    "**/id_rsa*",
+    "**/.env",
+]
+# Executables permitted for terminal/process tools. Matched by basename
+# (case-insensitive on Windows, `.exe` stripped). Examples:
+#   ["git", "cargo", "npm", "node", "python", "go", "docker", "powershell"]
+allowed_commands = [
+    # "git",
+    # "cargo",
+    # "npm",
+    # "node",
+    # "python",
+    # "go",
+    # "docker",
+]
+# Default per-call timeout in seconds.
+default_timeout_secs = 120
+# Absolute ceiling for any single call, in seconds.
+max_runtime_secs = 3600
+# Maximum captured output per stream, in bytes (8 MiB).
+max_output_bytes = 8388608
+# Whether tools may request elevated (admin) execution.
+allow_elevated = false
+# Whether tools that reach external networks are permitted.
+allow_network = true
+# Whether destructive operations (delete, reset --hard, container rm) are
+# permitted at all.
+allow_destructive = false
+
+# ---------------------------------------------------------------------------
+# Per-category enable switches. Disabling a category disables all of its tools.
+# Categories: filesystem, terminal, process, git, github, network, powershell,
+#             windows, diagnostics, browser, docker, scheduler, security
+# ---------------------------------------------------------------------------
+# [categories.powershell]
+# enabled = false
+
+# ---------------------------------------------------------------------------
+# Per-tool overrides. Any field is optional and layers on top of [security].
+# ---------------------------------------------------------------------------
+# [tools."git.push"]
+# enabled = true
+#
+# [tools."fs.delete"]
+# allow_destructive = true
+#
+# [tools."terminal.run"]
+# timeout_secs = 600
+# max_output_bytes = 16777216
+# allowed_commands = ["cargo", "npm"]
