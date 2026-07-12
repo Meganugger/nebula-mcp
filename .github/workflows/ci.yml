@@ -54,7 +54,23 @@ jobs:
       - name: Build
         run: cargo build --workspace
       - name: Test
-        run: cargo test --workspace
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --workspace 2>&1 | tee test-output.txt
+      # Surface the failure details as check annotations so contributors
+      # without a Windows machine can diagnose from the PR checks UI/API.
+      - name: Surface failing tests
+        if: failure()
+        shell: bash
+        run: |
+          if [ -f test-output.txt ]; then
+            summary=$(sed -n '/^failures:$/,$p' test-output.txt | head -c 3500)
+            detail=$(grep -E "^---- .* stdout ----$" -A 25 test-output.txt | head -c 3500)
+            encode() { printf '%s' "$1" | python3 -c 'import sys,urllib.parse; d=sys.stdin.read(); print(d.replace("%","%25").replace("\r","%0D").replace("\n","%0A"), end="")'; }
+            [ -n "$summary" ] && echo "::error title=Failing tests (summary)::$(encode "$summary")"
+            [ -n "$detail" ] && echo "::error title=Failing tests (detail)::$(encode "$detail")"
+          fi
 
   stress:
     name: Stress/soak — thousands of concurrent calls, both transports
