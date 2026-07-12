@@ -12,7 +12,14 @@ use tokio_util::sync::CancellationToken;
 /// Build a server with a permissive-but-bounded policy for tests.
 fn make_server(cancel: CancellationToken) -> Arc<Server> {
     let mut config = Config::default();
-    config.security.allowed_paths = vec!["/tmp/**".into(), "/tmp".into()];
+    // Allow the platform temp dir (the test workspace root): `/tmp` on Unix,
+    // `C:\Users\...\Temp` on Windows. Globs use forward slashes everywhere.
+    let tmp = std::env::temp_dir()
+        .display()
+        .to_string()
+        .replace('\\', "/");
+    let tmp = tmp.trim_end_matches('/').to_string();
+    config.security.allowed_paths = vec![format!("{tmp}/**"), tmp];
     config.security.allowed_commands = vec!["echo".into(), "sleep".into()];
     config.security.default_timeout_secs = 30;
     config.security.max_runtime_secs = 60;
