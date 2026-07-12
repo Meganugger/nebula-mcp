@@ -72,6 +72,12 @@ pub struct HttpConfig {
     pub allowed_origins: Vec<String>,
     /// Maximum accepted request body size, in bytes (DoS guard).
     pub max_body_bytes: usize,
+    /// Seconds between keep-alive comment lines written on the `GET` SSE
+    /// stream. An idle SSE response carries zero bytes of traffic, so tunnels
+    /// and proxies (ngrok, Cloudflare Tunnel, NATs) silently reap it after
+    /// their idle timeout; the heartbeat keeps the connection warm. Set to `0`
+    /// to disable.
+    pub sse_keep_alive_secs: u64,
 }
 
 impl Default for HttpConfig {
@@ -84,6 +90,7 @@ impl Default for HttpConfig {
             require_auth: true,
             allowed_origins: Vec::new(),
             max_body_bytes: 16 * 1024 * 1024,
+            sse_keep_alive_secs: 20,
         }
     }
 }

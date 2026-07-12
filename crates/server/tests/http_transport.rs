@@ -16,6 +16,11 @@ const TOKEN: &str = "test-secret-token";
 
 /// Spawn the HTTP transport on an ephemeral port; return (base_url, cancel).
 async fn spawn_http() -> (String, CancellationToken) {
+    spawn_http_with_keep_alive(20).await
+}
+
+/// Spawn the HTTP transport with a custom SSE keep-alive interval (seconds).
+async fn spawn_http_with_keep_alive(sse_keep_alive_secs: u64) -> (String, CancellationToken) {
     let mut config = Config::default();
     config.security.allowed_commands = vec!["echo".into()];
     config.security.allowed_paths = vec!["/tmp/**".into()];
@@ -38,6 +43,7 @@ async fn spawn_http() -> (String, CancellationToken) {
         require_auth: true,
         allowed_origins: vec![],
         max_body_bytes: 1024 * 1024,
+        sse_keep_alive_secs,
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -53,6 +59,32 @@ async fn spawn_http() -> (String, CancellationToken) {
 
 fn client() -> reqwest::Client {
     reqwest::Client::new()
+}
+
+/// Append chunks from an open SSE response into `buf` until `pred(buf)` holds.
+/// Panics (failing the test) if the stream ends or 15 s pass first.
+async fn read_sse_until(
+    resp: &mut reqwest::Response,
+    buf: &mut String,
+    what: &str,
+    pred: impl Fn(&str) -> bool,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !pred(buf) {
+        let now = std::time::Instant::now();
+        assert!(
+            now < deadline,
+            "timed out waiting for {what}; stream so far: {buf:?}"
+        );
+        let chunk = tokio::time::timeout(deadline - now, resp.chunk())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {what}; stream so far: {buf:?}"))
+            .expect("SSE read failed");
+        match chunk {
+            Some(bytes) => buf.push_str(&String::from_utf8_lossy(&bytes)),
+            None => panic!("SSE stream ended while waiting for {what}; stream so far: {buf:?}"),
+        }
+    }
 }
 
 #[tokio::test]
@@ -140,6 +172,86 @@ async fn notification_is_accepted_with_202() {
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::ACCEPTED);
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn sse_get_requires_token() {
+    let (url, cancel) = spawn_http().await;
+    let resp = client().get(&url).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn sse_stream_emits_periodic_keep_alive_comments() {
+    let (url, cancel) = spawn_http_with_keep_alive(1).await;
+    let mut resp = client().get(&url).bearer_auth(TOKEN).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let content_type = resp.headers()[reqwest::header::CONTENT_TYPE]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "unexpected content-type: {content_type}"
+    );
+
+    // Multiple heartbeats must arrive on an otherwise-idle stream (the first
+    // immediately on connect, then one per configured interval).
+    let mut buf = String::new();
+    read_sse_until(&mut resp, &mut buf, "two keep-alive comments", |b| {
+        b.matches(": keep-alive").count() >= 2
+    })
+    .await;
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn sse_keep_alive_interleaves_with_real_notifications() {
+    let (url, cancel) = spawn_http_with_keep_alive(1).await;
+    let mut resp = client().get(&url).bearer_auth(TOKEN).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // First heartbeat proves the SSE subscription is live before we trigger work.
+    let mut buf = String::new();
+    read_sse_until(&mut resp, &mut buf, "initial keep-alive", |b| {
+        b.contains(": keep-alive")
+    })
+    .await;
+
+    // A tool call carrying a progress token emits `notifications/progress`
+    // frames onto the same stream.
+    let call: Value = client()
+        .post(&url)
+        .bearer_auth(TOKEN)
+        .json(&json!({
+            "jsonrpc":"2.0","id":7,"method":"tools/call",
+            "params":{
+                "name":"terminal.run",
+                "arguments":{"program":"echo","args":["sse-interleave"]},
+                "_meta":{"progressToken":"sse-test"}
+            }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(call["result"]["isError"], false);
+
+    // The real notification arrives as an SSE data event...
+    read_sse_until(&mut resp, &mut buf, "a progress notification", |b| {
+        b.contains("notifications/progress")
+    })
+    .await;
+    // ...and heartbeats keep flowing after real traffic.
+    let seen = buf.matches(": keep-alive").count();
+    read_sse_until(&mut resp, &mut buf, "keep-alive after real traffic", |b| {
+        b.matches(": keep-alive").count() > seen
+    })
+    .await;
     cancel.cancel();
 }
 

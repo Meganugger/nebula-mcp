@@ -9,7 +9,8 @@
 //!   notifications/responses is acknowledged with `202 Accepted`.
 //! * `GET` — opens a `text/event-stream` (SSE) channel that carries
 //!   server-initiated notifications (progress, resource updates) plus periodic
-//!   keep-alives.
+//!   keep-alive comments (interval set by `transport.http.sse_keep_alive_secs`)
+//!   so idle streams are not silently reaped by tunnels/proxies/NATs.
 //! * `DELETE` — ends the client session (best-effort; the engine is stateless
 //!   across requests, so this is a no-op acknowledgement).
 //!
@@ -31,11 +32,12 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, HeaderMap, StatusCode};
-use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response as AxumResponse};
 use axum::routing::post;
 use axum::{Json, Router};
@@ -256,24 +258,62 @@ async fn handle_post(
 }
 
 /// Handle a `GET`: open an SSE stream of server-initiated notifications.
+///
+/// The stream interleaves two kinds of writes:
+///
+/// * real JSON-RPC notifications fanned out from the engine, and
+/// * periodic keep-alive comment lines (`: keep-alive`), sent whenever the
+///   stream has been idle for `transport.http.sse_keep_alive_secs` seconds.
+///
+/// The heartbeat exists because an idle SSE response produces zero bytes of
+/// traffic, and intermediaries on the path (ngrok / Cloudflare tunnels,
+/// reverse proxies, NAT tables) reap connections that carry no data once
+/// their idle timeout fires — silently, with no error surfaced to either
+/// end. SSE comments are ignored by conforming clients, so the heartbeat is
+/// invisible to the MCP layer while keeping bytes flowing on the wire.
+///
+/// The heartbeat timer lives inside the stream itself (no spawned task), so
+/// it is dropped — and thereby cancelled — as soon as the client disconnects
+/// and hyper drops the response body. Nothing leaks per connection.
 async fn handle_get(State(state): State<Arc<HttpState>>, headers: HeaderMap) -> AxumResponse {
     if let Some(rejected) = authorize(&state, &headers) {
         return rejected;
     }
     let rx = state.notifications.subscribe();
+    let keep_alive_secs = state.config.sse_keep_alive_secs;
     let stream = async_stream::stream! {
         let mut rx = rx;
+        let heartbeat_enabled = keep_alive_secs > 0;
+        // `tokio::time::interval` panics on a zero period; when the heartbeat
+        // is disabled its select branch is never polled, so the clamped
+        // placeholder period is irrelevant.
+        let mut heartbeat =
+            tokio::time::interval(Duration::from_secs(keep_alive_secs.max(1)));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            match rx.recv().await {
-                Ok(line) => yield Ok::<Event, std::convert::Infallible>(Event::default().data(line)),
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
+            // Both `broadcast::Receiver::recv` and `Interval::tick` are
+            // cancel-safe, so losing the select race never drops a message.
+            tokio::select! {
+                msg = rx.recv() => match msg {
+                    Ok(line) => {
+                        // Real traffic proves liveness: push the next
+                        // heartbeat a full period out.
+                        heartbeat.reset();
+                        yield Ok::<Event, std::convert::Infallible>(Event::default().data(line));
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+                // Note: the first tick completes immediately, so a comment is
+                // written as soon as the stream opens — a cheap "stream
+                // established" signal through every intermediary.
+                _ = heartbeat.tick(), if heartbeat_enabled => {
+                    yield Ok::<Event, std::convert::Infallible>(Event::default().comment("keep-alive"));
+                }
             }
         }
     };
-    Sse::new(stream)
-        .keep_alive(KeepAlive::default())
-        .into_response()
+    Sse::new(stream).into_response()
 }
 
 /// Handle a `DELETE`: acknowledge session teardown.

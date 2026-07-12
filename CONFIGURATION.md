@@ -123,6 +123,7 @@ Remote HTTP (MCP Streamable HTTP) transport. Disabled by default.
 | `require_auth` | bool | `true` | Require a valid token on every request. |
 | `allowed_origins` | [string] | `[]` | Exact-match Origin allow-list (browser clients). |
 | `max_body_bytes` | int | `16777216` | Max accepted request body size. |
+| `sse_keep_alive_secs` | int | `20` | Seconds between keep-alive comments on the `GET` SSE stream, so idle streams survive tunnel/proxy/NAT idle timeouts. `0` disables. |
 
 ```toml
 [transport.http]
