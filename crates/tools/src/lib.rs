@@ -2,9 +2,10 @@
 //!
 //! Concrete MCP tool implementations for the Nebula MCP server, grouped by
 //! category. Cross-platform categories (filesystem, terminal, process, git,
-//! github, network, docker, scheduler, security, browser) work everywhere;
-//! Windows categories (powershell, windows, diagnostics) compile everywhere but
-//! return [`nebula_mcp_core::ToolError::PlatformUnsupported`] off Windows.
+//! github, network, docker, scheduler, security, browser, toolchain) work
+//! everywhere; Windows categories (powershell, windows, diagnostics) compile
+//! everywhere but return [`nebula_mcp_core::ToolError::PlatformUnsupported`]
+//! off Windows, and the unix category does the same off Linux/macOS.
 //!
 //! All tools are constructed once and share a small set of stateful services
 //! via [`ToolServices`].
@@ -24,6 +25,8 @@ pub mod process;
 pub mod scheduler;
 pub mod security;
 pub mod terminal;
+pub mod toolchain;
+pub mod unix;
 pub mod windows;
 
 use std::sync::Arc;
@@ -82,12 +85,14 @@ pub fn all_tools(services: &ToolServices) -> Vec<Arc<dyn Tool>> {
     let mut v: Vec<Arc<dyn Tool>> = Vec::new();
     v.extend(filesystem::tools());
     v.extend(terminal::tools(services));
+    v.extend(toolchain::tools());
     v.extend(process::tools());
     v.extend(git::tools());
     v.extend(github::tools(services));
     v.extend(network::tools(services));
     v.extend(powershell::tools());
     v.extend(windows::tools());
+    v.extend(unix::tools());
     v.extend(diagnostics::tools());
     v.extend(browser::tools());
     v.extend(docker::tools());

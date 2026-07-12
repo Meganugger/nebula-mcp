@@ -23,14 +23,35 @@ A single endpoint (default `/mcp`):
 - **`POST /mcp`** — body is one JSON-RPC message or an array of them. Requests
   are answered with `Content-Type: application/json` (a single object, or an
   array for a batch); a body of only notifications is acknowledged with
-  `202 Accepted`. Responses carry an `Mcp-Session-Id` header.
+  `202 Accepted`.
 - **`GET /mcp`** — opens a `text/event-stream` (SSE) carrying server-initiated
-  notifications (progress, resource updates) plus keep-alives.
-- **`DELETE /mcp`** — ends the session.
+  notifications (progress, resource updates) plus keep-alives. Every event
+  carries a monotonically increasing SSE `id:`; see *Resumable SSE* below.
+- **`DELETE /mcp`** — ends the session named by the `Mcp-Session-Id` header
+  (`404` if unknown/expired).
 
-Every request must present `Authorization: Bearer <token>` unless auth is
-explicitly disabled on a loopback bind. Malformed JSON yields `400` with a
-JSON-RPC parse-error body; a bad/absent token yields `401`.
+Every request must present `Authorization: Bearer <token>` — a configured
+static token or, when `[transport.http.oauth]` is enabled, any token the
+authorization server reports active (RFC 7662 introspection) with the required
+scopes — unless auth is explicitly disabled on a loopback bind. Malformed JSON
+yields `400` with a JSON-RPC parse-error body; a bad/absent token yields `401`.
+
+#### Sessions
+
+The response to a `POST` containing `initialize` includes an
+`Mcp-Session-Id` header. Include that header on subsequent requests: the
+server tracks per-session state and echoes the id back. A request presenting
+an unknown or expired id (idle longer than `session_idle_secs`, default
+1800 s) is answered `404 Not Found` — re-initialize to obtain a fresh session.
+Requests without the header are served statelessly for backwards
+compatibility.
+
+#### Resumable SSE
+
+Each SSE event carries an `id:` field. If the stream drops, reconnect with the
+standard `Last-Event-ID` header; the server replays every buffered event with
+a greater id (bounded by `sse_replay_events`, default 256) before resuming
+live delivery, so no notification is lost across brief disconnects.
 
 The method set, parameters and results below are identical across both
 transports.
@@ -92,10 +113,14 @@ Result (`CallToolResult`):
 ```json
 {"jsonrpc":"2.0","id":3,"result":{
   "content":[{"type":"text","text":"{ ...json... }"}],
+  "structuredContent":{ "...": "typed JSON mirroring the text block" },
   "isError":false}}
 ```
 
-Most tools return a single `text` content block containing a JSON document.
+Most tools return a single `text` content block containing a pretty-printed
+JSON document, plus the same value verbatim as `structuredContent` for
+schema-aware clients. Error results carry
+`structuredContent: {"error": {"category", "message"}}`.
 `browser.screenshot` and similar write artifacts to disk and return their paths.
 
 ### `ping`
@@ -207,15 +232,20 @@ Two distinct failure channels:
    | `-32601` | Method not found / unknown or disabled tool |
    | `-32602` | Invalid params (unparseable `tools/call` params) |
    | `-32603` | Internal error |
+   | `-32003` | Rate limit / resource budget rejection (retryable) |
 
 2. **Tool execution errors** — returned as a *successful* JSON-RPC response
    whose `result` is a `CallToolResult` with `isError: true` and a text block of
-   the form `"[<category>] <message>"`. This lets the model read and react to
-   failures. Categories include:
+   the form `"[<category>] <message>"` (mirrored in `structuredContent.error`).
+   This lets the model read and react to failures. Categories include:
 
    `invalid_arguments`, `permission_denied`, `path_not_allowed`,
-   `command_not_allowed`, `timeout`, `cancelled`, `output_too_large`,
-   `tool_not_found`, `platform_unsupported`, `io`, `execution`, `internal`.
+   `command_not_allowed`, `timeout`, `cancelled`, `rate_limited`,
+   `resource_exhausted`, `output_too_large`, `tool_not_found`,
+   `platform_unsupported`, `io`, `execution`, `internal`.
+
+   `rate_limited` and `resource_exhausted` are retryable: back off and retry
+   once the window slides or the server's usage drops under budget.
 
 ## Example session
 

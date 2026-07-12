@@ -62,6 +62,23 @@ require_auth = true
 allowed_origins = []
 # Maximum accepted request body size, in bytes (16 MiB).
 max_body_bytes = 16777216
+# Seconds an MCP session (minted on `initialize`, echoed via the
+# Mcp-Session-Id header) may sit idle before it is expired.
+session_idle_secs = 1800
+# Server-initiated SSE events retained for `Last-Event-ID` resumption.
+sse_replay_events = 256
+
+# OAuth2 bearer validation (RFC 7662 token introspection) in addition to the
+# static auth_tokens above. A presented token that matches no static token is
+# introspected at the authorization server; it is accepted when reported
+# active and carrying every required scope. Verdicts are cached briefly.
+[transport.http.oauth]
+enabled = false
+# introspection_url = "https://auth.example.com/oauth2/introspect"
+# client_id = "nebula-mcp"
+# client_secret = "..."          # prefer an env-substituted secret store
+# required_scopes = ["mcp"]
+# cache_secs = 60
 
 [security]
 # Glob patterns of paths tools may access. `**` spans path separators.
@@ -106,11 +123,19 @@ allow_network = true
 # Whether destructive operations (delete, reset --hard, container rm) are
 # permitted at all.
 allow_destructive = false
+# Per-tool rate limit in calls per minute (sliding window). Unset = unlimited.
+# Override per tool with [tools."<name>"] rate_limit_per_minute (0 = unlimited).
+# rate_limit_per_minute = 120
+# Global resource budget: reject new calls (retryably) while the server
+# process exceeds these bounds. Unset = no budget.
+# max_memory_bytes = 2147483648   # 2 GiB resident memory
+# max_cpu_percent = 400.0         # four full cores
 
 # ---------------------------------------------------------------------------
 # Per-category enable switches. Disabling a category disables all of its tools.
-# Categories: filesystem, terminal, process, git, github, network, powershell,
-#             windows, diagnostics, browser, docker, scheduler, security
+# Categories: filesystem, terminal, toolchain, process, git, github, network,
+#             powershell, windows, unix, diagnostics, browser, docker,
+#             scheduler, security
 # ---------------------------------------------------------------------------
 # [categories.powershell]
 # enabled = false
@@ -128,3 +153,4 @@ allow_destructive = false
 # timeout_secs = 600
 # max_output_bytes = 16777216
 # allowed_commands = ["cargo", "npm"]
+# rate_limit_per_minute = 30

@@ -72,6 +72,15 @@ pub struct HttpConfig {
     pub allowed_origins: Vec<String>,
     /// Maximum accepted request body size, in bytes (DoS guard).
     pub max_body_bytes: usize,
+    /// Seconds a session may sit idle before it is expired and its SSE replay
+    /// buffer is dropped.
+    pub session_idle_secs: u64,
+    /// Number of server-initiated SSE events retained per session for
+    /// `Last-Event-ID` resumption.
+    pub sse_replay_events: usize,
+    /// Optional OAuth2 bearer validation (RFC 7662 token introspection) in
+    /// addition to the static `auth_tokens`.
+    pub oauth: OAuthConfig,
 }
 
 impl Default for HttpConfig {
@@ -84,6 +93,47 @@ impl Default for HttpConfig {
             require_auth: true,
             allowed_origins: Vec::new(),
             max_body_bytes: 16 * 1024 * 1024,
+            session_idle_secs: 1800,
+            sse_replay_events: 256,
+            oauth: OAuthConfig::default(),
+        }
+    }
+}
+
+/// OAuth2 bearer validation via RFC 7662 token introspection.
+///
+/// When enabled, a bearer token that does not match any static `auth_tokens`
+/// entry is POSTed to `introspection_url` (authenticated with
+/// `client_id`/`client_secret`); the request is accepted when the
+/// authorization server reports the token `active` and carrying every scope in
+/// `required_scopes`. Verdicts are cached for `cache_secs` to bound
+/// introspection traffic.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OAuthConfig {
+    /// Enable OAuth2 introspection as an additional bearer validator.
+    pub enabled: bool,
+    /// RFC 7662 introspection endpoint URL.
+    pub introspection_url: String,
+    /// Client id used to authenticate to the introspection endpoint.
+    pub client_id: String,
+    /// Client secret used to authenticate to the introspection endpoint.
+    pub client_secret: String,
+    /// Scopes the token must carry (all of them). Empty = any active token.
+    pub required_scopes: Vec<String>,
+    /// Seconds to cache an introspection verdict per token.
+    pub cache_secs: u64,
+}
+
+impl Default for OAuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            introspection_url: String::new(),
+            client_id: String::new(),
+            client_secret: String::new(),
+            required_scopes: Vec::new(),
+            cache_secs: 60,
         }
     }
 }
@@ -207,6 +257,18 @@ pub struct SecurityConfig {
     /// Whether destructive operations (delete, reset --hard, driver uninstall)
     /// are permitted at all.
     pub allow_destructive: bool,
+    /// Default per-tool rate limit, in calls per minute. `None` disables rate
+    /// limiting. Override per tool via `[tools."<name>"] rate_limit_per_minute`.
+    pub rate_limit_per_minute: Option<u32>,
+    /// Global resident-memory budget for the server process, in bytes. New
+    /// tool calls are rejected (retryably) while usage exceeds the budget.
+    /// `None` disables the guard.
+    pub max_memory_bytes: Option<u64>,
+    /// Global CPU budget for the server process, in percent of one core
+    /// (100 = one full core; multi-core machines may exceed 100). New tool
+    /// calls are rejected (retryably) while usage exceeds the budget. `None`
+    /// disables the guard.
+    pub max_cpu_percent: Option<f32>,
 }
 
 impl Default for SecurityConfig {
@@ -221,6 +283,9 @@ impl Default for SecurityConfig {
             allow_elevated: false,
             allow_network: true,
             allow_destructive: false,
+            rate_limit_per_minute: None,
+            max_memory_bytes: None,
+            max_cpu_percent: None,
         }
     }
 }
@@ -257,6 +322,9 @@ pub struct ToolOverride {
     pub allow_destructive: Option<bool>,
     /// Override the elevation flag for this tool (least-privilege scoping).
     pub allow_elevated: Option<bool>,
+    /// Override the rate limit (calls per minute) for this tool. `Some(0)` is
+    /// treated as "no limit" (0 would otherwise deny every call).
+    pub rate_limit_per_minute: Option<u32>,
 }
 
 /// Per-category enable switch. A disabled category disables all of its tools.

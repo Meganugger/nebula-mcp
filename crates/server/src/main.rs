@@ -87,18 +87,28 @@ fn load_config(path: Option<&std::path::Path>) -> anyhow::Result<ConfigStore> {
     }
 }
 
+/// Print to stdout, treating a closed pipe (e.g. `nebula-mcp list-tools |
+/// head`) as success instead of panicking.
+fn print_out(text: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    match std::io::stdout().write_all(text.as_bytes()) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 fn print_default_config() -> anyhow::Result<()> {
     let text = Config::default()
         .to_toml_string()
         .context("serialising default configuration")?;
-    println!("{text}");
-    Ok(())
+    print_out(&format!("{text}\n"))
 }
 
 fn list_tools() -> anyhow::Result<()> {
     let services = ToolServices::new();
     let tools = nebula_mcp_tools::all_tools(&services);
-    println!("{} tools registered:\n", tools.len());
+    let mut out = format!("{} tools registered:\n\n", tools.len());
     let mut by_category: std::collections::BTreeMap<&str, Vec<(&str, &str)>> =
         std::collections::BTreeMap::new();
     for t in &tools {
@@ -108,13 +118,13 @@ fn list_tools() -> anyhow::Result<()> {
             .push((t.name(), t.description()));
     }
     for (cat, items) in by_category {
-        println!("[{cat}]");
+        out.push_str(&format!("[{cat}]\n"));
         for (name, desc) in items {
-            println!("  {name:<28} {desc}");
+            out.push_str(&format!("  {name:<28} {desc}\n"));
         }
-        println!();
+        out.push('\n');
     }
-    Ok(())
+    print_out(&out)
 }
 
 fn validate_config(path: Option<&std::path::Path>) -> anyhow::Result<()> {

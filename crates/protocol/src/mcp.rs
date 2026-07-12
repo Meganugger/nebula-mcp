@@ -227,6 +227,15 @@ impl ProgressToken {
 pub struct CallToolResult {
     /// Ordered content blocks produced by the tool.
     pub content: Vec<Content>,
+    /// Typed JSON result mirroring the text content, for schema-aware clients.
+    /// Optional in the wire format; clients that only understand text blocks
+    /// ignore it.
+    #[serde(
+        rename = "structuredContent",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub structured_content: Option<Value>,
     /// When `true`, the content describes an error rather than success.
     #[serde(rename = "isError", skip_serializing_if = "Option::is_none")]
     pub is_error: Option<bool>,
@@ -238,6 +247,7 @@ impl CallToolResult {
     pub fn text(body: impl Into<String>) -> Self {
         Self {
             content: vec![Content::text(body)],
+            structured_content: None,
             is_error: Some(false),
         }
     }
@@ -247,8 +257,16 @@ impl CallToolResult {
     pub fn error_text(body: impl Into<String>) -> Self {
         Self {
             content: vec![Content::text(body)],
+            structured_content: None,
             is_error: Some(true),
         }
+    }
+
+    /// Attach a typed JSON payload as `structuredContent`.
+    #[must_use]
+    pub fn with_structured(mut self, value: Value) -> Self {
+        self.structured_content = Some(value);
+        self
     }
 }
 
@@ -446,6 +464,18 @@ mod tests {
         assert_eq!(r.is_error, Some(false));
         let text = serde_json::to_string(&r).unwrap();
         assert!(text.contains("\"type\":\"text\""));
+        // No structuredContent key unless one is attached.
+        assert!(!text.contains("structuredContent"));
+    }
+
+    #[test]
+    fn structured_content_round_trips() {
+        let r =
+            CallToolResult::text("{\"ok\":true}").with_structured(serde_json::json!({"ok": true}));
+        let text = serde_json::to_string(&r).unwrap();
+        assert!(text.contains("\"structuredContent\":{\"ok\":true}"));
+        let back: CallToolResult = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.structured_content.unwrap()["ok"], true);
     }
 
     #[test]

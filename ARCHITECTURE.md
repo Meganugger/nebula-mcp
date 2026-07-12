@@ -65,7 +65,13 @@ The runtime foundation:
   **stderr** (never stdout) plus optional rotating files, and an optional
   OpenTelemetry OTLP layer behind the `otel` feature.
 - **metrics** — lock-free per-tool counters (calls, successes, failures,
-  cancellations, durations, output bytes).
+  cancellations, durations, output bytes) plus per-tool duration histogram
+  buckets exported in Prometheus format.
+- **ratelimit** — a sliding-window (60 s) per-tool `RateLimiter`; limits are
+  resolved from the effective policy on every call so hot reloads apply
+  immediately.
+- **resource** — the `ResourceGuard`, sampling this process's resident memory
+  and CPU (throttled, via `sysinfo`) to enforce the optional global budget.
 - **tool** — the `Tool` trait (async `call`, schema, annotations) and a
   `ToolRegistry` that produces the enabled `tools/list` payload.
 - **context** — `ToolContext`, the per-call bundle of policy, working directory,
@@ -87,13 +93,19 @@ building blocks live in `common`:
 - **scheduler** — a `SchedulerManager` for deferred/recurring command execution
   with captured results, also shared via `ToolServices`.
 - **args / schema / output** — typed argument extraction with precise errors, a
-  small JSON-Schema builder, and result formatting.
-- **platform** — `ensure_windows()` gating and a shared PowerShell runner.
+  small JSON-Schema builder, and result formatting (text + MCP
+  `structuredContent` on every result).
+- **platform** — `ensure_windows()`/`ensure_unix()` gating and a shared
+  PowerShell runner.
 
 Windows-specific tools are **typed command wrappers** over the real Windows
 tooling (`sc.exe`, `reg.exe`, `pnputil`, `schtasks`, `logman`, `cdb`,
 `procdump`, PowerShell/CIM, …). This is the production-standard approach and
 compiles on every host; on non-Windows they return `platform_unsupported`.
+The `unix` category mirrors this for Linux/macOS (`systemctl`, `launchctl`,
+`journalctl`, package managers, `crontab`, `sysctl`), and the `toolchain`
+category wraps the common build ecosystems (cargo/npm/pnpm/pip/poetry/go/
+gradle/maven) with per-ecosystem diagnostics parsers.
 
 ### `nebula-mcp-server`
 
@@ -109,7 +121,12 @@ Two transports share the same dispatch engine:
 - **HTTP** (`http` module) — the MCP **Streamable HTTP** binding built on
   `axum`: `POST /mcp` for JSON-RPC request/response, `GET /mcp` for a
   server-initiated SSE notification stream, bearer-token auth and an Origin
-  allow-list. This is what makes the server reachable by a URL.
+  allow-list. This is what makes the server reachable by a URL. On top of the
+  binding: per-session state (`Mcp-Session-Id` minted on initialize, idle
+  expiry, `DELETE` teardown), resumable SSE (monotonic event ids + a bounded
+  replay buffer honouring `Last-Event-ID`), and optional OAuth2 bearer
+  validation via RFC 7662 token introspection with a digest-keyed verdict
+  cache.
 
 ## Request lifecycle
 
@@ -122,10 +139,12 @@ stdin ─▶ FrameReader ─▶ read loop ─┬─▶ notification? handle inli
                                            before reading the next frame)
                                         2. spawn a task:
                                             a. resolve tool + EffectivePolicy
-                                            b. acquire a concurrency permit
-                                            c. run under ctx.guarded(max_runtime)
-                                            d. record metrics
-                                            e. write the response frame
+                                            b. rate limiter + resource budget
+                                               guard (reject retryably)
+                                            c. acquire a concurrency permit
+                                            d. run under ctx.guarded(max_runtime)
+                                            e. record metrics
+                                            f. write the response frame
                                         3. remove the token from `inflight`
 ```
 

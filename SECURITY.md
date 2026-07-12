@@ -44,6 +44,12 @@ single choke point for:
 - `max_runtime_secs` — an absolute ceiling enforced by the dispatcher.
 - `max_output_bytes` — captured stdout/stderr is bounded; the child is still
   fully drained so it cannot deadlock, and truncation is reported.
+- `rate_limit_per_minute` — optional per-tool rate limit (sliding 60 s
+  window), overridable per tool. Excess calls are rejected retryably
+  (`rate_limited`) without executing.
+- `max_memory_bytes` / `max_cpu_percent` — an optional whole-process budget:
+  while the server exceeds it, *new* calls are rejected retryably
+  (`resource_exhausted`); in-flight calls are never killed.
 
 ### Capability gates
 - `allow_elevated` — required by `powershell.elevated`, service create/delete,
@@ -93,6 +99,14 @@ allowlisted tool, so treat its exposure as granting shell access:
 - **Keep `require_auth = true`** and use a long, random bearer token (e.g.
   `openssl rand -hex 32`). Tokens are compared in constant time; the server
   refuses to start on a non-loopback bind with auth disabled or no tokens.
+- **Or delegate to an authorization server**: enable `[transport.http.oauth]`
+  and the server validates unknown bearer tokens by RFC 7662 introspection
+  (client-credential-authenticated, required-scope checks, verdicts cached by
+  token digest — raw tokens are never stored). Static tokens keep working
+  alongside.
+- **Sessions expire**: per-session state minted on `initialize` is dropped
+  after `session_idle_secs` of inactivity, and clients can `DELETE` it
+  explicitly.
 - **Terminate TLS at a tunnel/reverse proxy** (Cloudflare Tunnel, ngrok,
   Tailscale Funnel, nginx). Never publish plain HTTP to the internet — the token
   would travel in clear text.

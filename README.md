@@ -10,11 +10,12 @@ Point an AI platform at Nebula MCP — over a local stdio pipe *or a remote URL*
 
 ## Why Nebula MCP
 
-- **110 tools across 13 categories**, all designed for autonomous coding agents.
-- **Two transports.** Local **stdio** for editors (Claude Code, Cursor, Codex, Zed…) and remote **Streamable HTTP** so you can expose a **URL** to a hosted AI platform.
-- **Security-first.** Nothing is permitted by default. Every call is checked against an allowlist-based permission policy (paths, commands, elevation, network, destructive ops) before it runs. No shell interpolation — arguments are passed verbatim.
-- **Robust runtime.** Bounded concurrency, per-call timeouts and a hard runtime ceiling, cooperative cancellation, output caps, structured logging, Prometheus metrics and optional OpenTelemetry.
-- **Fast and small.** Rust + Tokio, four tight crates, no `unsafe` in the protocol layer.
+- **123 tools across 15 categories**, all designed for autonomous coding agents.
+- **Two transports.** Local **stdio** for editors (Claude Code, Cursor, Codex, Zed…) and remote **Streamable HTTP** — with per-session state, resumable SSE streams and optional OAuth2 token introspection — so you can expose a **URL** to a hosted AI platform.
+- **Security-first.** Nothing is permitted by default. Every call is checked against an allowlist-based permission policy (paths, commands, elevation, network, destructive ops) before it runs, plus optional per-tool rate limits and a global CPU/memory budget guard. No shell interpolation — arguments are passed verbatim.
+- **Robust runtime.** Bounded concurrency, per-call timeouts and a hard runtime ceiling, cooperative cancellation, output caps, structured logging, Prometheus metrics (with per-tool latency histograms) and optional OpenTelemetry.
+- **Typed results.** Every tool result carries MCP `structuredContent` alongside the text JSON for schema-aware clients.
+- **Fast and small.** Rust + Tokio, four tight crates, no `unsafe` in the protocol layer, fuzzed parsers.
 
 ---
 
@@ -24,6 +25,7 @@ Point an AI platform at Nebula MCP — over a local stdio pipe *or a remote URL*
 | --- | --- | --- |
 | `filesystem` | 14 | read/write/edit/search/glob/tree/hash/metadata/permissions, streaming + base64 |
 | `terminal` | 6 | run allowlisted commands **and** persistent interactive shell/REPL sessions |
+| `toolchain` | 8 | cargo, npm, pnpm, pip, poetry, go, gradle, maven — with **parsed diagnostics** (severity, file:line:col, codes, test failures) |
 | `process` | 3 | list / inspect / kill processes |
 | `git` | 24 | status, diff, blame, log, branch, checkout, merge, rebase, stash, tag, bisect, commit, push/pull/fetch, reset, clean, submodule, worktree, cherry-pick, revert, reflog, show, apply |
 | `github` | 13 | clone, arbitrary authenticated REST, PRs, issues, forks, releases, Actions runs, reviews, labels |
@@ -32,11 +34,12 @@ Point an AI platform at Nebula MCP — over a local stdio pipe *or a remote URL*
 | `scheduler` | 5 | deferred and recurring background jobs with captured results |
 | `security` | 3 | dry-run the path/command policy and inspect the effective policy for any tool |
 | `browser` | 2 | Playwright navigation + screenshot/PDF/trace/console/network capture |
+| `unix` | 5 | systemd/launchd services, package managers, journalctl/log, cron, sysctl *(Linux/macOS)* |
 | `powershell` | 3 | non-interactive, elevated and remote PowerShell *(Windows)* |
 | `windows` | 8 | services, registry, event log, perf counters, scheduled tasks, env, firewall, adapters *(Windows)* |
-| `diagnostics` | 7 | toolchain capabilities, live metrics, config summary, WER, crash dumps, procdump, cdb analyze, ETW *(mostly Windows)* |
+| `diagnostics` | 9 | toolchain capabilities, live metrics, config summary, WER, crash dumps, procdump, cdb analyze, ETW *(mostly Windows)* |
 
-Cross-platform categories work on Linux/macOS/Windows. Windows-only tools compile everywhere but return `platform_unsupported` off Windows. See [TOOLS.md](TOOLS.md) for every tool and argument.
+Cross-platform categories work on Linux/macOS/Windows. Platform-specific tools compile everywhere but return `platform_unsupported` off their platform. See [TOOLS.md](TOOLS.md) for every tool and argument.
 
 ---
 
@@ -129,9 +132,10 @@ Nebula MCP is **empty-deny by default**:
 
 - A tool may only touch a path matching `allowed_paths` and not matching `denied_paths` (which ships denying `.ssh`, `.aws`, `.gnupg`, `*.pem`, `*.key`, `id_rsa*`, `.env`).
 - A tool may only execute a program named in `allowed_commands` (basename match). Arguments are passed as a verbatim array — **there is no shell**, so no command injection.
-- Per-call **timeouts**, a hard **runtime ceiling**, and **output caps** bound every call.
+- Per-call **timeouts**, a hard **runtime ceiling**, and **output caps** bound every call; optional per-tool **rate limits** (`rate_limit_per_minute`) and a global **CPU/memory budget guard** (`max_memory_bytes`/`max_cpu_percent`) reject excess load retryably.
 - `allow_elevated`, `allow_network` and `allow_destructive` are explicit gates, off by default, scopable per tool.
 - Paths are lexically normalised (`..` contained) before matching. The GitHub token is read from the environment and never echoed.
+- The HTTP transport authenticates every request with static bearer tokens (constant-time compared) and/or **OAuth2 token introspection** (RFC 7662) with required-scope checks.
 
 Every gate can be relaxed globally under `[security]` or, better, scoped per tool under `[tools."<name>"]`. Dry-run any decision with the `security.*` tools before trusting it.
 
@@ -160,7 +164,7 @@ Four crates:
 | --- | --- |
 | `nebula-mcp-protocol` | JSON-RPC 2.0 + MCP types + stdio framing (no `unsafe`) |
 | `nebula-mcp-core` | TOML config + hot reload, permission engine, telemetry/metrics, the `Tool` trait + registry + per-call context |
-| `nebula-mcp-tools` | all 110 tool implementations, grouped by category |
+| `nebula-mcp-tools` | all 123 tool implementations, grouped by category |
 | `nebula-mcp-server` | dispatch engine + **stdio and HTTP transports** + `nebula-mcp` CLI |
 
 See [ARCHITECTURE.md](ARCHITECTURE.md).
@@ -171,12 +175,14 @@ See [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ```bash
 cargo test --workspace                                   # unit + integration + HTTP transport E2E
+cargo test -p nebula-mcp-server --test stress -- --ignored   # stress/soak: thousands of concurrent calls
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 cargo check --workspace --target x86_64-pc-windows-gnu   # type-check Windows tools (needs mingw)
+cargo +nightly fuzz run frame_decoder                    # fuzz the frame decoder (see fuzz/README.md)
 ```
 
-CI runs the Linux build/test/clippy/fmt suite and a Linux→Windows cross-check on every push.
+CI runs the Linux build/test/clippy/fmt suite, a Linux→Windows cross-check, a Windows build+test job, the stress/soak suite and a fuzz smoke on every push. Tag pushes (`v*`) trigger the release workflow: Linux/macOS/Windows binaries with SHA-256 checksums signed via Sigstore cosign.
 
 ---
 

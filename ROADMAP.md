@@ -1,38 +1,58 @@
 # Roadmap
 
-The 0.1.0 release implements the full general-purpose tool surface plus stdio
-and remote HTTP transports. This roadmap tracks deepening, hardening, and the
-external prerequisites no software can work around.
+The 0.1.0 release implemented the full general-purpose tool surface plus stdio
+and remote HTTP transports. The 0.2.0 release shipped everything from the
+previous roadmap that is implementable and verifiable in software. This
+roadmap tracks what remains.
 
-## Near term
+## Shipped in 0.2.0 (no longer roadmap items)
 
-- **Structured tool results** — populate MCP `structuredContent` alongside the
-  text JSON so schema-aware clients get typed results.
-- **HTTP transport depth** — resumable SSE streams (`Last-Event-ID`), persistent
-  per-session state, and optional OAuth2 bearer validation in addition to static
+- **Structured tool results** — MCP `structuredContent` is populated alongside
+  the text JSON on every tool result (typed success payloads and structured
+  error objects).
+- **HTTP transport depth** — resumable SSE streams (monotonic event ids +
+  `Last-Event-ID` replay from a bounded buffer), persistent per-session state
+  (`Mcp-Session-Id` minted on initialize, 404 on expiry, `DELETE` teardown,
+  idle expiry), and optional OAuth2 bearer validation via RFC 7662 token
+  introspection (cached verdicts, required-scope checks) in addition to static
   tokens.
-- **Per-tool rate limiting** and a global CPU/memory budget guard in addition to
-  the existing per-call bounds.
-- **More toolchain helpers** — first-class wrappers for common ecosystems
-  (cargo/npm/pnpm/pip/poetry/go/gradle/maven) layered on `terminal.run`, with
-  parsed diagnostics.
+- **Per-tool rate limiting** (`security.rate_limit_per_minute` + per-tool
+  overrides, sliding window) and a **global CPU/memory budget guard**
+  (`security.max_memory_bytes` / `max_cpu_percent`) in addition to the
+  existing per-call bounds. Both reject retryably (`rate_limited` /
+  `resource_exhausted`).
+- **Toolchain helpers** — first-class wrappers for
+  cargo/npm/pnpm/pip/poetry/go/gradle/maven layered on the hardened executor,
+  with parsed diagnostics (severity, file:line:col, codes, test failures).
+- **macOS/Linux system tools** — the `unix` category (systemd/launchd
+  services, package managers, journalctl/log, cron, sysctl) mirroring the
+  Windows subsystem tools.
+- **Fuzzing** — cargo-fuzz harnesses for the JSON-RPC frame decoder and the
+  argument parsers (`fuzz/`), plus a deterministic mini-fuzz regression test
+  in plain CI.
+- **Stress/soak CI job** — thousands of concurrent calls driven through the
+  engine, the stdio framing loop and the real HTTP transport
+  (`crates/server/tests/stress.rs`).
+- **Release binaries** — a tag-triggered release workflow building
+  Linux/macOS/Windows binaries with SHA-256 checksums and Sigstore cosign
+  (keyless) signatures.
+- **Prometheus histograms** — full per-tool
+  `nebula_mcp_tool_duration_seconds` histogram export alongside the existing
+  counters (OTLP trace export was already in via the `otel` feature).
 
-## Platform depth
+## Remaining
 
-- **Native services/registry** via the `windows` crate as an alternative to the
-  `sc.exe`/`reg.exe` wrappers, for callers that want to avoid spawning.
-- **macOS/Linux system tools** — a `unix` category (launchd/systemd, package
-  managers) mirroring the Windows subsystem tools.
-
-## Quality & ops
-
-- **Fuzzing** the JSON-RPC frame decoder and argument parsers.
-- **Stress/soak** CI job driving thousands of concurrent calls over both
-  transports.
-- **Signed release binaries** and MSI/winget/Homebrew packages.
-- **OTLP + Prometheus** — OTLP trace export (the `otel` feature) and a Prometheus
-  `/metrics` endpoint (`--metrics-addr`) are implemented; richer histogram export
-  is the next step.
+- **Native services/registry** via the `windows` crate as an alternative to
+  the `sc.exe`/`reg.exe` wrappers, for callers that want to avoid spawning.
+  *Deliberately deferred: it is Windows-only FFI that cannot be
+  runtime-verified off a real Windows host; the spawning wrappers cover the
+  functionality today.*
+- **HTTP transport**: streaming tool responses onto the POST SSE channel
+  (currently responses are plain JSON; notifications stream over GET).
+- **Package-manager packaging** — MSI/winget/Homebrew manifests on top of the
+  signed release artifacts (requires publisher accounts outside the repo).
+- **Richer OAuth** — JWT/JWKS local validation as an alternative to
+  introspection round-trips.
 
 ## External limitations (not solvable in software)
 

@@ -1,8 +1,8 @@
 # Nebula MCP — Tool Reference
 
-Auto-generated from `nebula-mcp list-tools`. **110 tools across 13 categories.**
+Auto-generated from `nebula-mcp list-tools`. **123 tools across 15 categories.**
 
-Cross-platform categories work on Linux, macOS and Windows. Categories marked *(Windows)* compile everywhere but return `platform_unsupported` when the host is not Windows. Every call is subject to the permission policy described in [SECURITY.md](SECURITY.md).
+Cross-platform categories work on Linux, macOS and Windows. Categories marked *(Windows)* or *(Unix)* compile everywhere but return `platform_unsupported` when the host does not match. Every call is subject to the permission policy described in [SECURITY.md](SECURITY.md).
 
 ### `browser`
 
@@ -142,6 +142,25 @@ Cross-platform categories work on Linux, macOS and Windows. Categories marked *(
 - **`terminal.session_list`** — List active interactive sessions.
 - **`terminal.session_close`** — Terminate an interactive session and free its resources.
 
+### `toolchain`
+
+- **`toolchain.cargo`** — Run cargo (build/check/test/clippy/...) with parsed rustc diagnostics (severity, code, file:line:col) and test failures. The cargo binary must be allowlisted; args are passed verbatim.
+- **`toolchain.npm`** — Run npm (install/run/test/...) with parsed npm ERR!/WARN diagnostics. The npm binary must be allowlisted; args are passed verbatim.
+- **`toolchain.pnpm`** — Run pnpm (install/run/test/...) with parsed ERR_PNPM_*/WARN diagnostics. The pnpm binary must be allowlisted; args are passed verbatim.
+- **`toolchain.pip`** — Run pip (install/download/...) with parsed ERROR:/WARNING: diagnostics. The pip binary must be allowlisted (override program to pip3 if needed); args are passed verbatim.
+- **`toolchain.poetry`** — Run poetry (install/add/build/...) with parsed error/warning diagnostics. The poetry binary must be allowlisted; args are passed verbatim.
+- **`toolchain.go`** — Run go (build/test/vet/...) with parsed file:line:col diagnostics and test failures. The go binary must be allowlisted; args are passed verbatim.
+- **`toolchain.gradle`** — Run gradle (build/test/...) with parsed compiler and task-failure diagnostics. The gradle binary must be allowlisted (override program to ./gradlew for wrapper builds); args are passed verbatim.
+- **`toolchain.maven`** — Run Maven (package/test/...) with parsed [ERROR]/[WARNING] diagnostics including file:[line,col] locations. The mvn binary must be allowlisted; args are passed verbatim.
+
+### `unix`
+
+- **`unix.service`** — Query or control a service via systemctl (Linux) or launchctl (macOS): status/list/start/stop/restart/enable/disable. stop/restart are destructive; enable/disable require elevation. Set user=true for the per-user manager. The systemctl/launchctl binary must be allowlisted. Unix only.
+- **`unix.package`** — Query or manage packages via the system package manager (apt/dnf/yum/pacman/zypper/apk/brew, auto-detected or explicit): list/info/search are read-only; install requires elevation; remove requires elevation and the destructive gate. The manager binary must be allowlisted. Unix only.
+- **`unix.logs`** — Query system logs via journalctl (Linux, JSON output) or `log show` (macOS): recent entries, optionally filtered by unit/priority. The journalctl/log binary must be allowlisted. Unix only.
+- **`unix.cron`** — List the current (or a named) user's crontab entries via `crontab -l`. Listing another user's crontab requires elevation. The crontab binary must be allowlisted. Unix only.
+- **`unix.sysctl`** — Get or set kernel parameters via sysctl: get one key, list keys by prefix, or set a value (set requires elevation). The sysctl binary must be allowlisted. Unix only.
+
 ### `windows`
 
 - **`windows.service`** — Query or control a Windows service (query/start/stop/restart/create/delete/config) via sc.exe. create/delete/config require elevation; stop/restart/delete are destructive. Windows only.
@@ -152,4 +171,3 @@ Cross-platform categories work on Linux, macOS and Windows. Categories marked *(
 - **`windows.env`** — Get or set a Windows environment variable at Process/User/Machine scope. Machine scope requires elevation. Windows only.
 - **`windows.firewall`** — List Windows firewall rules (optionally filtered by display-name substring) as JSON. Windows only.
 - **`windows.network_adapters`** — List network adapters (name, status, MAC, link speed) as JSON. Windows only.
-

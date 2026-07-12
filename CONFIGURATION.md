@@ -66,15 +66,23 @@ The global baseline every tool inherits. See [SECURITY.md](SECURITY.md).
 | `allow_elevated` | bool | `false` | Permit elevated/admin execution. |
 | `allow_network` | bool | `true` | Permit off-box network access. |
 | `allow_destructive` | bool | `false` | Permit destructive operations. |
+| `rate_limit_per_minute` | int | unset | Per-tool rate limit (sliding 60 s window). Unset ⇒ unlimited. |
+| `max_memory_bytes` | int | unset | Global budget: reject new calls while the server's resident memory exceeds this. |
+| `max_cpu_percent` | float | unset | Global budget: reject new calls while the server's CPU exceeds this (100 = one core). |
 
 Globs use `**` to span path separators. On Windows, use escaped backslashes in
 TOML strings (`"C:\\src\\**"`) or forward slashes.
 
+Rate-limit and budget rejections are **retryable**: they surface as tool
+results with `isError = true` and the categories `rate_limited` /
+`resource_exhausted`, so an agent can back off and retry. In-flight calls are
+never killed by the budget guard.
+
 ### `[categories.<name>]`
 
 Enable/disable a whole category. Categories: `filesystem`, `terminal`,
-`process`, `git`, `github`, `network`, `powershell`, `windows`, `diagnostics`,
-`browser`, `docker`, `scheduler`, `security`.
+`toolchain`, `process`, `git`, `github`, `network`, `powershell`, `windows`,
+`unix`, `diagnostics`, `browser`, `docker`, `scheduler`, `security`.
 
 ```toml
 [categories.powershell]
@@ -94,6 +102,7 @@ Per-tool overrides layered on the `[security]` baseline. All fields optional.
 | `allowed_commands` | [string] | **Additional** commands (merged with baseline). |
 | `allow_destructive` | bool | Override the destructive gate for this tool. |
 | `allow_elevated` | bool | Override the elevation gate for this tool (least-privilege scoping). |
+| `rate_limit_per_minute` | int | Override the rate limit for this tool (`0` ⇒ unlimited). |
 
 Example (least-privilege: destructive ops off globally, granted only to a
 single tool, and a longer timeout for builds):
@@ -123,6 +132,8 @@ Remote HTTP (MCP Streamable HTTP) transport. Disabled by default.
 | `require_auth` | bool | `true` | Require a valid token on every request. |
 | `allowed_origins` | [string] | `[]` | Exact-match Origin allow-list (browser clients). |
 | `max_body_bytes` | int | `16777216` | Max accepted request body size. |
+| `session_idle_secs` | int | `1800` | Idle seconds before an MCP session (`Mcp-Session-Id`) expires. |
+| `sse_replay_events` | int | `256` | Server-initiated SSE events buffered for `Last-Event-ID` resumption. |
 
 ```toml
 [transport.http]
@@ -130,6 +141,33 @@ enabled = true
 bind = "127.0.0.1:8765"
 require_auth = true
 # Prefer supplying tokens via NEBULA_MCP_AUTH_TOKEN or --auth-token.
+```
+
+### `[transport.http.oauth]`
+
+Optional OAuth2 bearer validation via **RFC 7662 token introspection**, in
+addition to the static `auth_tokens`. A presented token that matches no static
+token is POSTed to the introspection endpoint (authenticated with the client
+credentials); it is accepted when the authorization server reports it `active`
+with every required scope. Verdicts are cached (keyed by token digest, never
+the raw token) for `cache_secs`.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `enabled` | bool | `false` | Enable introspection as an additional validator. |
+| `introspection_url` | string | `""` | RFC 7662 endpoint URL (required when enabled). |
+| `client_id` | string | `""` | Client id for the introspection call. |
+| `client_secret` | string | `""` | Client secret for the introspection call. |
+| `required_scopes` | [string] | `[]` | Scopes the token must carry (all). Empty ⇒ any active token. |
+| `cache_secs` | int | `60` | Verdict cache TTL per token. |
+
+```toml
+[transport.http.oauth]
+enabled = true
+introspection_url = "https://auth.example.com/oauth2/introspect"
+client_id = "nebula-mcp"
+client_secret = "..."
+required_scopes = ["mcp"]
 ```
 
 ## Environment variables

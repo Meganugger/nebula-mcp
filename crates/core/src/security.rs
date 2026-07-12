@@ -36,6 +36,7 @@ pub struct EffectivePolicy {
     allow_elevated: bool,
     allow_network: bool,
     allow_destructive: bool,
+    rate_limit_per_minute: Option<u32>,
 }
 
 impl EffectivePolicy {
@@ -59,6 +60,7 @@ impl EffectivePolicy {
         let mut max_output_bytes = base.max_output_bytes;
         let mut allow_destructive = base.allow_destructive;
         let mut allow_elevated = base.allow_elevated;
+        let mut rate_limit_per_minute = base.rate_limit_per_minute;
 
         if let Some(o) = ov {
             if let Some(extra) = &o.allowed_paths {
@@ -78,6 +80,10 @@ impl EffectivePolicy {
             }
             if let Some(e) = o.allow_elevated {
                 allow_elevated = e;
+            }
+            if let Some(r) = o.rate_limit_per_minute {
+                // A per-tool override of 0 removes the baseline limit.
+                rate_limit_per_minute = if r == 0 { None } else { Some(r) };
             }
         }
 
@@ -101,6 +107,7 @@ impl EffectivePolicy {
             allow_elevated,
             allow_network: base.allow_network,
             allow_destructive,
+            rate_limit_per_minute: rate_limit_per_minute.filter(|r| *r > 0),
         })
     }
 
@@ -166,6 +173,13 @@ impl EffectivePolicy {
     #[must_use]
     pub fn allowed_pattern_count(&self) -> usize {
         self.allowed_pattern_count
+    }
+
+    /// The effective rate limit for this tool, in calls per minute
+    /// (`None` = unlimited).
+    #[must_use]
+    pub fn rate_limit_per_minute(&self) -> Option<u32> {
+        self.rate_limit_per_minute
     }
 
     /// Ensure elevation is permitted, returning an error otherwise.
@@ -412,6 +426,31 @@ mod tests {
         let (out, truncated) = p.clamp_output(b"123456");
         assert_eq!(out, b"1234");
         assert!(truncated);
+    }
+
+    #[test]
+    fn rate_limit_resolution_layers_override_on_baseline() {
+        let base = SecurityConfig {
+            rate_limit_per_minute: Some(30),
+            ..Default::default()
+        };
+        // Baseline applies when no override.
+        let p = EffectivePolicy::build("t", &base, None).unwrap();
+        assert_eq!(p.rate_limit_per_minute(), Some(30));
+        // Override replaces the baseline.
+        let ov = crate::config::ToolOverride {
+            rate_limit_per_minute: Some(5),
+            ..Default::default()
+        };
+        let p = EffectivePolicy::build("t", &base, Some(&ov)).unwrap();
+        assert_eq!(p.rate_limit_per_minute(), Some(5));
+        // An override of 0 removes the limit entirely.
+        let ov = crate::config::ToolOverride {
+            rate_limit_per_minute: Some(0),
+            ..Default::default()
+        };
+        let p = EffectivePolicy::build("t", &base, Some(&ov)).unwrap();
+        assert_eq!(p.rate_limit_per_minute(), None);
     }
 
     #[test]

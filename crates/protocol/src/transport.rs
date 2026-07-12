@@ -187,4 +187,69 @@ mod tests {
         assert_eq!(req.method, "m");
         assert_eq!(req.id, Some(RequestId::String("café".into())));
     }
+
+    /// Tiny deterministic PRNG (xorshift64*) so the mini-fuzz below is
+    /// reproducible without adding dependencies.
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn byte(&mut self) -> u8 {
+            (self.next() & 0xFF) as u8
+        }
+    }
+
+    /// Deterministic mini-fuzz: the frame decoder must never panic, hang or
+    /// mis-terminate on arbitrary byte streams (random garbage, mutated valid
+    /// frames, embedded newlines, invalid UTF-8). The libFuzzer harness in
+    /// `fuzz/` explores far deeper; this keeps a regression net in plain CI.
+    #[tokio::test]
+    async fn decoder_survives_random_byte_streams() {
+        let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
+        let valid = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n";
+        for case in 0..500 {
+            let mut input: Vec<u8> = Vec::new();
+            match case % 3 {
+                // Pure random bytes.
+                0 => {
+                    let len = (rng.next() % 512) as usize;
+                    input.extend((0..len).map(|_| rng.byte()));
+                }
+                // A valid frame with random single-byte mutations.
+                1 => {
+                    input.extend_from_slice(valid);
+                    for _ in 0..(rng.next() % 8) {
+                        let idx = (rng.next() as usize) % input.len();
+                        input[idx] = rng.byte();
+                    }
+                }
+                // Random garbage between valid frames.
+                _ => {
+                    input.extend_from_slice(valid);
+                    let len = (rng.next() % 64) as usize;
+                    input.extend((0..len).map(|_| rng.byte()));
+                    input.push(b'\n');
+                    input.extend_from_slice(valid);
+                }
+            }
+            let mut reader = FrameReader::new(input.as_slice());
+            // Bounded loop: the reader must reach EOF within the number of
+            // lines present (plus slack); each iteration returns Ok/Err
+            // without panicking.
+            for _ in 0..input.len() + 2 {
+                match reader.next_frame().await {
+                    Ok(None) => break,
+                    Ok(Some(_)) | Err(_) => continue,
+                }
+            }
+        }
+    }
 }

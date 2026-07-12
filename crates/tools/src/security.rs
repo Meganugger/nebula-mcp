@@ -178,6 +178,7 @@ impl Tool for PolicyInspect {
             "allowDestructive": policy.allow_destructive(),
             "allowedPathPatternCount": policy.allowed_pattern_count(),
             "allowedCommands": policy.allowed_commands(),
+            "rateLimitPerMinute": policy.rate_limit_per_minute(),
         })))
     }
 }

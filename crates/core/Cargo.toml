@@ -30,6 +30,7 @@ dashmap = { workspace = true }
 uuid = { workspace = true }
 dirs = { workspace = true }
 num_cpus = { workspace = true }
+sysinfo = "0.32"
 
 # Optional OpenTelemetry export stack (enabled by the `otel` feature).
 opentelemetry = { version = "0.27", optional = true }

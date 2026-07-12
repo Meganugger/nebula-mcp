@@ -6,9 +6,13 @@ members = [
     "crates/tools",
     "crates/server",
 ]
+# The libFuzzer harness needs nightly + cargo-fuzz; it is built on demand via
+# `cargo fuzz run <target>` from the fuzz/ directory, not as part of the
+# workspace.
+exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.82"
 license = "MIT OR Apache-2.0"

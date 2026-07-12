@@ -19,6 +19,22 @@ pub fn ensure_windows(tool: &str) -> Result<(), ToolError> {
     }
 }
 
+/// Return [`ToolError::PlatformUnsupported`] unless running on a Unix-like OS
+/// (Linux or macOS).
+///
+/// Unix-only tools call this first so that on Windows hosts they fail fast
+/// with a clear, structured error instead of an opaque "binary not found".
+pub fn ensure_unix(tool: &str) -> Result<(), ToolError> {
+    if cfg!(unix) {
+        Ok(())
+    } else {
+        Err(ToolError::PlatformUnsupported(format!(
+            "{tool} requires a Unix-like host (Linux/macOS); this server is running on {}",
+            std::env::consts::OS
+        )))
+    }
+}
+
 /// The PowerShell executable to invoke. `powershell.exe` (Windows PowerShell)
 /// is the broadest default; policy decides whether it is permitted, and callers
 /// may allowlist `pwsh` instead.

@@ -4,6 +4,79 @@ All notable changes to the Nebula MCP server are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/) and the project adheres
 to [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] - Unreleased
+
+Deepening and hardening release: every software-implementable item from the
+0.1.0 roadmap's "Near term", "Platform depth" and "Quality & ops" sections.
+
+### Added
+
+- **Structured tool results**: every tool now populates MCP
+  `structuredContent` alongside the pretty-printed text JSON, so schema-aware
+  clients get typed results. Error results carry a structured
+  `{error: {category, message}}` payload.
+- **HTTP transport depth** (`nebula-mcp-server::http`):
+  - **Persistent per-session state** — `initialize` mints an `Mcp-Session-Id`;
+    subsequent requests echo it, unknown/expired ids answer `404` (client
+    re-initializes), `DELETE` tears the session down, and idle sessions expire
+    after `transport.http.session_idle_secs` (default 1800 s).
+  - **Resumable SSE streams** — every server-initiated event carries a
+    monotonically increasing SSE `id`; reconnecting with `Last-Event-ID`
+    replays missed events from a bounded buffer
+    (`transport.http.sse_replay_events`, default 256) before the live stream
+    resumes.
+  - **OAuth2 bearer validation** — optional RFC 7662 token introspection
+    (`[transport.http.oauth]`: introspection URL, client credentials, required
+    scopes) in addition to static tokens, with a digest-keyed verdict cache.
+- **Per-tool rate limiting**: `security.rate_limit_per_minute` (sliding
+  60-second window) with per-tool `[tools."<name>"] rate_limit_per_minute`
+  overrides (`0` = unlimited). Rejections are retryable tool errors with the
+  new `rate_limited` category (JSON-RPC code `-32003`).
+- **Global CPU/memory budget guard**: `security.max_memory_bytes` and
+  `security.max_cpu_percent` reject *new* calls (retryable
+  `resource_exhausted` errors) while the server process exceeds budget;
+  in-flight calls are never killed. Sampling is throttled to 2 Hz via
+  `sysinfo`.
+- **toolchain category (8 tools)**: first-class wrappers for
+  cargo/npm/pnpm/pip/poetry/go/gradle/maven layered on the hardened executor,
+  each returning **parsed diagnostics** (severity, message, file:line:col,
+  tool-specific code) plus error/warning counts — rustc headers and `-->`
+  locations, libtest/go-test failures, `go` `file:line:col` errors,
+  `npm ERR!`/`ERR_PNPM_*`, pip/poetry errors, Kotlin/javac/gradle task
+  failures, and Maven `[ERROR] file:[line,col]` forms.
+- **unix category (5 tools)** mirroring the Windows subsystem tools:
+  `unix.service` (systemctl/launchctl), `unix.package`
+  (apt/dnf/yum/pacman/zypper/apk/brew with elevation/destructive gating),
+  `unix.logs` (journalctl JSON / `log show`), `unix.cron` and `unix.sysctl`.
+  All go through the command allowlist; Windows hosts get a structured
+  `platform_unsupported` error, exactly mirroring the `windows` category.
+- **Prometheus histograms**: the metrics endpoint now exports a full
+  per-tool `nebula_mcp_tool_duration_seconds` histogram (`_bucket` with 12
+  finite `le` bounds from 1 ms to 5 min, `_sum`, `_count`) alongside the
+  existing counters/gauges.
+- **Fuzzing**: `cargo-fuzz` harnesses for the JSON-RPC frame decoder and the
+  tool-argument parsers (`fuzz/`), plus a deterministic in-tree mini-fuzz
+  regression test that runs in plain CI.
+- **Stress/soak suite**: `crates/server/tests/stress.rs` drives thousands of
+  concurrent calls through the engine, the stdio framing loop and the real
+  HTTP transport; CI runs it in a dedicated job.
+- **Release pipeline**: `.github/workflows/release.yml` builds
+  Linux/macOS(x64+arm64)/Windows binaries on tags, publishes SHA-256
+  checksums, and signs the manifest with Sigstore cosign (keyless OIDC).
+- Introspection surfaces the new policy: `security.effective_policy` reports
+  `rateLimitPerMinute`; `diagnostics.config` reports rate limit and resource
+  budgets; `diagnostics.capabilities` probes the new toolchain and unix
+  binaries.
+
+### Changed
+
+- Tool count grows from 110 to **123 across 15 categories**.
+- `error_codes::RESOURCE_LIMITED` (`-32003`) added for rate-limit/budget
+  rejections.
+- HTTP startup validation: `require_auth` without static tokens is accepted
+  when OAuth introspection is enabled; enabling OAuth without an
+  introspection URL is refused.
+
 ## [0.1.0] - Unreleased
 
 Initial release of Nebula MCP as a standalone, **general-purpose** autonomous

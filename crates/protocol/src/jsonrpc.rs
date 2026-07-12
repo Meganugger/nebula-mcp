@@ -138,6 +138,9 @@ pub mod error_codes {
     pub const TOOL_EXECUTION_ERROR: i64 = -32001;
     /// The request was cancelled or timed out (application code).
     pub const REQUEST_CANCELLED: i64 = -32002;
+    /// The call was rejected by a rate limit or resource budget (application
+    /// code). Retryable after backing off.
+    pub const RESOURCE_LIMITED: i64 = -32003;
 }
 
 #[cfg(test)]

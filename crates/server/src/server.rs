@@ -13,7 +13,8 @@ use dashmap::DashMap;
 use nebula_mcp_core::config::ConfigStore;
 use nebula_mcp_core::security::EffectivePolicy;
 use nebula_mcp_core::{
-    LogControl, Metrics, Outcome, ProgressSink, ToolContext, ToolError, ToolRegistry,
+    LogControl, Metrics, Outcome, ProgressSink, RateLimiter, ResourceGuard, ToolContext, ToolError,
+    ToolRegistry,
 };
 use nebula_mcp_protocol::{
     error_codes, CallToolParams, CallToolResult, Content, ErrorObject, FrameReader, FrameWriter,
@@ -33,6 +34,8 @@ pub struct Server {
     metrics: Metrics,
     working_dir: PathBuf,
     semaphore: Arc<Semaphore>,
+    rate_limiter: RateLimiter,
+    resource_guard: ResourceGuard,
     inflight: Arc<DashMap<String, CancellationToken>>,
     root_cancel: CancellationToken,
     initialized: Arc<AtomicBool>,
@@ -60,6 +63,8 @@ impl Server {
             metrics: Metrics::new(),
             working_dir,
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            rate_limiter: RateLimiter::new(),
+            resource_guard: ResourceGuard::new(),
             inflight: Arc::new(DashMap::new()),
             root_cancel,
             initialized: Arc::new(AtomicBool::new(false)),
@@ -509,6 +514,27 @@ impl Server {
             }
         };
 
+        // Per-tool rate limit and global CPU/memory budget guard. Both reject
+        // retryably as tool results (isError) so the model can back off.
+        if let Err(e) = self
+            .rate_limiter
+            .check(&params.name, policy.rate_limit_per_minute())
+            .and_then(|()| {
+                self.resource_guard.check(
+                    config.security.max_memory_bytes,
+                    config.security.max_cpu_percent,
+                )
+            })
+        {
+            self.metrics
+                .record(&params.name, Outcome::Failure, std::time::Duration::ZERO, 0);
+            tracing::warn!(tool = %params.name, error = %e, "call rejected by resource governor");
+            return Response::success(
+                id,
+                serde_json::to_value(error_result(&e)).unwrap_or_default(),
+            );
+        }
+
         // Per-request cancellation token was registered by the read loop.
         // If the client supplied a progress token, wire a progress sink that
         // forwards updates as `notifications/progress` frames.
@@ -605,6 +631,9 @@ impl Server {
 fn error_result(e: &ToolError) -> CallToolResult {
     CallToolResult {
         content: vec![Content::text(format!("[{}] {}", e.category(), e))],
+        structured_content: Some(serde_json::json!({
+            "error": { "category": e.category(), "message": e.to_string() }
+        })),
         is_error: Some(true),
     }
 }
@@ -710,6 +739,87 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.error.unwrap().code, error_codes::METHOD_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_rejects_excess_calls_as_tool_result() {
+        let mut config = Config::default();
+        config.security.allowed_commands = vec!["echo".into()];
+        config.tools.insert(
+            "terminal.run".into(),
+            nebula_mcp_core::config::ToolOverride {
+                rate_limit_per_minute: Some(2),
+                ..Default::default()
+            },
+        );
+        let store = ConfigStore::new(config);
+        let registry = nebula_mcp_tools::build_registry(&ToolServices::new());
+        let server = Arc::new(Server::new(
+            registry,
+            store,
+            std::env::temp_dir(),
+            CancellationToken::new(),
+        ));
+
+        let call = |n: i64| Request {
+            jsonrpc: "2.0".into(),
+            id: Some(RequestId::Number(n)),
+            method: "tools/call".into(),
+            params: Some(serde_json::json!({
+                "name": "terminal.run",
+                "arguments": {"program": "echo", "args": ["x"]}
+            })),
+        };
+        for n in 1..=2 {
+            let resp = server
+                .clone()
+                .handle_request(call(n), n.to_string(), CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!(resp.result.unwrap()["isError"], false, "call {n}");
+        }
+        let resp = server
+            .clone()
+            .handle_request(call(3), "3".into(), CancellationToken::new())
+            .await
+            .unwrap();
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("[rate_limited]"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn memory_budget_rejects_calls_as_tool_result() {
+        let mut config = Config::default();
+        config.security.allowed_commands = vec!["echo".into()];
+        // One byte of memory budget: always exceeded.
+        config.security.max_memory_bytes = Some(1);
+        let store = ConfigStore::new(config);
+        let registry = nebula_mcp_tools::build_registry(&ToolServices::new());
+        let server = Arc::new(Server::new(
+            registry,
+            store,
+            std::env::temp_dir(),
+            CancellationToken::new(),
+        ));
+        let call = Request {
+            jsonrpc: "2.0".into(),
+            id: Some(RequestId::Number(1)),
+            method: "tools/call".into(),
+            params: Some(serde_json::json!({
+                "name": "terminal.run",
+                "arguments": {"program": "echo", "args": ["x"]}
+            })),
+        };
+        let resp = server
+            .handle_request(call, "1".into(), CancellationToken::new())
+            .await
+            .unwrap();
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("[resource_exhausted]"), "got: {text}");
     }
 
     #[tokio::test]

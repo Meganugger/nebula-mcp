@@ -55,3 +55,29 @@ jobs:
         run: cargo build --workspace
       - name: Test
         run: cargo test --workspace
+
+  stress:
+    name: Stress/soak — thousands of concurrent calls, both transports
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Stress tests (engine, stdio framing, HTTP transport)
+        run: cargo test -p nebula-mcp-server --test stress --release -- --ignored --test-threads=1
+
+  fuzz-smoke:
+    name: Fuzz smoke — frame decoder & argument parsers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Fuzz frame decoder (60s)
+        run: cargo +nightly fuzz run frame_decoder -- -max_total_time=60
+      - name: Fuzz argument parsers (60s)
+        run: cargo +nightly fuzz run args_parser -- -max_total_time=60

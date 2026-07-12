@@ -49,6 +49,21 @@ pub enum ToolError {
         limit: usize,
     },
 
+    /// The call was rejected by a per-tool rate limit. Retryable after a
+    /// backoff.
+    #[error("rate limit exceeded for '{tool}': at most {limit} calls per minute")]
+    RateLimited {
+        /// Tool whose limit was hit.
+        tool: String,
+        /// The configured calls-per-minute limit.
+        limit: u32,
+    },
+
+    /// The global CPU/memory budget guard rejected the call. Retryable once
+    /// the server's resource usage falls back under budget.
+    #[error("resource budget exceeded: {0}")]
+    ResourceExhausted(String),
+
     /// A required external tool (git, cargo, docker, ...) was not found.
     #[error("required external tool not found: {0}")]
     ToolNotFound(String),
@@ -80,6 +95,9 @@ impl ToolError {
             | ToolError::PathNotAllowed { .. }
             | ToolError::CommandNotAllowed(_) => error_codes::PERMISSION_DENIED,
             ToolError::Timeout(_) | ToolError::Cancelled => error_codes::REQUEST_CANCELLED,
+            ToolError::RateLimited { .. } | ToolError::ResourceExhausted(_) => {
+                error_codes::RESOURCE_LIMITED
+            }
             ToolError::OutputTooLarge { .. }
             | ToolError::ToolNotFound(_)
             | ToolError::PlatformUnsupported(_)
@@ -99,6 +117,8 @@ impl ToolError {
             ToolError::CommandNotAllowed(_) => "command_not_allowed",
             ToolError::Timeout(_) => "timeout",
             ToolError::Cancelled => "cancelled",
+            ToolError::RateLimited { .. } => "rate_limited",
+            ToolError::ResourceExhausted(_) => "resource_exhausted",
             ToolError::OutputTooLarge { .. } => "output_too_large",
             ToolError::ToolNotFound(_) => "tool_not_found",
             ToolError::PlatformUnsupported(_) => "platform_unsupported",

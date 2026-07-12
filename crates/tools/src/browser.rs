@@ -100,6 +100,7 @@ async fn run_driver(ctx: &ToolContext, cfg: Value, timeout: Option<u64>) -> Resu
         let text = serde_json::to_string_pretty(&parsed).unwrap_or(result.stdout.clone());
         Ok(CallToolResult {
             content: vec![Content::text(text)],
+            structured_content: Some(parsed),
             is_error: Some(false),
         })
     } else {

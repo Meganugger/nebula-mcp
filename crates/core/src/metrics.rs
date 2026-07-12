@@ -11,6 +11,24 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use serde::Serialize;
 
+/// Upper bounds (microseconds) of the finite duration histogram buckets. The
+/// implicit final bucket is `+Inf`. Chosen to resolve both fast filesystem
+/// calls and multi-minute builds.
+const BUCKET_BOUNDS_US: [u64; 12] = [
+    1_000,       // 1 ms
+    5_000,       // 5 ms
+    10_000,      // 10 ms
+    50_000,      // 50 ms
+    100_000,     // 100 ms
+    500_000,     // 500 ms
+    1_000_000,   // 1 s
+    5_000_000,   // 5 s
+    10_000_000,  // 10 s
+    30_000_000,  // 30 s
+    60_000_000,  // 60 s
+    300_000_000, // 5 min
+];
+
 /// Atomic counters for a single tool.
 #[derive(Debug, Default)]
 struct ToolCounters {
@@ -21,6 +39,9 @@ struct ToolCounters {
     total_duration_us: AtomicU64,
     max_duration_us: AtomicU64,
     output_bytes: AtomicU64,
+    /// Non-cumulative per-bucket observation counts; the final slot counts
+    /// observations above every finite bound (`+Inf` bucket).
+    duration_buckets: [AtomicU64; BUCKET_BOUNDS_US.len() + 1],
 }
 
 /// A point-in-time, serialisable snapshot of one tool's metrics.
@@ -40,8 +61,14 @@ pub struct ToolMetricsSnapshot {
     pub mean_duration_us: u64,
     /// Worst observed duration, in microseconds.
     pub max_duration_us: u64,
+    /// Total observed duration across all calls, in microseconds.
+    pub total_duration_us: u64,
     /// Total captured output bytes.
     pub output_bytes: u64,
+    /// Cumulative duration histogram counts, one per finite bound in
+    /// [`BUCKET_BOUNDS_US`] plus a final `+Inf` bucket (equal to `calls`).
+    #[serde(skip)]
+    pub duration_bucket_counts: Vec<u64>,
 }
 
 /// Shared metrics registry.
@@ -83,6 +110,11 @@ impl Metrics {
         entry
             .output_bytes
             .fetch_add(output_bytes, Ordering::Relaxed);
+        let bucket = BUCKET_BOUNDS_US
+            .iter()
+            .position(|bound| us <= *bound)
+            .unwrap_or(BUCKET_BOUNDS_US.len());
+        entry.duration_buckets[bucket].fetch_add(1, Ordering::Relaxed);
         // Update max via compare-and-swap loop.
         let mut cur = entry.max_duration_us.load(Ordering::Relaxed);
         while us > cur {
@@ -108,6 +140,14 @@ impl Metrics {
                 let c = kv.value();
                 let calls = c.calls.load(Ordering::Relaxed);
                 let total = c.total_duration_us.load(Ordering::Relaxed);
+                // Convert non-cumulative bucket counts into the cumulative
+                // form Prometheus expects.
+                let mut cumulative = Vec::with_capacity(c.duration_buckets.len());
+                let mut running = 0u64;
+                for b in &c.duration_buckets {
+                    running += b.load(Ordering::Relaxed);
+                    cumulative.push(running);
+                }
                 ToolMetricsSnapshot {
                     tool: kv.key().clone(),
                     calls,
@@ -116,7 +156,9 @@ impl Metrics {
                     cancellations: c.cancellations.load(Ordering::Relaxed),
                     mean_duration_us: total.checked_div(calls).unwrap_or(0),
                     max_duration_us: c.max_duration_us.load(Ordering::Relaxed),
+                    total_duration_us: total,
                     output_bytes: c.output_bytes.load(Ordering::Relaxed),
+                    duration_bucket_counts: cumulative,
                 }
             })
             .collect();
@@ -188,7 +230,42 @@ impl Metrics {
                 ));
             }
         }
+
+        // Full per-tool duration histogram (seconds), Prometheus-native shape.
+        let hname = "nebula_mcp_tool_duration_seconds";
+        s.push_str(&format!(
+            "# HELP {hname} Tool call duration distribution in seconds.\n"
+        ));
+        s.push_str(&format!("# TYPE {hname} histogram\n"));
+        for m in &snap {
+            let tool = escape_label(&m.tool);
+            for (i, count) in m.duration_bucket_counts.iter().enumerate() {
+                let le = match BUCKET_BOUNDS_US.get(i) {
+                    Some(bound_us) => format_le_seconds(*bound_us),
+                    None => "+Inf".to_string(),
+                };
+                s.push_str(&format!(
+                    "{hname}_bucket{{tool=\"{tool}\",le=\"{le}\"}} {count}\n"
+                ));
+            }
+            s.push_str(&format!(
+                "{hname}_sum{{tool=\"{tool}\"}} {}\n",
+                m.total_duration_us as f64 / 1e6
+            ));
+            s.push_str(&format!("{hname}_count{{tool=\"{tool}\"}} {}\n", m.calls));
+        }
         s
+    }
+}
+
+/// Render a microsecond bucket bound as a seconds `le` label without float
+/// noise (e.g. `0.005`, `1`, `300`).
+fn format_le_seconds(bound_us: u64) -> String {
+    let secs = bound_us as f64 / 1e6;
+    if (secs.fract()).abs() < f64::EPSILON {
+        format!("{}", secs as u64)
+    } else {
+        format!("{secs}")
     }
 }
 
@@ -239,5 +316,36 @@ mod tests {
         assert!(text.contains("# TYPE nebula_mcp_tool_calls_total counter"));
         assert!(text.contains("nebula_mcp_tool_calls_total{tool=\"fs.read\"} 1"));
         assert!(text.contains("nebula_mcp_tool_duration_microseconds_max{tool=\"fs.read\"}"));
+    }
+
+    #[test]
+    fn prometheus_histogram_is_cumulative_and_complete() {
+        let m = Metrics::new();
+        // 50 µs → first (1 ms) bucket; 2 s → 5 s bucket; 10 min → +Inf bucket.
+        m.record("t", Outcome::Success, Duration::from_micros(50), 0);
+        m.record("t", Outcome::Success, Duration::from_secs(2), 0);
+        m.record("t", Outcome::Success, Duration::from_secs(600), 0);
+        let text = m.to_prometheus();
+        assert!(text.contains("# TYPE nebula_mcp_tool_duration_seconds histogram"));
+        assert!(text.contains("nebula_mcp_tool_duration_seconds_bucket{tool=\"t\",le=\"0.001\"} 1"));
+        assert!(text.contains("nebula_mcp_tool_duration_seconds_bucket{tool=\"t\",le=\"1\"} 1"));
+        assert!(text.contains("nebula_mcp_tool_duration_seconds_bucket{tool=\"t\",le=\"5\"} 2"));
+        assert!(text.contains("nebula_mcp_tool_duration_seconds_bucket{tool=\"t\",le=\"300\"} 2"));
+        assert!(text.contains("nebula_mcp_tool_duration_seconds_bucket{tool=\"t\",le=\"+Inf\"} 3"));
+        assert!(text.contains("nebula_mcp_tool_duration_seconds_count{tool=\"t\"} 3"));
+        // Sum: 0.00005 + 2 + 600 seconds.
+        assert!(text.contains("nebula_mcp_tool_duration_seconds_sum{tool=\"t\"} 602.00005"));
+    }
+
+    #[test]
+    fn snapshot_exposes_cumulative_buckets() {
+        let m = Metrics::new();
+        m.record("t", Outcome::Success, Duration::from_micros(2_000), 0); // 5 ms bucket
+        let snap = m.snapshot();
+        let s = &snap[0];
+        assert_eq!(s.duration_bucket_counts.len(), BUCKET_BOUNDS_US.len() + 1);
+        assert_eq!(s.duration_bucket_counts[0], 0); // 1 ms
+        assert_eq!(s.duration_bucket_counts[1], 1); // 5 ms
+        assert_eq!(*s.duration_bucket_counts.last().unwrap(), 1); // +Inf
     }
 }

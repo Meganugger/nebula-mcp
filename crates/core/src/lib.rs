@@ -7,6 +7,8 @@
 //! * [`security`] – the permission policy engine (paths, commands, limits).
 //! * [`telemetry`] – tracing/JSON logging and optional OpenTelemetry export.
 //! * [`metrics`] – lock-free per-tool metrics.
+//! * [`ratelimit`] – per-tool sliding-window rate limiting.
+//! * [`resource`] – the global CPU/memory budget guard.
 //! * [`tool`] – the [`tool::Tool`] trait and [`tool::ToolRegistry`].
 //! * [`context`] – the per-call [`context::ToolContext`].
 //! * [`error`] – the shared [`error::ToolError`] taxonomy.
@@ -21,6 +23,8 @@ pub mod context;
 pub mod error;
 pub mod hotreload;
 pub mod metrics;
+pub mod ratelimit;
+pub mod resource;
 pub mod security;
 pub mod telemetry;
 pub mod tool;
@@ -29,5 +33,7 @@ pub use context::ToolContext;
 pub use context::{ProgressSink, ProgressUpdate};
 pub use error::{Result, ToolError};
 pub use metrics::{Metrics, Outcome};
+pub use ratelimit::RateLimiter;
+pub use resource::{ResourceGuard, ResourceUsage};
 pub use telemetry::LogControl;
 pub use tool::{Tool, ToolRegistry};
