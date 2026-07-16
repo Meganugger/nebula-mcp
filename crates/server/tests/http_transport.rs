@@ -120,6 +120,144 @@ async fn initialize_over_http() {
     cancel.cancel();
 }
 
+/// A client requesting a modern revision the server supports must get that
+/// exact revision echoed back — not a stale hardcoded one.
+#[tokio::test]
+async fn initialize_negotiates_modern_protocol_version() {
+    let (url, cancel) = spawn_http().await;
+    let body: Value = client()
+        .post(&url)
+        .bearer_auth(TOKEN)
+        .json(&json!({
+            "jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"it","version":"1"}}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(body.get("error").is_none(), "unexpected error: {body}");
+    assert_eq!(body["result"]["protocolVersion"], "2025-06-18");
+    cancel.cancel();
+}
+
+/// Old-but-supported revisions are echoed back unchanged.
+#[tokio::test]
+async fn initialize_echoes_legacy_supported_version() {
+    let (url, cancel) = spawn_http().await;
+    let body: Value = client()
+        .post(&url)
+        .bearer_auth(TOKEN)
+        .json(&json!({
+            "jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"it","version":"1"}}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(body.get("error").is_none(), "unexpected error: {body}");
+    assert_eq!(body["result"]["protocolVersion"], "2024-11-05");
+    cancel.cancel();
+}
+
+/// An unknown/unsupported requested revision must not crash or error: the
+/// server offers its own latest supported revision and lets the client decide.
+#[tokio::test]
+async fn initialize_with_unknown_version_offers_latest_supported() {
+    let (url, cancel) = spawn_http().await;
+    let resp = client()
+        .post(&url)
+        .bearer_auth(TOKEN)
+        .json(&json!({
+            "jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"protocolVersion":"2020-01-01","capabilities":{},"clientInfo":{"name":"it","version":"1"}}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let body: Value = resp.json().await.unwrap();
+    assert!(body.get("error").is_none(), "unexpected error: {body}");
+    assert_eq!(
+        body["result"]["protocolVersion"],
+        nebula_mcp_protocol::LATEST_PROTOCOL_VERSION
+    );
+    cancel.cancel();
+}
+
+/// The `MCP-Protocol-Version` header on post-handshake requests is validated
+/// against what `initialize` actually negotiated: the negotiated version and
+/// an absent header (pre-2025-06-18 clients) pass; anything else is 400.
+#[tokio::test]
+async fn protocol_version_header_is_validated_against_negotiation() {
+    let (url, cancel) = spawn_http().await;
+    let c = client();
+
+    // Handshake at 2025-06-18 (no header required on initialize itself).
+    let init: Value = c
+        .post(&url)
+        .bearer_auth(TOKEN)
+        .json(&json!({
+            "jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"it","version":"1"}}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
+
+    // Header matching the negotiated version: accepted.
+    let resp = c
+        .post(&url)
+        .bearer_auth(TOKEN)
+        .header("MCP-Protocol-Version", "2025-06-18")
+        .json(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // No header: accepted for backwards compatibility.
+    let resp = c
+        .post(&url)
+        .bearer_auth(TOKEN)
+        .json(&json!({"jsonrpc":"2.0","id":3,"method":"ping"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // Header naming a different version than negotiated: 400 Bad Request.
+    let resp = c
+        .post(&url)
+        .bearer_auth(TOKEN)
+        .header("MCP-Protocol-Version", "1999-01-01")
+        .json(&json!({"jsonrpc":"2.0","id":4,"method":"ping"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // Same validation applies to the SSE GET stream.
+    let resp = c
+        .get(&url)
+        .bearer_auth(TOKEN)
+        .header("MCP-Protocol-Version", "1999-01-01")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    cancel.cancel();
+}
+
 #[tokio::test]
 async fn tools_list_and_call_over_http() {
     let (url, cancel) = spawn_http().await;

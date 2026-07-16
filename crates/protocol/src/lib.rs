@@ -16,10 +16,12 @@ pub mod transport;
 
 pub use jsonrpc::{error_codes, ErrorObject, Request, RequestId, Response, JSONRPC_VERSION};
 pub use mcp::{
-    CallToolParams, CallToolResult, ClientCapabilities, Content, GetPromptParams, GetPromptResult,
-    Implementation, InitializeParams, InitializeResult, ListPromptsResult, ListResourcesResult,
-    ListToolsResult, ProgressToken, Prompt, PromptArgument, PromptMessage, PromptsCapability,
-    ReadResourceParams, ReadResourceResult, Resource, ResourceContents, ResourcesCapability,
-    ServerCapabilities, SetLevelParams, Tool, ToolAnnotations, ToolsCapability, PROTOCOL_VERSION,
+    is_supported_protocol_version, negotiate_protocol_version, CallToolParams, CallToolResult,
+    ClientCapabilities, Content, GetPromptParams, GetPromptResult, Implementation,
+    InitializeParams, InitializeResult, ListPromptsResult, ListResourcesResult, ListToolsResult,
+    ProgressToken, Prompt, PromptArgument, PromptMessage, PromptsCapability, ReadResourceParams,
+    ReadResourceResult, Resource, ResourceContents, ResourcesCapability, ServerCapabilities,
+    SetLevelParams, Tool, ToolAnnotations, ToolsCapability, LATEST_PROTOCOL_VERSION,
+    SUPPORTED_PROTOCOL_VERSIONS,
 };
 pub use transport::{FrameReader, FrameWriter, TransportError};

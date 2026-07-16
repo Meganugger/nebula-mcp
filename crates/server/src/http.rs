@@ -199,6 +199,63 @@ fn authorize(state: &HttpState, headers: &HeaderMap) -> Option<AxumResponse> {
     }
 }
 
+/// The Streamable HTTP protocol-version header (header names are lowercase in
+/// axum's `HeaderMap`).
+const PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
+
+/// Validate the `MCP-Protocol-Version` header on non-`initialize` requests.
+///
+/// Per the Streamable HTTP transport spec (2025-06-18 onward) the client MUST
+/// send the version negotiated during `initialize` on every subsequent HTTP
+/// request, and the server MUST answer `400 Bad Request` when the header names
+/// an invalid or unsupported revision. A missing header is accepted for
+/// backwards compatibility (the spec tells servers to assume `2025-03-26`,
+/// which this server supports). When a handshake has already negotiated a
+/// version on this engine, the header must match it — not whatever the client
+/// assumes.
+fn check_protocol_version(state: &HttpState, headers: &HeaderMap) -> Option<AxumResponse> {
+    let presented = match headers
+        .get(PROTOCOL_VERSION_HEADER)
+        .map(|v| v.to_str().map(str::to_owned))
+    {
+        None => return None, // Absent: pre-2025-06-18 client; accepted.
+        Some(Ok(v)) => v,
+        Some(Err(_)) => {
+            return Some(
+                (
+                    StatusCode::BAD_REQUEST,
+                    "invalid MCP-Protocol-Version header: not valid UTF-8",
+                )
+                    .into_response(),
+            )
+        }
+    };
+    match state.server.negotiated_protocol_version() {
+        Some(negotiated) if presented == negotiated => None,
+        Some(negotiated) => Some(
+            (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "MCP-Protocol-Version '{presented}' does not match the version \
+                     negotiated during initialize ('{negotiated}')"
+                ),
+            )
+                .into_response(),
+        ),
+        None if nebula_mcp_protocol::is_supported_protocol_version(&presented) => None,
+        None => Some(
+            (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "unsupported MCP-Protocol-Version '{presented}'; supported versions: {}",
+                    nebula_mcp_protocol::SUPPORTED_PROTOCOL_VERSIONS.join(", ")
+                ),
+            )
+                .into_response(),
+        ),
+    }
+}
+
 /// Handle a `POST` carrying one JSON-RPC message or an array of them.
 async fn handle_post(
     State(state): State<Arc<HttpState>>,
@@ -225,6 +282,18 @@ async fn handle_post(
         serde_json::Value::Array(items) => items,
         other => vec![other],
     };
+
+    // The protocol-version header only applies to requests *after* the
+    // handshake — an `initialize` request is what establishes the version, so
+    // a body carrying one is exempt from the check.
+    let contains_initialize = messages
+        .iter()
+        .any(|m| m.get("method").and_then(|v| v.as_str()) == Some("initialize"));
+    if !contains_initialize {
+        if let Some(rejected) = check_protocol_version(&state, &headers) {
+            return rejected;
+        }
+    }
 
     let mut responses: Vec<Response> = Vec::new();
     for msg in messages {
@@ -279,6 +348,9 @@ async fn handle_get(State(state): State<Arc<HttpState>>, headers: HeaderMap) -> 
     if let Some(rejected) = authorize(&state, &headers) {
         return rejected;
     }
+    if let Some(rejected) = check_protocol_version(&state, &headers) {
+        return rejected;
+    }
     let rx = state.notifications.subscribe();
     let keep_alive_secs = state.config.sse_keep_alive_secs;
     let stream = async_stream::stream! {
@@ -319,6 +391,9 @@ async fn handle_get(State(state): State<Arc<HttpState>>, headers: HeaderMap) -> 
 /// Handle a `DELETE`: acknowledge session teardown.
 async fn handle_delete(State(state): State<Arc<HttpState>>, headers: HeaderMap) -> AxumResponse {
     if let Some(rejected) = authorize(&state, &headers) {
+        return rejected;
+    }
+    if let Some(rejected) = check_protocol_version(&state, &headers) {
         return rejected;
     }
     StatusCode::OK.into_response()

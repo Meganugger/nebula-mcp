@@ -1,8 +1,11 @@
 # API
 
 The server speaks the [Model Context Protocol](https://modelcontextprotocol.io)
-using JSON-RPC 2.0. It implements protocol revision **2024-11-05** and offers
-two transports that share the same method set below.
+using JSON-RPC 2.0. It supports protocol revisions **2024-11-05**,
+**2025-03-26**, **2025-06-18** and **2025-11-25** — the revision requested by
+the client in `initialize` is echoed back when supported, otherwise the server
+offers its latest supported revision (2025-11-25). It offers two transports
+that share the same method set below.
 
 ## Transports
 
@@ -32,6 +35,12 @@ Every request must present `Authorization: Bearer <token>` unless auth is
 explicitly disabled on a loopback bind. Malformed JSON yields `400` with a
 JSON-RPC parse-error body; a bad/absent token yields `401`.
 
+Per the Streamable HTTP spec, non-`initialize` requests should carry an
+`MCP-Protocol-Version` header naming the revision negotiated during
+`initialize`. A header naming any other revision yields `400 Bad Request`;
+an absent header is accepted for backwards compatibility with
+pre-2025-06-18 clients.
+
 The method set, parameters and results below are identical across both
 transports.
 
@@ -43,15 +52,15 @@ Request:
 
 ```json
 {"jsonrpc":"2.0","id":1,"method":"initialize",
- "params":{"protocolVersion":"2024-11-05","capabilities":{},
+ "params":{"protocolVersion":"2025-06-18","capabilities":{},
            "clientInfo":{"name":"my-agent","version":"1.0"}}}
 ```
 
-Result:
+Result (the negotiated `protocolVersion` echoes the request when supported):
 
 ```json
 {"jsonrpc":"2.0","id":1,"result":{
-  "protocolVersion":"2024-11-05",
+  "protocolVersion":"2025-06-18",
   "capabilities":{
     "tools":{"listChanged":false},
     "resources":{"subscribe":true,"listChanged":false},
@@ -220,8 +229,8 @@ Two distinct failure channels:
 ## Example session
 
 ```
-→ {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"a","version":"1"}}}
-← {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05", ...}}
+→ {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"a","version":"1"}}}
+← {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18", ...}}
 → {"jsonrpc":"2.0","method":"notifications/initialized"}
 → {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"terminal.run","arguments":{"program":"cargo","args":["test"]}}}
 ← {"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"{\"exitCode\":0,\"stdout\":\"...\"}"}],"isError":false}}

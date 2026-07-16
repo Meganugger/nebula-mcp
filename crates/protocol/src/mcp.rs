@@ -3,14 +3,50 @@
 //! Only the subset required to operate a fully featured *tools* server is
 //! modelled: initialization handshake, capability advertisement, tool
 //! discovery (`tools/list`) and tool invocation (`tools/call`). The shapes
-//! follow the MCP 2024-11-05 revision, which is what current agent clients
-//! (Claude Code, Cursor, Codex) speak.
+//! are stable across the MCP revisions listed in
+//! [`SUPPORTED_PROTOCOL_VERSIONS`]; the exact revision spoken by a session is
+//! settled during the `initialize` handshake via
+//! [`negotiate_protocol_version`].
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Protocol revision this server implements and advertises.
-pub const PROTOCOL_VERSION: &str = "2024-11-05";
+/// Protocol revisions this server implements, ordered oldest → newest.
+///
+/// A revision belongs in this list only when every server-side requirement it
+/// introduces is actually implemented. The features this server ships — tools
+/// with annotations, resources with subscriptions, prompts, logging,
+/// progress notifications with `message`, and the Streamable HTTP transport
+/// with `MCP-Protocol-Version` header validation — cover the mandatory
+/// server-side surface of each listed revision; everything newer revisions
+/// add beyond that (structured tool output, elicitation, tasks, icons,
+/// OAuth discovery, …) is opt-in via capabilities this server does not
+/// advertise.
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
+    &["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
+
+/// The newest protocol revision this server supports.
+pub const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
+
+/// Negotiate the protocol version per the MCP lifecycle specification.
+///
+/// If the client's requested version is one this server supports, it is
+/// echoed back. Otherwise the server offers [`LATEST_PROTOCOL_VERSION`] and
+/// the client decides whether to proceed or disconnect.
+#[must_use]
+pub fn negotiate_protocol_version(requested: &str) -> &'static str {
+    SUPPORTED_PROTOCOL_VERSIONS
+        .iter()
+        .copied()
+        .find(|v| *v == requested)
+        .unwrap_or(LATEST_PROTOCOL_VERSION)
+}
+
+/// Whether `version` is a revision this server implements.
+#[must_use]
+pub fn is_supported_protocol_version(version: &str) -> bool {
+    SUPPORTED_PROTOCOL_VERSIONS.contains(&version)
+}
 
 /// Parameters for the `initialize` request sent by the client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -418,9 +454,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn negotiation_echoes_supported_versions() {
+        for v in SUPPORTED_PROTOCOL_VERSIONS {
+            assert_eq!(negotiate_protocol_version(v), *v);
+        }
+    }
+
+    #[test]
+    fn negotiation_offers_latest_for_unknown_versions() {
+        assert_eq!(
+            negotiate_protocol_version("2020-01-01"),
+            LATEST_PROTOCOL_VERSION
+        );
+        assert_eq!(negotiate_protocol_version(""), LATEST_PROTOCOL_VERSION);
+        assert_eq!(
+            negotiate_protocol_version("not-a-date"),
+            LATEST_PROTOCOL_VERSION
+        );
+    }
+
+    #[test]
+    fn latest_is_in_supported_list() {
+        assert!(is_supported_protocol_version(LATEST_PROTOCOL_VERSION));
+        assert_eq!(
+            SUPPORTED_PROTOCOL_VERSIONS.last(),
+            Some(&LATEST_PROTOCOL_VERSION)
+        );
+        assert!(!is_supported_protocol_version("1999-01-01"));
+    }
+
+    #[test]
     fn initialize_result_uses_camel_case() {
         let result = InitializeResult {
-            protocol_version: PROTOCOL_VERSION.into(),
+            protocol_version: LATEST_PROTOCOL_VERSION.into(),
             capabilities: ServerCapabilities {
                 tools: Some(ToolsCapability {
                     list_changed: Some(false),

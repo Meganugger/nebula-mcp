@@ -16,10 +16,10 @@ use nebula_mcp_core::{
     LogControl, Metrics, Outcome, ProgressSink, ToolContext, ToolError, ToolRegistry,
 };
 use nebula_mcp_protocol::{
-    error_codes, CallToolParams, CallToolResult, Content, ErrorObject, FrameReader, FrameWriter,
-    GetPromptParams, Implementation, InitializeResult, ListToolsResult, PromptsCapability,
-    ReadResourceParams, Request, ResourcesCapability, Response, ServerCapabilities, SetLevelParams,
-    ToolsCapability, PROTOCOL_VERSION,
+    error_codes, negotiate_protocol_version, CallToolParams, CallToolResult, Content, ErrorObject,
+    FrameReader, FrameWriter, GetPromptParams, Implementation, InitializeResult, ListToolsResult,
+    PromptsCapability, ReadResourceParams, Request, ResourcesCapability, Response,
+    ServerCapabilities, SetLevelParams, ToolsCapability, LATEST_PROTOCOL_VERSION,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::UnboundedSender;
@@ -36,6 +36,10 @@ pub struct Server {
     inflight: Arc<DashMap<String, CancellationToken>>,
     root_cancel: CancellationToken,
     initialized: Arc<AtomicBool>,
+    /// Protocol revision settled during the `initialize` handshake. `None`
+    /// until a client has initialized; transports use it to validate the
+    /// `MCP-Protocol-Version` header against what was actually negotiated.
+    negotiated_protocol: std::sync::Mutex<Option<&'static str>>,
     /// Sink for server-initiated notifications (progress). Set for the
     /// duration of `serve`.
     notifier: std::sync::Mutex<Option<UnboundedSender<serde_json::Value>>>,
@@ -63,6 +67,7 @@ impl Server {
             inflight: Arc::new(DashMap::new()),
             root_cancel,
             initialized: Arc::new(AtomicBool::new(false)),
+            negotiated_protocol: std::sync::Mutex::new(None),
             notifier: std::sync::Mutex::new(None),
             log_control: std::sync::Mutex::new(None),
             subscriptions: crate::resources::SubscriptionManager::new(),
@@ -266,10 +271,31 @@ impl Server {
         let id = req.id.clone();
         match req.method.as_str() {
             "initialize" => {
+                // Version negotiation per the MCP lifecycle spec: echo the
+                // client's requested revision when we support it, otherwise
+                // offer our latest supported revision and let the client
+                // decide whether to proceed. The requested version is read
+                // leniently so a malformed/absent field degrades to offering
+                // our latest rather than failing the handshake.
+                let requested = req
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("protocolVersion"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(LATEST_PROTOCOL_VERSION);
+                let negotiated = negotiate_protocol_version(requested);
+                if negotiated != requested {
+                    tracing::info!(
+                        requested,
+                        negotiated,
+                        "client requested an unsupported protocol version; offering ours"
+                    );
+                }
+                *self.negotiated_protocol.lock().unwrap() = Some(negotiated);
                 self.initialized.store(true, Ordering::SeqCst);
                 Some(Response::success(
                     id,
-                    serde_json::to_value(self.initialize_result()).unwrap_or_default(),
+                    serde_json::to_value(self.initialize_result(negotiated)).unwrap_or_default(),
                 ))
             }
             "ping" => Some(Response::success(id, serde_json::json!({}))),
@@ -431,10 +457,15 @@ impl Server {
         }
     }
 
-    fn initialize_result(&self) -> InitializeResult {
+    /// Protocol revision negotiated during `initialize`, if any yet.
+    pub fn negotiated_protocol_version(&self) -> Option<&'static str> {
+        *self.negotiated_protocol.lock().unwrap()
+    }
+
+    fn initialize_result(&self, negotiated: &str) -> InitializeResult {
         let config = self.config.snapshot();
         InitializeResult {
-            protocol_version: PROTOCOL_VERSION.to_string(),
+            protocol_version: negotiated.to_string(),
             capabilities: ServerCapabilities {
                 tools: Some(ToolsCapability {
                     list_changed: Some(false),
@@ -647,7 +678,7 @@ mod tests {
             id: Some(RequestId::Number(1)),
             method: "initialize".into(),
             params: Some(serde_json::json!({
-                "protocolVersion": PROTOCOL_VERSION,
+                "protocolVersion": LATEST_PROTOCOL_VERSION,
                 "capabilities": {},
                 "clientInfo": {"name": "test", "version": "0"}
             })),
