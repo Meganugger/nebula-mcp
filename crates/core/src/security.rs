@@ -10,8 +10,8 @@
 //! * maximum captured output,
 //! * elevation, network and destructive-operation gates.
 //!
-//! There is deliberately **no** "allow everything" escape hatch: an empty
-//! allowlist denies rather than permits.
+//! An empty allowlist denies rather than permits. The only "allow everything"
+//! switch is an explicit standalone `"*"` entry in `allowed_commands`.
 
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
@@ -236,7 +236,8 @@ impl EffectivePolicy {
     /// Validate an executable name/path against the command allowlist.
     ///
     /// Matching is by basename (without a trailing `.exe`), case-insensitive on
-    /// Windows. Returns the original program string on success.
+    /// Windows. A standalone `"*"` entry permits every command name. Returns the
+    /// original program string on success.
     pub fn check_command(&self, program: &str) -> Result<(), ToolError> {
         if self.allowed_commands.is_empty() {
             return Err(ToolError::CommandNotAllowed(program.to_string()));
@@ -245,7 +246,7 @@ impl EffectivePolicy {
         let permitted = self
             .allowed_commands
             .iter()
-            .any(|c| command_key(c) == candidate);
+            .any(|c| c == "*" || command_key(c) == candidate);
         if permitted {
             Ok(())
         } else {
@@ -400,6 +401,34 @@ mod tests {
     fn empty_command_allowlist_denies() {
         let p = policy_with(&[], &[]);
         assert!(p.check_command("git").is_err());
+    }
+
+    #[test]
+    fn wildcard_command_allowlist_permits_any_command() {
+        let p = policy_with(&[], &["*"]);
+        for program in [
+            "powershell.exe",
+            "git",
+            "/usr/bin/python3",
+            "C:\\Tools\\some-arbitrary-tool.exe",
+            "totally-unknown-binary",
+        ] {
+            assert!(p.check_command(program).is_ok(), "{program} should be allowed");
+        }
+
+        // Without a standalone "*" entry the allowlist stays exact.
+        let p = policy_with(&[], &["powershell.exe"]);
+        assert!(p.check_command("powershell.exe").is_ok());
+        assert!(p.check_command("git.exe").is_err());
+
+        let p = policy_with(&[], &["git.exe", "python.exe"]);
+        assert!(p.check_command("git.exe").is_ok());
+        assert!(p.check_command("python.exe").is_ok());
+        assert!(p.check_command("cargo.exe").is_err());
+
+        // "*" is only a wildcard as a standalone entry, not as a glob.
+        let p = policy_with(&[], &["git*"]);
+        assert!(p.check_command("github").is_err());
     }
 
     #[test]
