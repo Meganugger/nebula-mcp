@@ -13,7 +13,7 @@ use nebula_mcp_protocol::CallToolResult;
 use serde_json::Value;
 
 use crate::config::Config;
-use crate::context::ToolContext;
+use super::context::ToolContext;
 use crate::error::Result;
 
 /// A single MCP tool.
