@@ -5,14 +5,25 @@ on:
     branches: ["**"]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
 jobs:
-  linux:
-    name: Linux — build, test, lint
+  lint:
+    name: Format and lint
+    # Branch pushes in this repository already run CI, so the pull_request
+    # event only needs to run for forks. Each commit is then tested once.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -22,17 +33,44 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    name: Test (${{ matrix.os }})
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # --no-fail-fast: one failing test binary must not hide the others.
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked --no-fail-fast
+
+  release-build:
+    name: Release and feature builds
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Build release
-        run: cargo build --release
+        run: cargo build --release --locked
       - name: OpenTelemetry feature builds
-        run: cargo build -p nebula-mcp-server --features otel
+        run: cargo build -p nebula-mcp-server --features otel --locked
 
   windows-crosscheck:
-    name: Linux → Windows cross-check
+    name: Linux to Windows type-check
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -42,16 +80,4 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
       - uses: Swatinem/rust-cache@v2
       - name: Type-check Windows target
-        run: cargo check --workspace --target x86_64-pc-windows-gnu
-
-  windows:
-    name: Windows — build, test
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build
-        run: cargo build --workspace
-      - name: Test
-        run: cargo test --workspace
+        run: cargo check --workspace --locked --target x86_64-pc-windows-gnu

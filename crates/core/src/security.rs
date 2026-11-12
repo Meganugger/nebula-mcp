@@ -413,7 +413,10 @@ mod tests {
             "C:\\Tools\\some-arbitrary-tool.exe",
             "totally-unknown-binary",
         ] {
-            assert!(p.check_command(program).is_ok(), "{program} should be allowed");
+            assert!(
+                p.check_command(program).is_ok(),
+                "{program} should be allowed"
+            );
         }
 
         // Without a standalone "*" entry the allowlist stays exact.
