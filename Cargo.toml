@@ -58,6 +58,11 @@ num_cpus = "1.16"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 url = "2.5"
 
+# Confinement primitives used by the core crate
+cap-std = "4.0"
+cap-fs-ext = "4.0"
+process-wrap = { version = "10.0", default-features = false, features = ["tokio1", "process-group", "job-object", "kill-on-drop"] }
+
 # Dev
 tempfile = "3.12"
 
