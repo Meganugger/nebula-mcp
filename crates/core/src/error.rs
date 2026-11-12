@@ -49,6 +49,18 @@ pub enum ToolError {
         limit: usize,
     },
 
+    /// A file, directory or other named thing does not exist.
+    #[error("not found: {0}")]
+    NotFound(String),
+
+    /// Something that must not exist already does.
+    #[error("already exists: {0}")]
+    AlreadyExists(String),
+
+    /// The server is at capacity; the caller should retry later.
+    #[error("server busy: {0}")]
+    Busy(String),
+
     /// A required external tool (git, cargo, docker, ...) was not found.
     #[error("required external tool not found: {0}")]
     ToolNotFound(String),
@@ -82,6 +94,9 @@ impl ToolError {
             ToolError::Timeout(_) | ToolError::Cancelled => error_codes::REQUEST_CANCELLED,
             ToolError::OutputTooLarge { .. }
             | ToolError::ToolNotFound(_)
+            | ToolError::NotFound(_)
+            | ToolError::AlreadyExists(_)
+            | ToolError::Busy(_)
             | ToolError::PlatformUnsupported(_)
             | ToolError::Io(_)
             | ToolError::Execution(_) => error_codes::TOOL_EXECUTION_ERROR,
@@ -101,6 +116,9 @@ impl ToolError {
             ToolError::Cancelled => "cancelled",
             ToolError::OutputTooLarge { .. } => "output_too_large",
             ToolError::ToolNotFound(_) => "tool_not_found",
+            ToolError::NotFound(_) => "not_found",
+            ToolError::AlreadyExists(_) => "already_exists",
+            ToolError::Busy(_) => "server_busy",
             ToolError::PlatformUnsupported(_) => "platform_unsupported",
             ToolError::Io(_) => "io",
             ToolError::Execution(_) => "execution",
