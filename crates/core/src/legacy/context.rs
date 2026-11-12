@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::Config;
 use crate::error::ToolError;
 use crate::metrics::Metrics;
-use crate::security::EffectivePolicy;
+use super::security::EffectivePolicy;
 
 /// A single progress update emitted by a tool during a long-running call.
 ///
