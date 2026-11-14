@@ -1,11 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
+    # Re-added as each crate is ported to the 0.2 core (see OVERHAUL_LOG.md).
     "crates/protocol",
     "crates/core",
-    "crates/tools",
-    "crates/server",
 ]
+
+exclude = ["crates/tools", "crates/server"]
 
 [workspace.package]
 version = "0.1.0"
@@ -46,6 +47,8 @@ regex = "1.10"
 notify = "6.1"
 notify-debouncer-mini = "0.4"
 which = "6.0"
+cap-std = "4.0"
+cap-fs-ext = "4.0"
 shell-words = "1.1"
 uuid = { version = "1.10", features = ["v4", "serde"] }
 time = { version = "0.3", features = ["formatting", "macros"] }
