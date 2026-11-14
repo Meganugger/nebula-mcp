@@ -1,153 +1,96 @@
-//! TOML-backed configuration with hot reload.
+//! TOML configuration.
 //!
-//! The configuration is split into a small number of sections:
+//! Sections:
 //!
-//! * `[server]`   – identity and MCP handshake metadata.
-//! * `[logging]`  – tracing/telemetry sinks and verbosity.
-//! * `[security]` – the global permission baseline every tool inherits.
-//! * `[tools.<name>]` – optional per-tool overrides layered on the baseline.
+//! * `[server]`    – identity, concurrency and which tool categories are exposed.
+//! * `[logging]`   – log sinks and verbosity.
+//! * `[security]`  – the permission baseline every tool call is checked against.
+//! * `[limits]`    – resource ceilings for long-lived state.
+//! * `[transport]` – the HTTP transport and its authentication.
+//! * `[tools.<name>]` – per-tool overrides layered on the baseline.
 //!
-//! A [`ConfigStore`] owns the parsed config behind an atomic swap so hot
-//! reloads are lock-free for readers. See [`crate::hotreload`] for the file
-//! watcher that drives reloads.
+//! Unknown keys are errors: a typo in a switch that is meant to restrict
+//! something must not silently leave it open.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
-use crate::error::ToolError;
+/// A configuration error, worded for the operator.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{0}")]
+pub struct ConfigError(pub String);
 
-/// Root configuration document.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Config {
-    /// Server identity and handshake metadata.
-    pub server: ServerConfig,
-    /// Logging and telemetry configuration.
-    pub logging: LoggingConfig,
-    /// Global permission baseline.
-    pub security: SecurityConfig,
-    /// Transport configuration (stdio and/or remote HTTP).
-    pub transport: TransportConfig,
-    /// Per-tool overrides keyed by fully-qualified tool name.
-    pub tools: BTreeMap<String, ToolOverride>,
-    /// Per-category enable switches keyed by category name (e.g. `network`).
-    pub categories: BTreeMap<String, CategoryConfig>,
-}
-
-/// How the server is exposed to clients.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct TransportConfig {
-    /// Remote HTTP (MCP Streamable HTTP) transport. Disabled by default; when
-    /// enabled the server listens for JSON-RPC over HTTP so it can be reached
-    /// by a URL from an AI platform.
-    pub http: HttpConfig,
-}
-
-/// Configuration for the remote HTTP (Streamable HTTP) transport.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct HttpConfig {
-    /// Enable the HTTP transport.
-    pub enabled: bool,
-    /// Socket address to bind. Defaults to loopback; set to `0.0.0.0:<port>`
-    /// only when you intend to expose the server beyond this machine (and put
-    /// it behind TLS + authentication).
-    pub bind: String,
-    /// The single MCP endpoint path clients POST/GET against.
-    pub path: String,
-    /// Bearer tokens accepted in the `Authorization: Bearer <token>` header.
-    /// Any match grants access. Ignored when `require_auth` is false.
-    pub auth_tokens: Vec<String>,
-    /// Require a valid bearer token on every request. Strongly recommended
-    /// whenever `bind` is not loopback; refusing to start otherwise.
-    pub require_auth: bool,
-    /// Permitted `Origin` header values (exact match) for browser-based
-    /// clients. Empty allows requests without an `Origin` header (native
-    /// clients) and denies cross-origin browser requests.
-    pub allowed_origins: Vec<String>,
-    /// Maximum accepted request body size, in bytes (DoS guard).
-    pub max_body_bytes: usize,
-    /// Seconds between keep-alive comment lines written on the `GET` SSE
-    /// stream. An idle SSE response carries zero bytes of traffic, so tunnels
-    /// and proxies (ngrok, Cloudflare Tunnel, NATs) silently reap it after
-    /// their idle timeout; the heartbeat keeps the connection warm. Set to `0`
-    /// to disable.
-    pub sse_keep_alive_secs: u64,
-}
-
-impl Default for HttpConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            bind: "127.0.0.1:8765".to_string(),
-            path: "/mcp".to_string(),
-            auth_tokens: Vec::new(),
-            require_auth: true,
-            allowed_origins: Vec::new(),
-            max_body_bytes: 16 * 1024 * 1024,
-            sse_keep_alive_secs: 20,
-        }
+impl ConfigError {
+    fn new(msg: impl Into<String>) -> Self {
+        Self(msg.into())
     }
 }
 
-/// Server identity section.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+/// Root configuration document.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Config {
+    /// Server identity and tool exposure.
+    pub server: ServerConfig,
+    /// Logging and telemetry.
+    pub logging: LoggingConfig,
+    /// Permission baseline.
+    pub security: SecurityConfig,
+    /// Resource ceilings.
+    pub limits: LimitsConfig,
+    /// Transports.
+    pub transport: TransportConfig,
+    /// Per-tool overrides keyed by tool name (for example `fs_delete`).
+    pub tools: BTreeMap<String, ToolOverride>,
+}
+
+/// Server identity and exposure.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
     /// Advertised server name.
     pub name: String,
-    /// Advertised server version.
-    pub version: String,
-    /// Optional instructions surfaced to the model during initialize.
+    /// Replaces the built-in instructions shown to the model, when set.
     pub instructions: Option<String>,
-    /// Maximum number of tool calls executed concurrently.
+    /// Tool categories exposed to clients. Nothing is exposed unless listed.
+    pub categories: Vec<String>,
+    /// Tool calls executing at once.
     pub max_concurrent_calls: usize,
+    /// Tool calls allowed to wait for a slot; further calls are refused.
+    pub max_queued_calls: usize,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             name: "nebula-mcp".to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            instructions: Some(
-                "Nebula MCP: a general-purpose autonomous software-engineering backend. \
-                 It exposes the host machine's filesystem, terminal/process control, git, \
-                 GitHub, networking, containers, browser automation and job scheduling so an \
-                 AI agent can design, build, test and ship any program end-to-end. \
-                 Cross-platform tools work everywhere; powershell/windows/diagnostics tools \
-                 require a Windows host. Every call is gated by an allowlist-based permission \
-                 policy — nothing is permitted until it is configured."
-                    .to_string(),
-            ),
+            instructions: None,
+            categories: Vec::new(),
             max_concurrent_calls: 16,
+            max_queued_calls: 64,
         }
     }
 }
 
 /// Logging / telemetry section.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct LoggingConfig {
-    /// Verbosity filter (`error`, `warn`, `info`, `debug`, `trace`, or an
-    /// `env_logger`-style directive such as `nebula=debug,info`).
+    /// Verbosity: `error`, `warn`, `info`, `debug` or `trace`.
     pub level: String,
     /// Output format for the file sink.
     pub format: LogFormat,
-    /// Directory to write rotating log files into. `None` disables file logs.
+    /// Directory for rotating log files. Unset disables file logs.
     pub directory: Option<PathBuf>,
     /// Log file name prefix.
     pub file_prefix: String,
     /// Rotation cadence for file logs.
     pub rotation: LogRotation,
-    /// When set, an OTLP endpoint URL to export traces to. Presence toggles
-    /// OpenTelemetry export in the server binary.
+    /// OTLP endpoint for trace export (needs the `otel` build feature).
     pub otel_endpoint: Option<String>,
-    /// Emit per-tool metrics summaries to the logs.
+    /// Log a per-tool metrics summary at shutdown.
     pub emit_metrics: bool,
 }
 
@@ -171,7 +114,7 @@ impl Default for LoggingConfig {
 pub enum LogFormat {
     /// Structured JSON, one object per line.
     Json,
-    /// Human-readable, coloured when a TTY.
+    /// Human-readable.
     Pretty,
 }
 
@@ -179,259 +122,531 @@ pub enum LogFormat {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogRotation {
-    /// Rotate every minute (useful for stress tests).
+    /// Rotate every minute.
     Minutely,
     /// Rotate hourly.
     Hourly,
     /// Rotate daily.
     Daily,
-    /// Never rotate (single growing file).
+    /// Never rotate.
     Never,
 }
 
-/// Global permission baseline. Every tool inherits these unless overridden.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+/// Permission baseline. Every tool call is checked against it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct SecurityConfig {
-    /// Glob patterns of paths tools may access. Empty means "deny all file
-    /// access" — a safe default that forces explicit configuration.
+    /// Directories tools may work in. Empty denies all file access. Each
+    /// entry is a directory; everything beneath it, and the directory itself,
+    /// is allowed. `~` expands to the home directory.
     pub allowed_paths: Vec<String>,
-    /// Glob patterns explicitly denied even if matched by `allowed_paths`.
+    /// Extra glob patterns denied for all access, added to the built-in set.
     pub denied_paths: Vec<String>,
-    /// Executable names permitted for process/terminal tools (basename match,
-    /// case-insensitive on Windows). Empty means "deny all execution".
+    /// Extra glob patterns that may be read but not written.
+    pub read_only_paths: Vec<String>,
+    /// Keep the built-in deny patterns for credentials and keys.
+    pub builtin_denied_paths: bool,
+    /// Programs the arbitrary-execution tools may run: bare names resolved
+    /// on the server's `PATH`, or absolute paths. `"*"` allows everything.
     pub allowed_commands: Vec<String>,
+    /// Environment variable names (globs) passed to child processes in
+    /// addition to the built-in base set.
+    pub env_passthrough: Vec<String>,
+    /// Environment variable names (globs) a caller may set on a child.
+    pub caller_env: Vec<String>,
     /// Default per-call timeout in seconds.
     pub default_timeout_secs: u64,
-    /// Absolute maximum runtime a single call may request, in seconds.
+    /// Ceiling for any single call, in seconds.
     pub max_runtime_secs: u64,
-    /// Maximum captured output per stream, in bytes.
+    /// Maximum bytes returned per output stream or file read.
     pub max_output_bytes: usize,
-    /// Whether tools may request elevated (admin/root) execution.
-    pub allow_elevated: bool,
-    /// Whether tools that reach external networks are permitted.
+    /// Allow tools that reach the network.
     pub allow_network: bool,
-    /// Whether destructive operations (delete, reset --hard, driver uninstall)
-    /// are permitted at all.
+    /// When non-empty, the only hosts network tools may contact (exact
+    /// names or `*.example.com`).
+    pub allowed_hosts: Vec<String>,
+    /// Allow loopback, private, link-local and other non-public addresses.
+    pub allow_private_network: bool,
+    /// Allow destructive operations.
     pub allow_destructive: bool,
+    /// Allow operations that need administrator / root rights.
+    pub allow_elevated: bool,
+    /// Operating-system confinement of spawned processes.
+    pub sandbox: SandboxConfig,
 }
 
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
             allowed_paths: Vec::new(),
-            denied_paths: default_denied_paths(),
+            denied_paths: Vec::new(),
+            read_only_paths: Vec::new(),
+            builtin_denied_paths: true,
             allowed_commands: Vec::new(),
+            env_passthrough: Vec::new(),
+            caller_env: Vec::new(),
             default_timeout_secs: 120,
             max_runtime_secs: 3600,
-            max_output_bytes: 8 * 1024 * 1024,
-            allow_elevated: false,
-            allow_network: true,
+            max_output_bytes: 1024 * 1024,
+            allow_network: false,
+            allowed_hosts: Vec::new(),
+            allow_private_network: false,
             allow_destructive: false,
+            allow_elevated: false,
+            sandbox: SandboxConfig::default(),
         }
     }
 }
 
-/// Sensitive paths denied by default on every platform.
-fn default_denied_paths() -> Vec<String> {
-    vec![
-        "**/.ssh/**".to_string(),
-        "**/.aws/**".to_string(),
-        "**/.gnupg/**".to_string(),
-        "**/*.pem".to_string(),
-        "**/*.key".to_string(),
-        "**/id_rsa*".to_string(),
-        "**/.env".to_string(),
-    ]
+/// Operating-system confinement of spawned processes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SandboxConfig {
+    /// `off`, `auto` (confine when the platform supports it) or `require`
+    /// (refuse to spawn when it does not).
+    pub mode: SandboxMode,
+    /// Extra directories children may read, beyond the allowed roots and the
+    /// system directories.
+    pub read_paths: Vec<String>,
+    /// Extra directories children may write, beyond the allowed roots and
+    /// the temp directory.
+    pub write_paths: Vec<String>,
 }
 
-/// Optional per-tool override. All fields are optional; unset fields fall back
-/// to the [`SecurityConfig`] baseline.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self {
+            mode: SandboxMode::Off,
+            read_paths: Vec::new(),
+            write_paths: Vec::new(),
+        }
+    }
+}
+
+/// How spawned processes are confined by the operating system.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SandboxMode {
+    /// No OS confinement.
+    Off,
+    /// Confine when supported, otherwise run unconfined with a warning.
+    Auto,
+    /// Confine, and refuse to spawn where confinement is unavailable.
+    Require,
+}
+
+/// Resource ceilings for state that outlives a single call.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LimitsConfig {
+    /// Largest accepted JSON-RPC message on stdio, in bytes.
+    pub max_message_bytes: usize,
+    /// Interactive terminal sessions per client.
+    pub max_terminal_sessions: usize,
+    /// Seconds an idle terminal session is kept.
+    pub terminal_session_idle_secs: u64,
+    /// Scheduled jobs per client.
+    pub max_scheduled_jobs: usize,
+    /// Resource subscriptions per client.
+    pub max_subscriptions: usize,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_message_bytes: 4 * 1024 * 1024,
+            max_terminal_sessions: 8,
+            terminal_session_idle_secs: 1800,
+            max_scheduled_jobs: 16,
+            max_subscriptions: 64,
+        }
+    }
+}
+
+/// How the server is exposed to clients.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TransportConfig {
+    /// Streamable HTTP transport. Disabled by default.
+    pub http: HttpConfig,
+}
+
+/// Configuration for the Streamable HTTP transport.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HttpConfig {
+    /// Enable the HTTP transport.
+    pub enabled: bool,
+    /// Socket address to bind.
+    pub bind: String,
+    /// The MCP endpoint path.
+    pub path: String,
+    /// The URL clients use to reach the endpoint through a tunnel or proxy,
+    /// for example `https://mcp.example.com/mcp`. Required for OAuth.
+    pub public_url: Option<String>,
+    /// Static bearer tokens accepted in `Authorization: Bearer <token>`.
+    pub auth_tokens: Vec<String>,
+    /// Require authentication on every request.
+    pub require_auth: bool,
+    /// `Origin` values allowed for browser clients (exact match).
+    pub allowed_origins: Vec<String>,
+    /// Extra `Host` values accepted besides loopback names and the host of
+    /// `public_url`.
+    pub allowed_hosts: Vec<String>,
+    /// Maximum request body size in bytes.
+    pub max_body_bytes: usize,
+    /// Seconds between keep-alive comments on event streams. `0` disables.
+    pub sse_keep_alive_secs: u64,
+    /// Simultaneous connections.
+    pub max_connections: usize,
+    /// Seconds allowed for a client to send its request headers and body.
+    pub read_timeout_secs: u64,
+    /// Legacy protocol sessions kept at once.
+    pub max_sessions: usize,
+    /// Seconds an idle legacy session is kept.
+    pub session_idle_secs: u64,
+    /// OAuth 2.1 authorization for clients that cannot send a static token.
+    pub oauth: OAuthConfig,
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: "127.0.0.1:8765".to_string(),
+            path: "/mcp".to_string(),
+            public_url: None,
+            auth_tokens: Vec::new(),
+            require_auth: true,
+            allowed_origins: Vec::new(),
+            allowed_hosts: Vec::new(),
+            max_body_bytes: 4 * 1024 * 1024,
+            sse_keep_alive_secs: 20,
+            max_connections: 64,
+            read_timeout_secs: 30,
+            max_sessions: 64,
+            session_idle_secs: 3600,
+            oauth: OAuthConfig::default(),
+        }
+    }
+}
+
+/// Embedded single-operator OAuth 2.1 authorization server.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OAuthConfig {
+    /// Serve the OAuth endpoints and accept tokens they issue.
+    pub enabled: bool,
+    /// The secret the operator types on the consent page to approve a client.
+    pub approval_secret: Option<String>,
+    /// Lifetime of an access token, in seconds.
+    pub access_token_ttl_secs: u64,
+    /// Lifetime of a refresh token, in seconds.
+    pub refresh_token_ttl_secs: u64,
+    /// File where registered clients and refresh tokens persist across
+    /// restarts. Unset keeps them in memory only.
+    pub state_file: Option<PathBuf>,
+}
+
+impl Default for OAuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            approval_secret: None,
+            access_token_ttl_secs: 3600,
+            refresh_token_ttl_secs: 30 * 24 * 3600,
+            state_file: None,
+        }
+    }
+}
+
+/// Per-tool override. Unset fields fall back to `[security]`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ToolOverride {
-    /// Explicitly enable/disable this tool.
+    /// Disable (or explicitly enable) this tool within an enabled category.
     pub enabled: Option<bool>,
-    /// Override timeout in seconds.
+    /// Default timeout in seconds.
     pub timeout_secs: Option<u64>,
-    /// Override maximum output bytes.
+    /// Maximum output bytes.
     pub max_output_bytes: Option<usize>,
-    /// Additional allowed paths (merged with the baseline).
+    /// Additional allowed directories for this tool.
     pub allowed_paths: Option<Vec<String>>,
-    /// Additional allowed commands (merged with the baseline).
+    /// Additional allowed commands for this tool.
     pub allowed_commands: Option<Vec<String>>,
-    /// Override the destructive flag for this tool.
+    /// Network gate for this tool.
+    pub allow_network: Option<bool>,
+    /// Destructive gate for this tool.
     pub allow_destructive: Option<bool>,
-    /// Override the elevation flag for this tool (least-privilege scoping).
+    /// Elevation gate for this tool.
     pub allow_elevated: Option<bool>,
 }
 
-/// Per-category enable switch. A disabled category disables all of its tools.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct CategoryConfig {
-    /// Whether the category is enabled.
-    pub enabled: bool,
-}
-
-impl Default for CategoryConfig {
-    fn default() -> Self {
-        Self { enabled: true }
-    }
+/// The names a configuration may refer to, supplied by the tool registry.
+#[derive(Debug, Clone, Default)]
+pub struct Catalog {
+    /// Every category name.
+    pub categories: Vec<String>,
+    /// Every tool name.
+    pub tools: Vec<String>,
 }
 
 impl Config {
-    /// Parse a config document from a TOML string.
-    pub fn from_toml_str(text: &str) -> Result<Self, ToolError> {
-        toml::from_str(text).map_err(|e| ToolError::Internal(format!("invalid config: {e}")))
+    /// Parse a config document, rejecting unknown keys and explaining keys
+    /// that existed before 0.2.
+    pub fn from_toml_str(text: &str) -> Result<Self, ConfigError> {
+        if let Ok(raw) = toml::from_str::<toml::Value>(text) {
+            if let Some(msg) = legacy_key_message(&raw) {
+                return Err(ConfigError::new(msg));
+            }
+        }
+        toml::from_str(text).map_err(|e| ConfigError::new(format!("invalid configuration: {e}")))
     }
 
     /// Load a config document from disk.
-    pub fn load(path: &Path) -> Result<Self, ToolError> {
+    pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let text = std::fs::read_to_string(path)
-            .map_err(|e| ToolError::Io(format!("reading config {}: {e}", path.display())))?;
+            .map_err(|e| ConfigError::new(format!("reading {}: {e}", path.display())))?;
         Self::from_toml_str(&text)
     }
 
-    /// Serialise this config back to a TOML string.
-    pub fn to_toml_string(&self) -> Result<String, ToolError> {
+    /// Serialise this config to TOML.
+    pub fn to_toml_string(&self) -> Result<String, ConfigError> {
         toml::to_string_pretty(self)
-            .map_err(|e| ToolError::Internal(format!("serialising config: {e}")))
+            .map_err(|e| ConfigError::new(format!("serialising configuration: {e}")))
     }
 
-    /// Return `true` if the given tool (in the given category) is enabled.
-    ///
-    /// A tool is enabled unless its category is disabled or its own
-    /// `enabled = false` override is set.
-    #[must_use]
-    pub fn is_tool_enabled(&self, category: &str, tool: &str) -> bool {
-        if let Some(cat) = self.categories.get(category) {
-            if !cat.enabled {
-                return false;
+    /// Check names against the registry and values against their ranges.
+    /// Returns warnings; an `Err` means the config must not be used.
+    pub fn validate(&self, catalog: &Catalog) -> Result<Vec<String>, ConfigError> {
+        let mut warnings = Vec::new();
+        for c in &self.server.categories {
+            if !catalog.categories.iter().any(|k| k == c) {
+                return Err(ConfigError::new(format!(
+                    "[server] categories: unknown category '{c}'. Known categories: {}",
+                    catalog.categories.join(", ")
+                )));
             }
         }
-        match self.tools.get(tool) {
-            Some(o) => o.enabled.unwrap_or(true),
-            None => true,
+        for name in self.tools.keys() {
+            if !catalog.tools.iter().any(|t| t == name) {
+                let hint = if name.contains('.') {
+                    format!(
+                        " Tool names use underscores since 0.2: '{}'.",
+                        name.replace('.', "_")
+                    )
+                } else {
+                    String::new()
+                };
+                return Err(ConfigError::new(format!(
+                    "[tools.{name}]: unknown tool '{name}'.{hint}"
+                )));
+            }
         }
-    }
-}
-
-/// A concurrency-friendly holder for the active [`Config`].
-///
-/// Readers take a cheap `Arc` snapshot; writers (hot reload) swap the pointer
-/// atomically. This keeps the hot path lock-free for tool execution.
-#[derive(Clone)]
-pub struct ConfigStore {
-    inner: Arc<RwLock<Arc<Config>>>,
-    source_path: Option<PathBuf>,
-}
-
-impl ConfigStore {
-    /// Create a store from an in-memory config.
-    #[must_use]
-    pub fn new(config: Config) -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(Arc::new(config))),
-            source_path: None,
-        }
-    }
-
-    /// Create a store backed by a file, remembering the path for reloads.
-    pub fn from_path(path: &Path) -> Result<Self, ToolError> {
-        let config = Config::load(path)?;
-        Ok(Self {
-            inner: Arc::new(RwLock::new(Arc::new(config))),
-            source_path: Some(path.to_path_buf()),
-        })
-    }
-
-    /// Take a cheap snapshot of the current configuration.
-    #[must_use]
-    pub fn snapshot(&self) -> Arc<Config> {
-        self.inner.read().clone()
-    }
-
-    /// The file this store was loaded from, if any.
-    #[must_use]
-    pub fn source_path(&self) -> Option<&Path> {
-        self.source_path.as_deref()
-    }
-
-    /// Replace the active configuration.
-    pub fn replace(&self, config: Config) {
-        *self.inner.write() = Arc::new(config);
-    }
-
-    /// Re-read the source file and swap in the new config.
-    ///
-    /// Returns an error (without changing the active config) if the file is
-    /// missing or invalid, so a bad edit never takes down a running server.
-    pub fn reload_from_disk(&self) -> Result<(), ToolError> {
-        let Some(path) = &self.source_path else {
-            return Err(ToolError::Internal(
-                "config store has no backing file to reload".to_string(),
+        let s = &self.security;
+        if s.default_timeout_secs == 0 || s.max_runtime_secs == 0 {
+            return Err(ConfigError::new(
+                "[security] default_timeout_secs and max_runtime_secs must be at least 1",
             ));
-        };
-        let config = Config::load(path)?;
-        self.replace(config);
-        Ok(())
+        }
+        if s.max_output_bytes < 1024 {
+            return Err(ConfigError::new(
+                "[security] max_output_bytes must be at least 1024",
+            ));
+        }
+        if self.server.max_concurrent_calls == 0 {
+            return Err(ConfigError::new(
+                "[server] max_concurrent_calls must be at least 1",
+            ));
+        }
+        match self.logging.level.to_ascii_lowercase().as_str() {
+            "error" | "warn" | "info" | "debug" | "trace" => {}
+            other => {
+                return Err(ConfigError::new(format!(
+                    "[logging] level '{other}' is not one of error, warn, info, debug, trace"
+                )))
+            }
+        }
+        let http = &self.transport.http;
+        if !http.path.starts_with('/') {
+            return Err(ConfigError::new(
+                "[transport.http] path must start with '/'",
+            ));
+        }
+        if http.oauth.enabled {
+            if http.public_url.is_none() {
+                return Err(ConfigError::new(
+                    "[transport.http.oauth] enabled needs [transport.http] public_url, the URL \
+                     clients use to reach this server",
+                ));
+            }
+            match &http.oauth.approval_secret {
+                Some(secret) if secret.len() >= 16 => {}
+                _ => {
+                    return Err(ConfigError::new(
+                        "[transport.http.oauth] enabled needs approval_secret of at least 16 \
+                         characters",
+                    ))
+                }
+            }
+        }
+        for token in &http.auth_tokens {
+            if token.len() < 16 {
+                return Err(ConfigError::new(
+                    "[transport.http] auth_tokens entries must be at least 16 characters",
+                ));
+            }
+        }
+
+        if self.server.categories.is_empty() {
+            warnings.push(
+                "[server] categories is empty: no tools are exposed. List the categories to \
+                 enable, for example categories = [\"fs\", \"git\"]."
+                    .to_string(),
+            );
+        }
+        if s.allowed_commands.iter().any(|c| c == "*") {
+            warnings.push(
+                "[security] allowed_commands contains \"*\": every program on this machine may \
+                 be run by the connected agent with your privileges."
+                    .to_string(),
+            );
+        }
+        if !s.builtin_denied_paths {
+            warnings.push(
+                "[security] builtin_denied_paths = false: credential and key files inside \
+                 allowed directories are readable by tools."
+                    .to_string(),
+            );
+        }
+        if s.max_runtime_secs < s.default_timeout_secs {
+            warnings.push(
+                "[security] max_runtime_secs is below default_timeout_secs; calls are cut at \
+                 max_runtime_secs."
+                    .to_string(),
+            );
+        }
+        if s.allow_elevated && s.allow_destructive {
+            warnings.push(
+                "[security] allow_elevated and allow_destructive are both on globally; prefer \
+                 per-tool overrides under [tools.<name>]."
+                    .to_string(),
+            );
+        }
+        Ok(warnings)
     }
+
+    /// Whether `tool` in `category` is exposed.
+    #[must_use]
+    pub fn is_tool_enabled(&self, category: &str, tool: &str) -> bool {
+        if !self.server.categories.iter().any(|c| c == category) {
+            return false;
+        }
+        self.tools.get(tool).and_then(|o| o.enabled).unwrap_or(true)
+    }
+}
+
+/// Explain keys that were valid in 0.1 so an old config fails with guidance
+/// instead of a bare "unknown field".
+fn legacy_key_message(raw: &toml::Value) -> Option<String> {
+    if raw.get("categories").is_some() {
+        return Some(
+            "[categories.<name>] was replaced in 0.2: list the categories to expose as \
+             [server] categories = [\"fs\", \"git\", ...]. Categories not listed are off."
+                .to_string(),
+        );
+    }
+    if raw.get("server").and_then(|s| s.get("version")).is_some() {
+        return Some(
+            "[server] version was removed in 0.2: the server always reports its own version."
+                .to_string(),
+        );
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn defaults_deny_file_and_command_access() {
-        let c = Config::default();
-        assert!(c.security.allowed_paths.is_empty());
-        assert!(c.security.allowed_commands.is_empty());
-        assert!(!c.security.allow_elevated);
-        assert!(!c.security.allow_destructive);
+    fn catalog() -> Catalog {
+        Catalog {
+            categories: vec!["fs".into(), "git".into()],
+            tools: vec!["fs_read".into(), "fs_delete".into()],
+        }
     }
 
     #[test]
-    fn parses_minimal_config() {
-        let text = r#"
-            [server]
-            name = "custom"
+    fn defaults_allow_nothing() {
+        let c = Config::default();
+        assert!(c.server.categories.is_empty());
+        assert!(c.security.allowed_paths.is_empty());
+        assert!(c.security.allowed_commands.is_empty());
+        assert!(!c.security.allow_network);
+        assert!(!c.security.allow_private_network);
+        assert!(!c.security.allow_elevated);
+        assert!(!c.security.allow_destructive);
+        assert!(c.security.builtin_denied_paths);
+        assert!(!c.is_tool_enabled("fs", "fs_read"));
+    }
 
-            [security]
-            allowed_paths = ["/work/**"]
-            allowed_commands = ["git", "cargo"]
-            default_timeout_secs = 30
+    #[test]
+    fn unknown_keys_are_rejected() {
+        let err = Config::from_toml_str("[security]\nallow_netwrok = false\n").unwrap_err();
+        assert!(err.0.contains("allow_netwrok"), "{err}");
+        let err = Config::from_toml_str("[sever]\nname = \"x\"\n").unwrap_err();
+        assert!(err.0.contains("sever"), "{err}");
+        let err = Config::from_toml_str("[tools.fs_read]\nenabeld = false\n").unwrap_err();
+        assert!(err.0.contains("enabeld"), "{err}");
+    }
 
-            [tools."fs.delete"]
-            enabled = false
+    #[test]
+    fn legacy_keys_get_migration_guidance() {
+        let err = Config::from_toml_str("[categories.powershell]\nenabled = false\n").unwrap_err();
+        assert!(err.0.contains("[server] categories"), "{err}");
+    }
 
-            [categories.powershell]
-            enabled = false
-        "#;
-        let c = Config::from_toml_str(text).unwrap();
-        assert_eq!(c.server.name, "custom");
-        assert_eq!(c.security.default_timeout_secs, 30);
-        assert!(!c.is_tool_enabled("filesystem", "fs.delete"));
-        assert!(!c.is_tool_enabled("powershell", "powershell.run"));
-        assert!(c.is_tool_enabled("filesystem", "fs.read"));
+    #[test]
+    fn categories_are_opt_in_and_tools_can_be_disabled() {
+        let c = Config::from_toml_str(
+            "[server]\ncategories = [\"fs\"]\n[tools.fs_delete]\nenabled = false\n",
+        )
+        .unwrap();
+        assert!(c.is_tool_enabled("fs", "fs_read"));
+        assert!(!c.is_tool_enabled("fs", "fs_delete"));
+        assert!(!c.is_tool_enabled("git", "git_status"));
+        assert!(c.validate(&catalog()).is_ok());
+    }
+
+    #[test]
+    fn validation_names_unknown_tools_and_categories() {
+        let c = Config::from_toml_str("[server]\ncategories = [\"filesystem\"]\n").unwrap();
+        let err = c.validate(&catalog()).unwrap_err();
+        assert!(err.0.contains("unknown category 'filesystem'"), "{err}");
+
+        let c = Config::from_toml_str("[tools.\"fs.read\"]\nenabled = false\n").unwrap();
+        let err = c.validate(&catalog()).unwrap_err();
+        assert!(err.0.contains("fs_read"), "{err}");
+    }
+
+    #[test]
+    fn wildcard_commands_and_empty_categories_warn() {
+        let c = Config::from_toml_str("[security]\nallowed_commands = [\"*\"]\n").unwrap();
+        let warnings = c.validate(&catalog()).unwrap();
+        assert!(warnings.iter().any(|w| w.contains("\"*\"")));
+        assert!(warnings.iter().any(|w| w.contains("categories is empty")));
+    }
+
+    #[test]
+    fn oauth_needs_public_url_and_secret() {
+        let c = Config::from_toml_str("[transport.http.oauth]\nenabled = true\n").unwrap();
+        assert!(c.validate(&catalog()).is_err());
     }
 
     #[test]
     fn roundtrips_through_toml() {
         let c = Config::default();
-        let text = c.to_toml_string().unwrap();
-        let back = Config::from_toml_str(&text).unwrap();
-        assert_eq!(back.server.name, c.server.name);
-    }
-
-    #[test]
-    fn store_replace_is_visible_to_new_snapshots() {
-        let store = ConfigStore::new(Config::default());
-        assert_eq!(store.snapshot().server.name, "nebula-mcp");
-        let mut c = Config::default();
-        c.server.name = "renamed".into();
-        store.replace(c);
-        assert_eq!(store.snapshot().server.name, "renamed");
+        let back = Config::from_toml_str(&c.to_toml_string().unwrap()).unwrap();
+        assert_eq!(back, c);
     }
 }

@@ -90,7 +90,8 @@ the server validated a path.
   allowlist governs caller-chosen programs only. Enabling a category is the
   grant for its typed tools.
 - D6 Child environment is an allowlist (`env_passthrough` extends it).
-- D7 Protocol: dual-era (2026-07-28 stateless + legacy 2024-11-05, 2025-03-26,
+- D7 (R) Protocol layer: built on the official Rust SDK (rmcp 3.x) instead of the
+  hand-written crate, which is removed. Dual-era (2026-07-28 stateless + legacy 2024-11-05, 2025-03-26,
   2025-06-18, 2025-11-25). The deprecated two-endpoint HTTP+SSE transport is not
   implemented.
 - D8 HTTP auth: static bearer tokens stay; an embedded single-operator OAuth
@@ -100,7 +101,7 @@ the server validated a path.
 - D9 Unknown config keys are errors.
 - D10 Content-heavy tools (file contents, command output, diffs) return text
   only; record-like tools return `structuredContent` with an `outputSchema`.
-- D11 Version becomes 0.2.0.
+- D11 Version becomes 0.2.0. MSRV becomes 1.88 (what the dependency graph needs).
 
 ## Plan and status
 
@@ -108,7 +109,7 @@ Workspace members are re-added as they are ported, so every pushed commit
 builds and passes for what it contains.
 
 1. [done] CI trustworthy on three OSes; harness; failing regressions recorded.
-2. [ ] Core: config v2, policy, checked paths, spawn, net guard, schema
+2. [wip] Core: config v2 (done), policy (done), checked paths (done), spawn, net guard, schema
    validation, tool metadata, context.
 3. [ ] Protocol crate: JSON-RPC, per-revision MCP types, bounded framing.
 4. [ ] Server: engine and connection state, stdio, HTTP (modern + legacy
