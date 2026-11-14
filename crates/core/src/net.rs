@@ -421,11 +421,13 @@ fn parse_url(input: &str, schemes: &[&str], allow_userinfo: bool) -> Result<Pars
             }
         }
     };
-    let port = explicit_port.or_else(|| default_port(&scheme)).ok_or_else(|| {
-        ToolError::invalid(format!(
-            "the URL has no port and the scheme '{scheme}' has no default port; add :<port>"
-        ))
-    })?;
+    let port = explicit_port
+        .or_else(|| default_port(&scheme))
+        .ok_or_else(|| {
+            ToolError::invalid(format!(
+                "the URL has no port and the scheme '{scheme}' has no default port; add :<port>"
+            ))
+        })?;
 
     let url = Url::parse(input).map_err(|e| ToolError::invalid(format!("invalid URL: {e}")))?;
     let url_host = url
@@ -701,7 +703,8 @@ impl Net {
             return Err(ToolError::invalid("the port must be between 1 and 65535"));
         }
         let kind = parse_host(host)?;
-        self.guarded(DNS_TIMEOUT * 2, self.vet_kind(&kind, port)).await
+        self.guarded(DNS_TIMEOUT * 2, self.vet_kind(&kind, port))
+            .await
     }
 
     /// Parse `url`, require its scheme to be one of `schemes`, and vet its host.
@@ -769,9 +772,8 @@ impl Net {
                 Err(_) => return Err(ToolError::Timeout(DNS_TIMEOUT)),
             },
         };
-        let ips = found.map_err(|e| {
-            ToolError::Io(format!("DNS lookup for '{host}' failed: {e}"))
-        })?;
+        let ips =
+            found.map_err(|e| ToolError::Io(format!("DNS lookup for '{host}' failed: {e}")))?;
         if ips.is_empty() {
             return Err(ToolError::Io(format!(
                 "DNS lookup for '{host}' returned no addresses"
@@ -926,9 +928,8 @@ impl Net {
             let mut ex = self.follow(&prepared).await?;
             let content_length = content_length(ex.resp.headers());
             let (body, truncated) = read_capped(&mut ex.resp, cap, content_length).await?;
-            let body_bytes_total = content_length.or_else(|| {
-                (!truncated).then(|| u64::try_from(body.len()).unwrap_or(u64::MAX))
-            });
+            let body_bytes_total = content_length
+                .or_else(|| (!truncated).then(|| u64::try_from(body.len()).unwrap_or(u64::MAX)));
             Ok(HttpResponse {
                 status: ex.status,
                 headers: response_headers(ex.resp.headers()),
@@ -1217,7 +1218,13 @@ fn validate_headers(headers: &[(String, String)]) -> Result<()> {
         let lower = name.to_ascii_lowercase();
         if matches!(
             lower.as_str(),
-            "host" | "content-length" | "transfer-encoding" | "connection" | "upgrade" | "te" | "trailer"
+            "host"
+                | "content-length"
+                | "transfer-encoding"
+                | "connection"
+                | "upgrade"
+                | "te"
+                | "trailer"
         ) || lower.starts_with("proxy-")
         {
             return Err(ToolError::invalid(format!(
@@ -1288,8 +1295,7 @@ fn plan_redirect(status: u16, method: &str, from: &Url, to: &Url) -> Result<Redi
 
 fn is_credential_header(lower: &str) -> bool {
     matches!(lower, "authorization" | "proxy-authorization" | "cookie")
-        || (lower.starts_with("x-")
-            && ["token", "key", "secret"].iter().any(|w| lower.contains(w)))
+        || (lower.starts_with("x-") && ["token", "key", "secret"].iter().any(|w| lower.contains(w)))
         || ["token", "secret", "password", "api-key", "apikey"]
             .iter()
             .any(|w| lower.contains(w))
@@ -1373,7 +1379,9 @@ where
         .max_header_size(MAX_RESPONSE_HEAD_BYTES)
         .handshake(TokioIo::new(io))
         .await
-        .map_err(|e| ToolError::Execution(format!("HTTP handshake with {label} failed: {}", chain(&e))))?;
+        .map_err(|e| {
+            ToolError::Execution(format!("HTTP handshake with {label} failed: {}", chain(&e)))
+        })?;
     let task = tokio::spawn(async move {
         let _ = conn.await;
     });
@@ -1492,4 +1500,388 @@ async fn tls_handshake(
             };
             ToolError::Execution(format!("TLS handshake with {label} failed: {reason}{hint}"))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn net(allow: bool, private: bool, hosts: &[&str]) -> Net {
+        Net::new(
+            NetPolicy::new(
+                allow,
+                private,
+                hosts.iter().map(|h| (*h).to_string()).collect(),
+            ),
+            CancellationToken::new(),
+            1024 * 1024,
+        )
+    }
+
+    struct Fixed(Vec<IpAddr>);
+
+    #[async_trait::async_trait]
+    impl Resolve for Fixed {
+        async fn resolve(&self, _host: &str) -> std::io::Result<Vec<IpAddr>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// A tiny HTTP/1.1 server: `respond` maps the request head to a full response.
+    async fn serve(respond: impl Fn(&str) -> String + Send + Sync + 'static) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let respond = Arc::new(respond);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let respond = respond.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&buf).into_owned();
+                    let _ = stream.write_all(respond(&head).as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        port
+    }
+
+    fn ok(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn redirect(status: u16, to: &str) -> String {
+        format!("HTTP/1.1 {status} Moved\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    }
+
+    #[test]
+    fn destinations_are_classified() {
+        let public = ["93.184.216.34", "8.8.8.8", "2606:4700:4700::1111"];
+        for ip in public {
+            assert!(classify(ip.parse().unwrap()).allowed(false), "{ip}");
+        }
+        let private = [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "::1",
+            "fe80::1",
+            "fc00::1",
+            "fd12::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "64:ff9b::7f00:1",
+            "192.0.2.1",
+            "198.18.0.1",
+            "240.0.0.1",
+            "0.1.2.3",
+            "2001:db8::1",
+        ];
+        for ip in private {
+            assert!(!classify(ip.parse().unwrap()).allowed(false), "{ip}");
+        }
+        // Never reachable, even with private destinations enabled.
+        for ip in ["0.0.0.0", "::", "224.0.0.1", "255.255.255.255", "ff02::1"] {
+            assert!(!classify(ip.parse().unwrap()).allowed(true), "{ip}");
+        }
+        assert!(classify("127.0.0.1".parse().unwrap()).allowed(true));
+    }
+
+    #[tokio::test]
+    async fn a_disabled_policy_refuses_everything_first() {
+        let n = net(false, true, &[]);
+        assert!(matches!(
+            n.vet("example.com", 80).await,
+            Err(ToolError::PermissionDenied(_))
+        ));
+        assert!(matches!(
+            n.connect_tcp("127.0.0.1", 9, Duration::from_secs(1)).await,
+            Err(ToolError::PermissionDenied(_))
+        ));
+        assert!(matches!(
+            n.http(HttpRequest::new("GET", "http://127.0.0.1:9/")).await,
+            Err(ToolError::PermissionDenied(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn private_destinations_need_the_switch() {
+        let n = net(true, false, &[]);
+        for host in [
+            "127.0.0.1",
+            "169.254.169.254",
+            "10.0.0.1",
+            "::1",
+            "::ffff:127.0.0.1",
+            "localhost",
+        ] {
+            assert!(
+                matches!(n.vet(host, 80).await, Err(ToolError::NetworkNotAllowed(_))),
+                "{host}"
+            );
+        }
+        assert!(matches!(
+            n.http(HttpRequest::new("GET", "http://[::1]:8080/")).await,
+            Err(ToolError::NetworkNotAllowed(_))
+        ));
+        assert!(net(true, true, &[]).vet("127.0.0.1", 80).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn obfuscated_and_malformed_hosts_are_rejected() {
+        let n = net(true, true, &[]);
+        for host in [
+            "0x7f.1",
+            "0177.0.0.1",
+            "2130706433",
+            "127.1",
+            "",
+            "a b",
+            "a/b",
+            "user@host",
+            "exa\0mple",
+        ] {
+            assert!(n.vet(host, 80).await.is_err(), "{host:?}");
+        }
+        assert!(n.vet("127.0.0.1", 0).await.is_err());
+        for url in [
+            "file:///etc/passwd",
+            "gopher://127.0.0.1/",
+            "http://user:pw@127.0.0.1/",
+            "http:///nohost",
+        ] {
+            assert!(n.vet_url(url, &["http", "https"]).await.is_err(), "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn one_bad_address_refuses_the_whole_host() {
+        let mixed: Vec<IpAddr> = vec![
+            "93.184.216.34".parse().unwrap(),
+            "10.0.0.5".parse().unwrap(),
+        ];
+        let n = net(true, false, &[]).with_resolver(Arc::new(Fixed(mixed)));
+        assert!(matches!(
+            n.vet("rebind.example", 443).await,
+            Err(ToolError::NetworkNotAllowed(_))
+        ));
+        let good: Vec<IpAddr> = vec!["93.184.216.34".parse().unwrap()];
+        let n = net(true, false, &[]).with_resolver(Arc::new(Fixed(good)));
+        let addrs = n.vet("ok.example", 443).await.unwrap();
+        assert_eq!(addrs, vec!["93.184.216.34:443".parse().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn the_host_allowlist_applies_before_resolution() {
+        let n = net(true, true, &["api.example.com"]);
+        assert!(matches!(
+            n.vet("127.0.0.1", 80).await,
+            Err(ToolError::NetworkNotAllowed(_))
+        ));
+        assert!(matches!(
+            n.vet("other.example.com", 80).await,
+            Err(ToolError::NetworkNotAllowed(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_returns_the_body_and_caps_it() {
+        let port = serve(|_| ok("hello world")).await;
+        let n = net(true, true, &[]);
+        let r = n
+            .http(HttpRequest::new("GET", format!("http://127.0.0.1:{port}/")))
+            .await
+            .unwrap();
+        assert_eq!(
+            (r.status, r.body.as_slice(), r.truncated),
+            (200, &b"hello world"[..], false)
+        );
+
+        let mut req = HttpRequest::new("GET", format!("http://127.0.0.1:{port}/"));
+        req.max_body_bytes = 5;
+        let r = n.http(req).await.unwrap();
+        assert_eq!(r.body, b"hello");
+        assert!(r.truncated);
+        assert_eq!(r.body_bytes_total, Some(11));
+    }
+
+    #[tokio::test]
+    async fn every_redirect_hop_is_vetted_again() {
+        // Only 127.0.0.1 is allowed; the server redirects to another name.
+        let port = serve(|_| redirect(302, "http://localhost:1/next")).await;
+        let n = net(true, true, &["127.0.0.1"]);
+        let r = n
+            .http(HttpRequest::new("GET", format!("http://127.0.0.1:{port}/")))
+            .await;
+        assert!(matches!(r, Err(ToolError::NetworkNotAllowed(_))), "{r:?}");
+
+        // A redirect to a non-http scheme is refused.
+        let port = serve(|_| redirect(302, "file:///etc/passwd")).await;
+        let n = net(true, true, &[]);
+        assert!(n
+            .http(HttpRequest::new("GET", format!("http://127.0.0.1:{port}/")))
+            .await
+            .is_err());
+
+        // Redirects are not followed when the caller asks for none.
+        let mut req = HttpRequest::new("GET", format!("http://127.0.0.1:{port}/"));
+        req.max_redirects = 0;
+        assert_eq!(n.http(req).await.unwrap().status, 302);
+    }
+
+    #[tokio::test]
+    async fn credentials_are_dropped_on_cross_origin_redirects() {
+        let echo = |head: &str| {
+            let lower = head.to_ascii_lowercase();
+            ok(if lower.contains("authorization:") {
+                "auth:present"
+            } else {
+                "auth:none"
+            })
+        };
+        let target = serve(echo).await;
+        let cross = serve(move |_| redirect(307, &format!("http://127.0.0.1:{target}/t"))).await;
+        let n = net(true, true, &[]);
+        let mut req = HttpRequest::new("GET", format!("http://127.0.0.1:{cross}/"));
+        req.headers
+            .push(("Authorization".into(), "Bearer secret".into()));
+        let r = n.http(req).await.unwrap();
+        assert_eq!(r.body, b"auth:none");
+        assert_eq!(r.redirects.len(), 1);
+
+        // Same origin keeps them.
+        let same = serve(|head: &str| {
+            if head.starts_with("GET /start") {
+                redirect(302, "/end")
+            } else if head.to_ascii_lowercase().contains("authorization:") {
+                ok("auth:present")
+            } else {
+                ok("auth:none")
+            }
+        })
+        .await;
+        let mut req = HttpRequest::new("GET", format!("http://127.0.0.1:{same}/start"));
+        req.headers
+            .push(("Authorization".into(), "Bearer secret".into()));
+        assert_eq!(n.http(req).await.unwrap().body, b"auth:present");
+    }
+
+    #[tokio::test]
+    async fn see_other_turns_post_into_get() {
+        let port = serve(|head: &str| {
+            if head.starts_with("POST /form") {
+                redirect(303, "/done")
+            } else {
+                ok(head.split_whitespace().next().unwrap_or(""))
+            }
+        })
+        .await;
+        let n = net(true, true, &[]);
+        let mut req = HttpRequest::new("POST", format!("http://127.0.0.1:{port}/form"));
+        req.body = Some(b"a=1".to_vec());
+        assert_eq!(n.http(req).await.unwrap().body, b"GET");
+    }
+
+    #[tokio::test]
+    async fn caller_headers_and_methods_are_validated() {
+        let n = net(true, true, &[]);
+        let bad = [
+            ("X-A", "v\r\nInjected: 1"),
+            ("Host", "evil.example"),
+            ("Content-Length", "0"),
+            ("Transfer-Encoding", "chunked"),
+            ("bad name", "v"),
+        ];
+        for (name, value) in bad {
+            let mut req = HttpRequest::new("GET", "http://127.0.0.1:9/");
+            req.headers.push((name.into(), value.into()));
+            assert!(
+                matches!(n.http(req).await, Err(ToolError::InvalidArguments(_))),
+                "{name}"
+            );
+        }
+        assert!(matches!(
+            n.http(HttpRequest::new("CONNECT", "http://127.0.0.1:9/"))
+                .await,
+            Err(ToolError::InvalidArguments(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn downloads_are_capped() {
+        let port = serve(|_| ok(&"x".repeat(5000))).await;
+        let n = net(true, true, &[]);
+        let mut sink = Vec::new();
+        let req = HttpRequest::new("GET", format!("http://127.0.0.1:{port}/"));
+        let d = n
+            .http_download(req.clone(), &mut sink, 10_000)
+            .await
+            .unwrap();
+        assert_eq!((d.bytes_written, sink.len()), (5000, 5000));
+        let mut sink = Vec::new();
+        assert!(matches!(
+            n.http_download(req, &mut sink, 100).await,
+            Err(ToolError::LimitExceeded(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancellation_and_timeouts_end_a_stalled_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream); // accept, then say nothing
+            }
+        });
+        let cancel = CancellationToken::new();
+        let n = Net::new(NetPolicy::new(true, true, vec![]), cancel.clone(), 1024);
+        let url = format!("http://127.0.0.1:{port}/");
+        let mut req = HttpRequest::new("GET", url.clone());
+        req.timeout = Duration::from_secs(1);
+        assert!(matches!(n.http(req).await, Err(ToolError::Timeout(_))));
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cancel.cancel();
+        });
+        assert!(matches!(
+            n.http(HttpRequest::new("GET", url)).await,
+            Err(ToolError::Cancelled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_failed_tls_handshake_is_an_error_not_a_panic() {
+        // No process-wide crypto provider is installed in this test binary.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        let n = net(true, true, &[]);
+        let r = n
+            .connect_tls("127.0.0.1", port, Duration::from_secs(3))
+            .await;
+        assert!(r.is_err());
+        let _ = Net::tls_config();
+    }
 }

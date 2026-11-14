@@ -383,3 +383,11 @@ keep descriptions tight.
 See the top of `OVERHAUL_LOG.md` ("Plan and status") and `git log`. If the
 last commit subject starts with `wip`, the workspace may not build yet: run
 `cargo test -p nebula-mcp-core` and fix what it reports before anything else.
+
+Last update: `cargo test -p nebula-mcp-core` passes on Linux (156 tests:
+config, policy, fs, process, net, schema, args, tool, store, dispatch).
+Not yet done for the core: `cargo clippy -p nebula-mcp-core --all-targets --
+-D warnings` (run it and fix what it reports), the Windows type-check, and a
+CI run on macOS and Windows. `schema.rs`, `args.rs` and `net.rs` were written
+quickly and deserve a read-through before tools depend on them. Next step
+after that: section 4.2, starting with the `fs` category.
