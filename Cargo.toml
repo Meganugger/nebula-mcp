@@ -57,7 +57,17 @@ parking_lot = "0.12"
 dashmap = "6.1"
 num_cpus = "1.16"
 
-# HTTP / network
+# HTTP / network. The client is hyper over our own vetted TcpStream and a rustls
+# config with an explicit aws-lc-rs provider (the only crypto provider in the graph).
+http = "1.4"
+hyper = { version = "1.12", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
+http-body-util = "0.1.5"
+rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws_lc_rs", "tls12"] }
+webpki-roots = "1.0.12"
+libc = "0.2"
+process-wrap = { version = "10.0", default-features = false, features = ["tokio1", "job-object", "kill-on-drop"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 url = "2.5"
 
