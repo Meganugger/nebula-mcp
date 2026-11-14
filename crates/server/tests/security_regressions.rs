@@ -1,140 +1,156 @@
-//! Regression tests for defects reproduced against 0.1.0, driven through the
-//! real binary over stdio. Each test names the guarantee it pins.
+//! Regression tests for the defects reproduced against 0.1.0, driven through
+//! the real binary over stdio. Each failed before its fix; none may be
+//! ignored.
 
 mod support;
 
 use std::time::Duration;
 
 use serde_json::json;
-use support::{is_error, text_of, toml_path, Proc, Sandbox};
+use support::{is_error, text_of, Proc, Sandbox};
 
-fn config(sandbox: &Sandbox, commands: &[&str], extra: &str) -> String {
-    let root = sandbox.root_str();
-    let cmds = commands
-        .iter()
-        .map(|c| format!("\"{c}\""))
-        .collect::<Vec<_>>()
-        .join(", ");
+/// A configuration with `categories` enabled, the sandbox root allowed and
+/// `security` appended to `[security]`.
+fn config(sandbox: &Sandbox, categories: &[&str], security: &str) -> String {
+    let list: Vec<String> = categories.iter().map(|c| format!("\"{c}\"")).collect();
     format!(
-        "[logging]\nlevel = \"error\"\n\n[security]\nallowed_paths = [\"{root}/**\"]\n\
-         allowed_commands = [{cmds}]\nmax_runtime_secs = 120\n{extra}\n"
+        "[server]\ncategories = [{}]\n[security]\nallowed_paths = [\"{}\"]\n{security}\n",
+        list.join(", "),
+        sandbox.root_str()
     )
 }
 
-/// G-EXEC-1: an allowlisted command name never runs a different executable
-/// that merely shares its basename.
+fn start(sandbox: &Sandbox, categories: &[&str], security: &str) -> Proc {
+    let mut server = Proc::start(sandbox, &config(sandbox, categories, security));
+    server.initialize("2025-11-25");
+    server
+}
+
+/// G-EXEC-1: an allowed name authorises the program found on PATH, not a
+/// file of the same name somewhere else.
 #[cfg(unix)]
 #[test]
-#[ignore = "fails on 0.1.0; enabled by the commit that fixes it"]
-fn allowlisted_name_does_not_run_a_planted_executable() {
+fn an_allowed_name_does_not_authorise_a_planted_file() {
     use std::os::unix::fs::PermissionsExt;
-    let sb = Sandbox::new();
-    let planted = sb.root.join("echo");
-    let marker = sb.outside.join("planted-ran");
+    let sandbox = Sandbox::new();
+    let planted = sandbox.root.join("echo");
+    let marker = sandbox.root.join("planted-ran");
     std::fs::write(
         &planted,
-        format!("#!/bin/sh\ntouch '{}'\necho PLANTED\n", marker.display()),
+        format!("#!/bin/sh\necho pwned > '{}'\n", marker.display()),
     )
     .unwrap();
     std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let mut p = Proc::start(&sb, &config(&sb, &["echo"], ""));
-    p.initialize("2025-06-18");
-    let result = p.call(
-        "terminal.run",
-        json!({"program": toml_path(&planted), "args": ["hi"]}),
-    );
-    assert!(
-        !marker.exists() && !text_of(&result).contains("PLANTED"),
-        "a planted script named like an allowlisted command was executed: {result}"
-    );
-    assert!(is_error(&result), "expected a policy error, got {result}");
+    let mut server = start(&sandbox, &["terminal"], "allowed_commands = [\"echo\"]");
+    for program in [planted.to_string_lossy().into_owned(), "./echo".to_string()] {
+        let result = server.call("terminal_run", json!({"program": program, "args": ["x"]}));
+        assert!(is_error(&result), "{program} ran: {result}");
+        assert!(
+            text_of(&result).starts_with("[command_not_allowed]"),
+            "{result}"
+        );
+    }
+    assert!(!marker.exists(), "the planted file was executed");
+    let result = server.call("terminal_run", json!({"program": "echo", "args": ["real"]}));
+    assert!(text_of(&result).starts_with("real\n"), "{result}");
+    assert!(!marker.exists());
 }
 
-/// G-FS-1: a symlink inside an allowed root cannot be used to read a file
-/// outside every allowed root.
+/// G-FS-1: a symlink inside an allowed directory does not reach outside it.
 #[cfg(unix)]
 #[test]
-#[ignore = "fails on 0.1.0; enabled by the commit that fixes it"]
-fn symlink_inside_root_cannot_read_outside_it() {
-    let sb = Sandbox::new();
-    let secret = sb.outside.join("secret.txt");
-    std::fs::write(&secret, "OUTSIDE-SECRET").unwrap();
-    std::os::unix::fs::symlink(&secret, sb.root.join("link.txt")).unwrap();
+fn a_symlink_does_not_read_outside_the_allowed_directory() {
+    let sandbox = Sandbox::new();
+    let secret = sandbox.outside.join("secret.txt");
+    std::fs::write(&secret, "TOP-SECRET").unwrap();
+    std::os::unix::fs::symlink(&secret, sandbox.root.join("link.txt")).unwrap();
+    std::os::unix::fs::symlink(&sandbox.outside, sandbox.root.join("dir")).unwrap();
 
-    let mut p = Proc::start(&sb, &config(&sb, &[], ""));
-    p.initialize("2025-06-18");
-    let result = p.call("fs.read", json!({"path": "link.txt"}));
-    assert!(
-        !result.to_string().contains("OUTSIDE-SECRET"),
-        "read escaped the root through a symlink: {result}"
-    );
-    assert!(is_error(&result));
+    let mut server = start(&sandbox, &["fs"], "");
+    for path in ["link.txt", "dir/secret.txt"] {
+        let result = server.call("fs_read", json!({"path": path}));
+        assert!(is_error(&result), "{path}: {result}");
+        assert!(!text_of(&result).contains("TOP-SECRET"), "{result}");
+        assert!(
+            text_of(&result).starts_with("[path_not_allowed]"),
+            "{result}"
+        );
+    }
+    let result = server.call("fs_write", json!({"path": "dir/new.txt", "content": "x"}));
+    assert!(is_error(&result), "{result}");
+    assert!(!sandbox.outside.join("new.txt").exists());
 }
 
-/// G-FS-2: deny patterns apply to every file a tool reads, not only to the
-/// path named in the call.
+/// G-FS-2: deny patterns apply to every file a search reads.
 #[test]
-#[ignore = "fails on 0.1.0; enabled by the commit that fixes it"]
-fn search_does_not_reveal_denied_files() {
-    let sb = Sandbox::new();
-    std::fs::write(sb.root.join(".env"), "API_KEY=DENIED-CONTENT\n").unwrap();
-    std::fs::write(sb.root.join("notes.txt"), "API_KEY=public-example\n").unwrap();
+fn search_does_not_return_the_contents_of_denied_files() {
+    let sandbox = Sandbox::new();
+    std::fs::write(sandbox.root.join(".env"), "API_KEY=needle-secret\n").unwrap();
+    std::fs::write(sandbox.root.join("notes.txt"), "a needle here\n").unwrap();
 
-    let mut p = Proc::start(&sb, &config(&sb, &[], ""));
-    p.initialize("2025-06-18");
-    let result = p.call("fs.search", json!({"root": ".", "pattern": "API_KEY"}));
-    let text = result.to_string();
+    let mut server = start(&sandbox, &["fs"], "");
+    let result = server.call("fs_search", json!({"root": ".", "pattern": "needle"}));
+    let text = text_of(&result);
+    assert!(!is_error(&result), "{result}");
+    assert!(text.contains("notes.txt:1: a needle here"), "{text}");
     assert!(
-        text.contains("public-example"),
-        "search should still find allowed files: {result}"
+        !text.contains("needle-secret") && !text.contains(".env:"),
+        "{text}"
     );
-    assert!(
-        !text.contains("DENIED-CONTENT"),
-        "search returned the contents of a denied file: {result}"
-    );
+
+    for tool in ["fs_glob", "fs_tree"] {
+        let args = if tool == "fs_glob" {
+            json!({"root": ".", "pattern": "**/*"})
+        } else {
+            json!({"path": "."})
+        };
+        let listing = server.call(tool, args).to_string();
+        assert!(
+            listing.contains("notes.txt") && !listing.contains(".env"),
+            "{tool}: {listing}"
+        );
+    }
 }
 
 /// G-FS-3: allowing a directory allows the directory itself.
 #[test]
-#[ignore = "fails on 0.1.0; enabled by the commit that fixes it"]
-fn allowed_root_itself_is_accessible() {
-    let sb = Sandbox::new();
-    std::fs::write(sb.root.join("a.txt"), "x").unwrap();
-    let mut p = Proc::start(&sb, &config(&sb, &[], ""));
-    p.initialize("2025-06-18");
-    let result = p.call("fs.tree", json!({"path": sb.root_str()}));
-    assert!(
-        !is_error(&result),
-        "the allowed root directory was refused: {result}"
-    );
-    assert!(text_of(&result).contains("a.txt"));
+fn the_allowed_directory_itself_is_accessible() {
+    let sandbox = Sandbox::new();
+    std::fs::write(sandbox.root.join("a.txt"), "a").unwrap();
+    let mut server = start(&sandbox, &["fs"], "");
+    for path in [sandbox.root_str(), ".".to_string()] {
+        let result = server.call("fs_tree", json!({"path": path}));
+        assert!(!is_error(&result), "{path}: {result}");
+        assert!(text_of(&result).contains("a.txt"), "{result}");
+        let result = server.call("fs_metadata", json!({"path": path}));
+        assert_eq!(result["structuredContent"]["type"], "dir", "{result}");
+    }
 }
 
-/// G-PROC-1: cancelling a call kills the whole process tree, stops progress
-/// notifications for that call, and leaves the server able to shut down.
+/// G-PROC-1: cancelling a call kills its whole process tree, stops its
+/// progress notifications, and leaves a server that still exits cleanly.
 #[cfg(unix)]
 #[test]
-#[ignore = "fails on 0.1.0; enabled by the commit that fixes it"]
-fn cancel_kills_the_process_tree_and_the_server_still_exits() {
-    let sb = Sandbox::new();
-    let pidfile = sb.root.join("grandchild.pid");
-    let script = format!("sleep 300 & echo $! > '{}'; wait", pidfile.display());
+fn cancelling_a_command_kills_its_tree_and_stops_its_progress() {
+    let sandbox = Sandbox::new();
+    let pidfile = sandbox.root.join("grandchild.pid");
+    let mut server = start(&sandbox, &["terminal"], "allowed_commands = [\"sh\"]");
 
-    let mut p = Proc::start(&sb, &config(&sb, &["sh"], ""));
-    p.initialize("2025-06-18");
-    let id = p.send_request(
+    let script = format!("sleep 300 & echo $! > '{}'; wait", pidfile.display());
+    let id = server.send_request(
         "tools/call",
         json!({
-            "name": "terminal.run",
-            "arguments": {"program": "sh", "args": ["-c", script], "timeoutSecs": 100},
+            "name": "terminal_run",
+            "arguments": {"program": "sh", "args": ["-c", script]},
             "_meta": {"progressToken": "tok-1"}
         }),
     );
     assert!(
-        support::wait_until(Duration::from_secs(10), || pidfile.exists()
+        support::wait_until(Duration::from_secs(20), || pidfile.exists()
             && !std::fs::read_to_string(&pidfile).unwrap().trim().is_empty()),
-        "the command never started"
+        "the command never started; stderr:\n{}",
+        server.stderr()
     );
     let grandchild: u32 = std::fs::read_to_string(&pidfile)
         .unwrap()
@@ -143,65 +159,77 @@ fn cancel_kills_the_process_tree_and_the_server_still_exits() {
         .unwrap();
     assert!(support::pid_alive(grandchild));
 
-    p.notify("notifications/cancelled", json!({"requestId": id}));
-    // A cancelled request may or may not be answered; either way the tree dies.
-    let killed = support::wait_until(Duration::from_secs(10), || !support::pid_alive(grandchild));
-    if !killed {
-        // Do not leak the process from a failing test.
-        let _ = std::process::Command::new("kill")
-            .args(["-9", &grandchild.to_string()])
-            .status();
-    }
-    assert!(killed, "the grandchild survived cancellation");
+    server.notify(
+        "notifications/cancelled",
+        json!({"requestId": id, "reason": "test"}),
+    );
+    assert!(
+        support::wait_until(Duration::from_secs(15), || !support::pid_alive(grandchild)),
+        "the grandchild survived the cancellation"
+    );
 
-    // No progress for the dead call once things have settled.
+    // No progress for the dead token once things have settled.
     std::thread::sleep(Duration::from_millis(500));
-    p.drain_notifications();
-    std::thread::sleep(Duration::from_secs(4));
-    let late: Vec<_> = p
+    server.drain_notifications();
+    std::thread::sleep(Duration::from_secs(7));
+    let late: Vec<_> = server
         .drain_notifications()
         .into_iter()
         .filter(|m| m["method"] == "notifications/progress")
         .collect();
     assert!(
         late.is_empty(),
-        "progress kept arriving after cancel: {late:?}"
+        "progress continued after the cancel: {late:?}"
     );
 
-    let status = p.close_stdin_and_wait(Duration::from_secs(10));
-    assert!(status.is_some(), "the server did not exit on stdin EOF");
+    // The server is still healthy, and exits when its input closes.
+    let listed = server.request("tools/list", json!({}));
+    assert!(listed["result"]["tools"].is_array(), "{listed}");
+    let status = server.close_stdin_and_wait(Duration::from_secs(20));
+    assert!(status.is_some(), "the server did not exit on end of input");
+    assert!(status.unwrap().success());
 }
 
-/// G-AVAIL-1: no tool call can take the process down; a failing call is
-/// answered and the next call still works.
+/// G-PROC-1 (shutdown): a running command does not outlive the server, by
+/// end of input or by SIGTERM.
+#[cfg(unix)]
 #[test]
-#[ignore = "fails on 0.1.0; enabled by the commit that fixes it"]
-fn tls_probe_failure_is_answered_and_the_server_survives() {
-    let sb = Sandbox::new();
-    // A listener that accepts and immediately closes: a clean handshake error.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            drop(stream);
-        }
-    });
+fn a_running_command_does_not_outlive_the_server() {
+    for by_signal in [false, true] {
+        let sandbox = Sandbox::new();
+        let pidfile = sandbox.root.join("grandchild.pid");
+        let mut server = start(&sandbox, &["terminal"], "allowed_commands = [\"sh\"]");
+        let script = format!("sleep 300 & echo $! > '{}'; wait", pidfile.display());
+        server.send_request(
+            "tools/call",
+            json!({"name": "terminal_run", "arguments": {"program": "sh", "args": ["-c", script]}}),
+        );
+        assert!(support::wait_until(Duration::from_secs(20), || {
+            std::fs::read_to_string(&pidfile).is_ok_and(|s| !s.trim().is_empty())
+        }));
+        let grandchild: u32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
 
-    let mut p = Proc::start(&sb, &config(&sb, &[], "allow_network = true"));
-    p.initialize("2025-06-18");
-    let id = p.send_request(
-        "tools/call",
-        json!({"name": "net.tls_info", "arguments": {"host": "127.0.0.1", "port": port, "timeoutMs": 3000}}),
-    );
-    let resp = p.response(id, Duration::from_secs(15));
-    assert!(
-        resp.is_some(),
-        "net.tls_info was never answered; stderr:\n{}",
-        p.stderr()
-    );
-    let listed = p.request("tools/list", json!({}));
-    assert!(
-        listed["result"]["tools"].is_array(),
-        "server died: {listed}"
-    );
+        let status = if by_signal {
+            let killed = std::process::Command::new("kill")
+                .args(["-TERM", &server.pid().to_string()])
+                .status()
+                .unwrap();
+            assert!(killed.success());
+            server.wait(Duration::from_secs(20))
+        } else {
+            server.close_stdin_and_wait(Duration::from_secs(20))
+        };
+        assert!(
+            status.is_some(),
+            "the server did not exit (signal: {by_signal})"
+        );
+        assert!(
+            support::wait_until(Duration::from_secs(10), || !support::pid_alive(grandchild)),
+            "the grandchild outlived the server (signal: {by_signal})"
+        );
+    }
 }

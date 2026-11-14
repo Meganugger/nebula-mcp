@@ -443,6 +443,13 @@ impl Config {
                 )));
             }
         }
+        let enabled = |name: &str| self.server.categories.iter().any(|c| c == name);
+        if enabled("scheduler") && !enabled("terminal") {
+            return Err(ConfigError::new(
+                "[server] categories: scheduler needs terminal as well, because a scheduled job \
+                 runs as a terminal_run call",
+            ));
+        }
         let s = &self.security;
         if s.default_timeout_secs == 0 || s.max_runtime_secs == 0 {
             return Err(ConfigError::new(

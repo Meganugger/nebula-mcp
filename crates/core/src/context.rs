@@ -81,7 +81,7 @@ impl OwnerId {
 }
 
 /// What the dispatcher supplies to build a context.
-pub struct ContextParts {
+pub(crate) struct ContextParts {
     /// Policy resolved for the tool.
     pub policy: Arc<Policy>,
     /// The tool's declared effects.
@@ -122,7 +122,7 @@ pub struct ToolContext {
 impl ToolContext {
     /// Build the context for a call.
     #[must_use]
-    pub fn new(parts: ContextParts) -> Self {
+    pub(crate) fn new(parts: ContextParts) -> Self {
         let fs = Fs::new(
             parts.policy.paths().clone(),
             parts.working_dir.clone(),

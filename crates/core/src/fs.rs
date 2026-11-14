@@ -224,10 +224,12 @@ pub struct Fs {
 }
 
 impl Fs {
-    /// Create a capability. `writable` is false for tools that declared
+    /// Create a capability. Only the dispatcher does: a tool that could
+    /// build its own would not be limited by what it declared. `writable` is
+    /// false for tools that declared
     /// themselves read-only; such tools cannot obtain write access.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         rules: Arc<PathRules>,
         working_dir: PathBuf,
         writable: bool,

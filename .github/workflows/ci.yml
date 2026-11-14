@@ -64,7 +64,7 @@ jobs:
       - name: Build release
         run: cargo build --release --locked
       - name: OpenTelemetry feature builds
-        run: cargo build -p nebula-mcp-core --features otel --locked
+        run: cargo build -p nebula-mcp-server --features otel --locked
 
   windows-crosscheck:
     name: Linux to Windows type-check
