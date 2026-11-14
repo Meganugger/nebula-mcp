@@ -360,7 +360,7 @@ impl std::fmt::Debug for Spawner {
 impl Spawner {
     /// Create a spawner for a call.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         policy: Arc<Policy>,
         exec: Exec,
         working_dir: PathBuf,

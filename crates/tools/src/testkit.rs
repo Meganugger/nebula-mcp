@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use nebula_mcp_core::config::Config;
 use nebula_mcp_core::policy::{simplify, slash_string};
@@ -22,17 +23,29 @@ pub(crate) struct Kit {
     /// A directory next to the root that policy does not allow.
     pub outside: PathBuf,
     pub dispatcher: Arc<Dispatcher>,
+    pub state: crate::ToolState,
+    pub shutdown: CancellationToken,
+    categories: String,
 }
 
 impl Kit {
     /// A dispatcher with every category enabled and `root` allowed.
     /// `security` is appended to the `[security]` table.
     pub(crate) fn new(security: &str) -> Self {
-        Self::with_config(security, "")
+        Self::build(None, security, "")
     }
 
     /// Like [`Kit::new`], with further TOML appended after `[security]`.
     pub(crate) fn with_config(security: &str, rest: &str) -> Self {
+        Self::build(None, security, rest)
+    }
+
+    /// Like [`Kit::new`], with only the named categories enabled.
+    pub(crate) fn with_categories(categories: &[&str], security: &str) -> Self {
+        Self::build(Some(categories), security, "")
+    }
+
+    fn build(categories: Option<&[&str]>, security: &str, rest: &str) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let base = simplify(&std::fs::canonicalize(tmp.path()).unwrap());
         let root = base.join("root");
@@ -41,55 +54,80 @@ impl Kit {
         std::fs::create_dir_all(&outside).unwrap();
 
         let mut registry = ToolRegistry::new();
-        crate::register_all(&mut registry).unwrap();
-        let categories: Vec<String> = registry
-            .catalog()
-            .categories
-            .iter()
-            .map(|c| format!("\"{c}\""))
-            .collect();
-        let text = format!(
-            "[server]\ncategories = [{}]\n[security]\nallowed_paths = [\"{}\"]\n{security}\n{rest}\n",
-            categories.join(", "),
-            slash_string(&root)
-        );
-        let config = Config::from_toml_str(&text).unwrap();
+        let state = crate::register_all(&mut registry).unwrap();
+        let categories: Vec<String> = match categories {
+            Some(list) => list.iter().map(|c| format!("\"{c}\"")).collect(),
+            None => registry
+                .catalog()
+                .categories
+                .iter()
+                .map(|c| format!("\"{c}\""))
+                .collect(),
+        };
+        let categories = categories.join(", ");
+        let config = Self::config(&categories, &root, security, rest);
         config.validate(&registry.catalog()).unwrap();
-        let dispatcher = Dispatcher::new(
+        let shutdown = CancellationToken::new();
+        let dispatcher = Arc::new(Dispatcher::new(
             Arc::new(registry),
             ConfigStore::from_config(config).unwrap(),
             root.clone(),
-            CancellationToken::new(),
-        );
+            shutdown.clone(),
+        ));
+        state.start(&dispatcher, shutdown.clone());
         Self {
             _tmp: tmp,
             root,
             outside,
-            dispatcher: Arc::new(dispatcher),
+            dispatcher,
+            state,
+            shutdown,
+            categories,
         }
     }
 
-    pub(crate) fn request(name: &str, arguments: Value) -> Call {
+    fn config(categories: &str, root: &Path, security: &str, rest: &str) -> Config {
+        let text = format!(
+            "[server]\ncategories = [{categories}]\n[security]\nallowed_paths = [\"{}\"]\n\
+             {security}\n{rest}\n",
+            slash_string(root)
+        );
+        Config::from_toml_str(&text).unwrap()
+    }
+
+    /// Swap the live configuration, as a hot reload would.
+    pub(crate) fn reconfigure(&self, security: &str) {
+        let config = Self::config(&self.categories, &self.root, security, "");
+        self.dispatcher.store().replace(config).unwrap();
+    }
+
+    pub(crate) fn request(name: &str, arguments: Value, owner: &OwnerId) -> Call {
         Call {
             name: name.to_string(),
             arguments,
-            owner: OwnerId::stdio(),
+            owner: owner.clone(),
             request_id: "test".into(),
             cancel: CancellationToken::new(),
             progress: None,
         }
     }
 
-    /// Call a tool. Successful structured results are checked against the
-    /// tool's declared output schema.
-    pub(crate) async fn call(
+    /// Call a tool as the stdio owner.
+    pub(crate) async fn call(&self, name: &str, arguments: Value) -> Result<ToolOutput, CallFailure> {
+        self.call_as(&OwnerId::stdio(), name, arguments).await
+    }
+
+    /// Call a tool as `owner`. Successful structured results are checked
+    /// against the tool's declared output schema.
+    pub(crate) async fn call_as(
         &self,
+        owner: &OwnerId,
         name: &str,
         arguments: Value,
     ) -> Result<ToolOutput, CallFailure> {
         let result = self
             .dispatcher
-            .call(Self::request(name, arguments))
+            .call(Self::request(name, arguments, owner))
             .await
             .unwrap_or_else(|e| panic!("{name}: {}", e.message));
         if let Ok(out) = &result {
@@ -154,6 +192,28 @@ impl Kit {
     pub(crate) fn exists(&self, rel: &str) -> bool {
         self.root.join(rel).symlink_metadata().is_ok()
     }
+
+    /// Wait for a file under the root to exist with content, and return it.
+    pub(crate) async fn wait_for_file(&self, rel: &str) -> String {
+        let path = self.root.join(rel);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if !text.trim().is_empty() {
+                    return text;
+                }
+            }
+            assert!(Instant::now() < deadline, "{rel} never appeared");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+impl Drop for Kit {
+    fn drop(&mut self) {
+        // Stops jobs and sessions the test left behind.
+        self.shutdown.cancel();
+    }
 }
 
 /// All text blocks of a result joined with newlines.
@@ -173,4 +233,23 @@ pub(crate) fn write_outside(dir: &Path, name: &str, content: &str) -> PathBuf {
     let p = dir.join(name);
     std::fs::write(&p, content).unwrap();
     p
+}
+
+/// Whether process `pid` is gone (or a zombie), polling for a while.
+#[cfg(unix)]
+pub(crate) async fn gone(pid: &str) -> bool {
+    let pid = pid.trim().to_string();
+    for _ in 0..100 {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid])
+            .output()
+            .expect("run ps");
+        let stat = String::from_utf8_lossy(&out.stdout);
+        let stat = stat.trim();
+        if stat.is_empty() || stat.starts_with('Z') {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
 }
