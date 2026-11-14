@@ -466,11 +466,12 @@ async fn search_reports_lines_and_never_reads_protected_files() {
 
 #[tokio::test]
 async fn glob_and_tree_hide_protected_names() {
-    let kit = Kit::new("denied_paths = [\"**/private/**\"]");
+    // Not "private": macOS temp directories live under /private.
+    let kit = Kit::new("denied_paths = [\"**/vault/**\"]");
     kit.write("src/a.rs", "");
     kit.write("src/nested/b.rs", "");
     kit.write("src/.env", "");
-    kit.write("private/key.rs", "");
+    kit.write("vault/key.rs", "");
     kit.write("README.md", "hello");
 
     let out = kit
@@ -502,10 +503,7 @@ async fn glob_and_tree_hide_protected_names() {
         text.contains("  src/\n    a.rs (0 bytes)\n    nested/\n      b.rs (0 bytes)\n"),
         "{text}"
     );
-    assert!(
-        !text.contains(".env") && !text.contains("private"),
-        "{text}"
-    );
+    assert!(!text.contains(".env") && !text.contains("vault"), "{text}");
     assert!(
         text.contains("2 not shown because policy protects them"),
         "{text}"
