@@ -4,9 +4,16 @@ members = [
     # Re-added as each crate is ported to the 0.2 core (see OVERHAUL_LOG.md).
     "crates/protocol",
     "crates/core",
+    "crates/tools",
 ]
 
-exclude = ["crates/tools", "crates/server"]
+exclude = ["crates/server"]
+
+[workspace.lints.clippy]
+# Tools must not reach files, processes or the network except through the
+# core's capabilities; crates/tools/clippy.toml lists the banned routes.
+disallowed_methods = "deny"
+disallowed_types = "deny"
 
 [workspace.package]
 version = "0.2.0"
@@ -30,7 +37,6 @@ toml = "0.8"
 
 # Errors
 thiserror = "1.0"
-anyhow = "1.0"
 
 # Tracing / telemetry
 tracing = "0.1"
@@ -40,22 +46,18 @@ tracing-appender = "0.2"
 # Utilities
 bytes = "1.7"
 globset = "0.4"
-walkdir = "2.5"
 sha2 = "0.10"
 hex = "0.4"
+base64 = "0.22"
 regex = "1.10"
 notify = "6.1"
 notify-debouncer-mini = "0.4"
 which = "6.0"
 cap-std = "4.0"
 cap-fs-ext = "4.0"
-shell-words = "1.1"
-uuid = { version = "1.10", features = ["v4", "serde"] }
 time = { version = "0.3", features = ["formatting", "macros"] }
-dirs = "5.0"
 parking_lot = "0.12"
 dashmap = "6.1"
-num_cpus = "1.16"
 
 # HTTP / network. The client is hyper over our own vetted TcpStream and a rustls
 # config with an explicit aws-lc-rs provider (the only crypto provider in the graph).
@@ -68,7 +70,6 @@ tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws_
 webpki-roots = "1.0.12"
 libc = "0.2"
 process-wrap = { version = "10.0", default-features = false, features = ["tokio1", "job-object", "kill-on-drop"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 url = "2.5"
 
 # Dev

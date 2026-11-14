@@ -38,17 +38,18 @@ rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 webpki-roots = { workspace = true }
 
+# Optional OpenTelemetry export stack (enabled by the `otel` feature).
+opentelemetry = { version = "0.27", optional = true }
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"], optional = true }
+tracing-opentelemetry = { version = "0.28", optional = true }
+
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 process-wrap = { workspace = true }
 
-# Optional OpenTelemetry export stack (enabled by the `otel` feature).
-opentelemetry = { version = "0.27", optional = true }
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"], optional = true }
-opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"], optional = true }
-tracing-opentelemetry = { version = "0.28", optional = true }
 
 [features]
 default = []
@@ -63,3 +64,6 @@ otel = [
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true }
+
+[lints]
+workspace = true

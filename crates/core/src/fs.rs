@@ -32,6 +32,11 @@ use crate::policy::{
     lexical_normalize, path_starts_with, paths_equal, simplify, Access, PathRules,
 };
 
+/// The message of the [`ToolError::Execution`] that [`Fs::rename`] returns
+/// when source and destination are on different filesystems, so a caller
+/// can fall back to copying.
+pub const CROSS_DEVICE: &str = "the source and the destination are on different filesystems";
+
 /// A path that passed the policy. Only [`Fs`] can create one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckedPath {
@@ -762,9 +767,24 @@ impl Fs {
                 to.display()
             )));
         }
-        from_dir
-            .rename(&from_name, &to_dir, &to_name)
-            .map_err(|e| ToolError::from_io(&from.display(), &e))
+        from_dir.rename(&from_name, &to_dir, &to_name).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::CrossesDevices {
+                ToolError::Execution(CROSS_DEVICE.to_string())
+            } else {
+                ToolError::from_io(&from.display(), &e)
+            }
+        })
+    }
+
+    /// The directory containing `path`; `None` for an allowed root.
+    #[must_use]
+    pub fn parent(&self, path: &CheckedPath) -> Option<CheckedPath> {
+        let rel = path.rel.parent()?;
+        Some(CheckedPath {
+            root: path.root.clone(),
+            rel: rel.to_path_buf(),
+            access: path.access,
+        })
     }
 
     /// Copy a file.

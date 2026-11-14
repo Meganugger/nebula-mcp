@@ -103,25 +103,64 @@ the server validated a path.
   only; record-like tools return `structuredContent` with an `outputSchema`.
 - D11 Version becomes 0.2.0. MSRV becomes 1.88 (what the dependency graph needs).
 
+- D12 Release profile uses `panic = "unwind"`; `abort` would defeat panic
+  isolation.
+- D13 The destructive gate covers removal and replacement of one thing by
+  another: delete, recursive delete, move or copy onto an existing
+  destination, and the git, docker and process equivalents. Rewriting a file's
+  content (`fs_write`, `fs_edit`) is an ordinary write, because any tool that
+  can write can do it; such tools are still reported to clients with
+  `destructiveHint`. `read_only_paths` is the control for content that must not
+  change.
+- D14 Tool arguments keep their 0.1 camelCase names. Tool names changed for
+  client compatibility; renaming arguments would be style only.
+- D15 Content-heavy results carry their bookkeeping (chunk offsets, match
+  counts, truncation) in a second text block in square brackets, so the first
+  block is exactly the content.
+- D16 Scheduled jobs fire a tool call through the dispatcher, so they are
+  re-authorised against the configuration current at fire time.
+
+## Work rules for this branch (owner's instructions)
+
+- No subagents for anything. Read, write, test and review in the main thread.
+- Finish the whole project; do not stop to report or to ask.
+- Tool categories are ported one after another, not in parallel.
+
 ## Plan and status
 
 Workspace members are re-added as they are ported, so every pushed commit
-builds and passes for what it contains.
+builds and passes for what it contains. 0.1 sources that are not ported yet
+sit in `crates/tools/legacy` and `crates/server/legacy` (not compiled) and are
+deleted as each is replaced.
 
 1. [done] CI trustworthy on three OSes; harness; failing regressions recorded.
-2. [wip] Core: config v2 (done), policy (done), checked paths (done), spawn, net guard, schema
-   validation, tool metadata, context.
-3. [ ] Protocol crate: JSON-RPC, per-revision MCP types, bounded framing.
-4. [ ] Server: engine and connection state, stdio, HTTP (modern + legacy
-   sessions), OAuth, resources, prompts, metrics, CLI.
-5. [ ] Tools by category on the new core (fs first, then parallel).
-6. [ ] Platform: process-tree kill on Windows (Job Objects), OS confinement
-   (Landlock, Seatbelt), macOS/Windows path cases.
-7. [ ] Docs regenerated and drift-checked, CI audit + MSRV + release hygiene,
-   version 0.2.0, changelog with migration notes; delete this log.
+2. [done] Core. Reviewed in full on 2026-11-14 (second session); fixes in
+   7af5d1f: stale process-group id on long-lived children, calls held open by
+   a pipe owner outside the group, queue-slot leak on drop, self-copy
+   truncation, non-canonical working directory, optional arguments sent as
+   null, `/private` aliases on macOS, `sandbox.mode = "require"` now refuses.
+   The 13 macOS failures were the test fixture's own `**/private/**` deny
+   pattern matching macOS temp paths. Green on all three OSes in CI at 5e724ba.
+3. [wip] Vertical slice: `fs` tools (done, 15 tools, tested through the
+   dispatcher), then the server on rmcp 3.10 over stdio with the six
+   regression tests ported and switched on.
+4. [ ] Server: HTTP (modern stateless + legacy sessions), per-owner state,
+   auth, limits, OAuth, resources, prompts, metrics, CLI. `crates/protocol`
+   is deleted when the server no longer needs it (D7: rmcp 3.10 was checked
+   again in its source: `V_2026_07_28`, `server/discover`, `listen`,
+   `legacy_session_mode`, Host/Origin validation, body limit).
+5. [ ] Remaining tool categories, one at a time: git, github, terminal,
+   scheduler, process, net, docker, browser, powershell, windows,
+   diagnostics, security.
+6. [ ] Platform: OS confinement decision (none exists yet; `require` refuses),
+   Windows and macOS behaviour verified in CI.
+7. [ ] Dependencies (thiserror 2, toml 1, notify 8, OTel current), MSRV job,
+   cargo-deny, docs drift job, dependabot; all documents; version 0.2.0
+   changelog with migration notes; delete this log and HANDOFF.md.
 
 ## Verified where
 
 | What | Linux (sandbox) | CI Linux | CI macOS | CI Windows |
 | --- | --- | --- | --- | --- |
 | baseline suite (121 + harness) | yes | c0a0be1 | c0a0be1 | c0a0be1 |
+| core unit tests (159) | yes | 5e724ba | 5e724ba | 5e724ba |

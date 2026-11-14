@@ -172,8 +172,13 @@ pub enum Gate {
 pub struct Effects {
     /// The tool changes nothing: no file writes, no state changes anywhere.
     pub read_only: bool,
-    /// The tool can delete or overwrite data or stop things.
+    /// The tool can remove things or stop them: delete files, discard
+    /// commits, kill processes. Gated by `allow_destructive`.
     pub destructive: Gate,
+    /// The tool can replace the content of something that exists (rewrite a
+    /// file, change a setting). Not gated, since any write can do it, but
+    /// reported to clients as destructive.
+    pub overwrites: bool,
     /// Repeating the call with the same arguments has no further effect.
     pub idempotent: bool,
     /// The tool reaches the network.
@@ -193,6 +198,7 @@ impl Effects {
         Self {
             read_only: true,
             destructive: Gate::Never,
+            overwrites: false,
             idempotent: true,
             network: false,
             open_world: false,
@@ -207,6 +213,7 @@ impl Effects {
         Self {
             read_only: false,
             destructive: Gate::Never,
+            overwrites: false,
             idempotent: false,
             network: false,
             open_world: false,
@@ -226,6 +233,13 @@ impl Effects {
     #[must_use]
     pub const fn idempotent(mut self, yes: bool) -> Self {
         self.idempotent = yes;
+        self
+    }
+
+    /// The tool can replace existing content.
+    #[must_use]
+    pub const fn overwrites(mut self) -> Self {
+        self.overwrites = true;
         self
     }
 
@@ -301,7 +315,7 @@ impl ToolSpec {
         let e = &self.effects;
         Annotations {
             read_only: e.read_only,
-            destructive: !e.read_only && e.destructive != Gate::Never,
+            destructive: !e.read_only && (e.destructive != Gate::Never || e.overwrites),
             idempotent: e.read_only || e.idempotent,
             open_world: e.open_world,
         }
@@ -488,7 +502,7 @@ fn check_spec(spec: &ToolSpec) -> std::result::Result<(), String> {
         }
     }
     let e = &spec.effects;
-    if e.read_only && (e.destructive != Gate::Never || e.elevated == Gate::Always) {
+    if e.read_only && (e.destructive != Gate::Never || e.overwrites || e.elevated == Gate::Always) {
         return Err(format!(
             "tool '{name}' is declared read-only but also destructive or always elevated"
         ));
