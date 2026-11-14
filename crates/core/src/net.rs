@@ -421,11 +421,13 @@ fn parse_url(input: &str, schemes: &[&str], allow_userinfo: bool) -> Result<Pars
             }
         }
     };
-    let port = explicit_port.or_else(|| default_port(&scheme)).ok_or_else(|| {
-        ToolError::invalid(format!(
-            "the URL has no port and the scheme '{scheme}' has no default port; add :<port>"
-        ))
-    })?;
+    let port = explicit_port
+        .or_else(|| default_port(&scheme))
+        .ok_or_else(|| {
+            ToolError::invalid(format!(
+                "the URL has no port and the scheme '{scheme}' has no default port; add :<port>"
+            ))
+        })?;
 
     let url = Url::parse(input).map_err(|e| ToolError::invalid(format!("invalid URL: {e}")))?;
     let url_host = url
@@ -701,7 +703,8 @@ impl Net {
             return Err(ToolError::invalid("the port must be between 1 and 65535"));
         }
         let kind = parse_host(host)?;
-        self.guarded(DNS_TIMEOUT * 2, self.vet_kind(&kind, port)).await
+        self.guarded(DNS_TIMEOUT * 2, self.vet_kind(&kind, port))
+            .await
     }
 
     /// Parse `url`, require its scheme to be one of `schemes`, and vet its host.
@@ -769,9 +772,8 @@ impl Net {
                 Err(_) => return Err(ToolError::Timeout(DNS_TIMEOUT)),
             },
         };
-        let ips = found.map_err(|e| {
-            ToolError::Io(format!("DNS lookup for '{host}' failed: {e}"))
-        })?;
+        let ips =
+            found.map_err(|e| ToolError::Io(format!("DNS lookup for '{host}' failed: {e}")))?;
         if ips.is_empty() {
             return Err(ToolError::Io(format!(
                 "DNS lookup for '{host}' returned no addresses"
@@ -926,9 +928,8 @@ impl Net {
             let mut ex = self.follow(&prepared).await?;
             let content_length = content_length(ex.resp.headers());
             let (body, truncated) = read_capped(&mut ex.resp, cap, content_length).await?;
-            let body_bytes_total = content_length.or_else(|| {
-                (!truncated).then(|| u64::try_from(body.len()).unwrap_or(u64::MAX))
-            });
+            let body_bytes_total = content_length
+                .or_else(|| (!truncated).then(|| u64::try_from(body.len()).unwrap_or(u64::MAX)));
             Ok(HttpResponse {
                 status: ex.status,
                 headers: response_headers(ex.resp.headers()),
@@ -1217,7 +1218,13 @@ fn validate_headers(headers: &[(String, String)]) -> Result<()> {
         let lower = name.to_ascii_lowercase();
         if matches!(
             lower.as_str(),
-            "host" | "content-length" | "transfer-encoding" | "connection" | "upgrade" | "te" | "trailer"
+            "host"
+                | "content-length"
+                | "transfer-encoding"
+                | "connection"
+                | "upgrade"
+                | "te"
+                | "trailer"
         ) || lower.starts_with("proxy-")
         {
             return Err(ToolError::invalid(format!(
@@ -1288,8 +1295,7 @@ fn plan_redirect(status: u16, method: &str, from: &Url, to: &Url) -> Result<Redi
 
 fn is_credential_header(lower: &str) -> bool {
     matches!(lower, "authorization" | "proxy-authorization" | "cookie")
-        || (lower.starts_with("x-")
-            && ["token", "key", "secret"].iter().any(|w| lower.contains(w)))
+        || (lower.starts_with("x-") && ["token", "key", "secret"].iter().any(|w| lower.contains(w)))
         || ["token", "secret", "password", "api-key", "apikey"]
             .iter()
             .any(|w| lower.contains(w))
@@ -1373,7 +1379,9 @@ where
         .max_header_size(MAX_RESPONSE_HEAD_BYTES)
         .handshake(TokioIo::new(io))
         .await
-        .map_err(|e| ToolError::Execution(format!("HTTP handshake with {label} failed: {}", chain(&e))))?;
+        .map_err(|e| {
+            ToolError::Execution(format!("HTTP handshake with {label} failed: {}", chain(&e)))
+        })?;
     let task = tokio::spawn(async move {
         let _ = conn.await;
     });

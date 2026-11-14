@@ -54,8 +54,7 @@ impl ConfigStore {
         overlay: Option<Overlay>,
         catalog: Catalog,
     ) -> Result<(Self, Vec<String>), ConfigError> {
-        let (loaded, warnings) =
-            build(source, overlay.as_ref(), Some(&catalog), 0)?;
+        let (loaded, warnings) = build(source, overlay.as_ref(), Some(&catalog), 0)?;
         let (changed, _) = tokio::sync::watch::channel(0);
         Ok((
             Self {
@@ -255,15 +254,17 @@ mod tests {
         let path = root.join("nebula.toml");
         std::fs::write(
             &path,
-            format!("[security]\nallowed_paths = [\"{}\"]\n", root.display())
-                .replace('\\', "/"),
+            format!("[security]\nallowed_paths = [\"{}\"]\n", root.display()).replace('\\', "/"),
         )
         .unwrap();
         let (store, _) = ConfigStore::load(Some(&path), None, catalog()).unwrap();
         let policy = store.snapshot().policies.for_tool("fs_read");
         assert!(policy.paths().denied(&path, Access::Read).is_some());
         assert!(policy.paths().denied(&path, Access::Write).is_some());
-        assert!(policy.paths().denied(&root.join("other.txt"), Access::Write).is_none());
+        assert!(policy
+            .paths()
+            .denied(&root.join("other.txt"), Access::Write)
+            .is_none());
     }
 
     #[test]

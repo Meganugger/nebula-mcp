@@ -148,7 +148,8 @@ impl Dispatcher {
         let loaded = self.store.snapshot();
         let tool = self.lookup(&call.name, &loaded.config)?;
         let policy = loaded.policies.for_tool(&call.name);
-        let span = tracing::info_span!("tool_call", tool = %call.name, request_id = %call.request_id);
+        let span =
+            tracing::info_span!("tool_call", tool = %call.name, request_id = %call.request_id);
         let started = Instant::now();
 
         let name = call.name.clone();
@@ -393,7 +394,10 @@ mod tests {
                 Behaviour::Echo => Ok(ToolOutput::json(args)),
                 Behaviour::Panic => panic!("boom"),
                 Behaviour::Sleep => {
-                    tokio::time::sleep(Duration::from_secs(600)).await;
+                    tokio::select! {
+                        () = tokio::time::sleep(Duration::from_secs(600)) => {}
+                        () = ctx.cancel().cancelled() => return Err(ToolError::Cancelled),
+                    }
                     Ok(ToolOutput::text("late"))
                 }
                 Behaviour::WriteWhileReadOnly => {
@@ -465,7 +469,10 @@ mod tests {
 
     #[tokio::test]
     async fn arguments_are_validated_before_the_tool_runs() {
-        let d = dispatcher("", vec![probe("fs_echo", Effects::read_only(), Behaviour::Echo)]);
+        let d = dispatcher(
+            "",
+            vec![probe("fs_echo", Effects::read_only(), Behaviour::Echo)],
+        );
         let ok = d.call(call("fs_echo", json!({"n": 1}))).await.unwrap();
         assert_eq!(ok.unwrap().structured, Some(json!({"n": 1})));
         assert!(d.call(call("fs_echo", Value::Null)).await.unwrap().is_ok());
@@ -498,7 +505,11 @@ mod tests {
                 probe("fs_echo", Effects::read_only(), Behaviour::Echo),
             ],
         );
-        let failure = d.call(call("fs_panic", json!({}))).await.unwrap().unwrap_err();
+        let failure = d
+            .call(call("fs_panic", json!({})))
+            .await
+            .unwrap()
+            .unwrap_err();
         assert!(matches!(failure.error, ToolError::Internal(_)));
         assert!(!failure.text.contains("boom"), "panic text must not leak");
         assert!(d.call(call("fs_echo", json!({}))).await.unwrap().is_ok());
@@ -545,8 +556,16 @@ mod tests {
         let d = dispatcher(
             "allow_network = true\n",
             vec![
-                probe("fs_sneaky", Effects::read_only(), Behaviour::WriteWhileReadOnly),
-                probe("fs_dial", Effects::read_only(), Behaviour::NetWithoutDeclaring),
+                probe(
+                    "fs_sneaky",
+                    Effects::read_only(),
+                    Behaviour::WriteWhileReadOnly,
+                ),
+                probe(
+                    "fs_dial",
+                    Effects::read_only(),
+                    Behaviour::NetWithoutDeclaring,
+                ),
             ],
         );
         for name in ["fs_sneaky", "fs_dial"] {
@@ -561,8 +580,11 @@ mod tests {
             "max_runtime_secs = 1\n",
             vec![probe("fs_sleep", Effects::read_only(), Behaviour::Sleep)],
         );
-        tokio::time::pause();
-        let failure = d.call(call("fs_sleep", json!({}))).await.unwrap().unwrap_err();
+        let failure = d
+            .call(call("fs_sleep", json!({})))
+            .await
+            .unwrap()
+            .unwrap_err();
         assert!(matches!(failure.error, ToolError::Timeout(_)));
     }
 
@@ -592,7 +614,11 @@ mod tests {
     async fn dropping_a_call_cancels_what_it_started() {
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let observed = Arc::new(tokio::sync::Notify::new());
-        struct Leaky(ToolSpec, Arc<std::sync::atomic::AtomicBool>, Arc<tokio::sync::Notify>);
+        struct Leaky(
+            ToolSpec,
+            Arc<std::sync::atomic::AtomicBool>,
+            Arc<tokio::sync::Notify>,
+        );
         #[async_trait]
         impl Tool for Leaky {
             fn spec(&self) -> &ToolSpec {
@@ -613,7 +639,10 @@ mod tests {
         let spec = probe("fs_leak", Effects::read_only(), Behaviour::Echo)
             .spec()
             .clone();
-        let d = dispatcher("", vec![Arc::new(Leaky(spec, flag.clone(), observed.clone()))]);
+        let d = dispatcher(
+            "",
+            vec![Arc::new(Leaky(spec, flag.clone(), observed.clone()))],
+        );
         let fut = d.call(call("fs_leak", json!({})));
         let _ = tokio::time::timeout(Duration::from_millis(100), fut).await;
         tokio::time::timeout(Duration::from_secs(5), observed.notified())
@@ -651,7 +680,11 @@ mod tests {
         let second = tokio::spawn(async move { d2.call(queued).await });
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let refused = d.call(call("fs_sleep", json!({}))).await.unwrap().unwrap_err();
+        let refused = d
+            .call(call("fs_sleep", json!({})))
+            .await
+            .unwrap()
+            .unwrap_err();
         assert!(matches!(refused.error, ToolError::LimitExceeded(_)));
 
         queued_cancel.cancel();
@@ -664,7 +697,10 @@ mod tests {
 
     #[tokio::test]
     async fn denials_explain_what_is_allowed() {
-        let d = dispatcher("", vec![probe("fs_echo", Effects::read_only(), Behaviour::Echo)]);
+        let d = dispatcher(
+            "",
+            vec![probe("fs_echo", Effects::read_only(), Behaviour::Echo)],
+        );
         let policy = d.store().snapshot().policies.for_tool("fs_echo");
         let text = d.describe(
             &ToolError::PathNotAllowed {

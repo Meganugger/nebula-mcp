@@ -383,11 +383,10 @@ impl Spawner {
                 "tool '{}' ran '{name}' without declaring it",
                 self.policy.tool()
             ))),
-            (Program::Caller(requested), Exec::CallerChosen(_)) => {
-                self.policy
-                    .commands()
-                    .authorize(requested, &cwd, self.policy.paths())
-            }
+            (Program::Caller(requested), Exec::CallerChosen(_)) => self
+                .policy
+                .commands()
+                .authorize(requested, &cwd, self.policy.paths()),
             (Program::Caller(_), _) => Err(ToolError::Internal(format!(
                 "tool '{}' ran a caller-chosen program without declaring it",
                 self.policy.tool()
@@ -439,7 +438,11 @@ impl Spawner {
             }
             cmd.env(k, v);
         }
-        if command.args.iter().any(|a| a.to_string_lossy().contains('\0')) {
+        if command
+            .args
+            .iter()
+            .any(|a| a.to_string_lossy().contains('\0'))
+        {
             return Err(ToolError::invalid("arguments must not contain NUL"));
         }
         cmd.stdout(Stdio::piped())
@@ -499,10 +502,8 @@ impl Spawner {
 
         let deadline = tokio::time::sleep(timeout);
         tokio::pin!(deadline);
-        let mut heartbeat = tokio::time::interval_at(
-            tokio::time::Instant::now() + HEARTBEAT,
-            HEARTBEAT,
-        );
+        let mut heartbeat =
+            tokio::time::interval_at(tokio::time::Instant::now() + HEARTBEAT, HEARTBEAT);
         let mut beats = 0.0_f64;
 
         #[derive(PartialEq)]
@@ -876,7 +877,7 @@ use imp::Tree;
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::policy::{slash_string, simplify, PolicySet};
+    use crate::policy::{simplify, slash_string, PolicySet};
 
     fn spawner(commands: &[&str], extra: &str, exec: Exec) -> (Spawner, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
@@ -1020,7 +1021,11 @@ mod tests {
             .await;
         assert!(matches!(r, Err(ToolError::Timeout(_))));
         assert!(started.elapsed() < Duration::from_secs(10));
-        let pid: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
         assert!(gone(pid).await, "grandchild {pid} survived the timeout");
     }
 
@@ -1032,7 +1037,11 @@ mod tests {
         let script = format!("sleep 300 & echo $! > '{}'; wait", pidfile.display());
         let fut = s.run(Command::caller("sh").args(["-c", &script]));
         let _ = tokio::time::timeout(Duration::from_millis(800), fut).await;
-        let pid: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
         assert!(gone(pid).await, "grandchild {pid} survived the drop");
     }
 
@@ -1043,10 +1052,20 @@ mod tests {
         let pidfile = t.path().join("pid");
         let script = format!("sleep 300 & echo $! > '{}'; echo done", pidfile.display());
         let started = Instant::now();
-        let out = s.run(Command::caller("sh").args(["-c", &script])).await.unwrap();
+        let out = s
+            .run(Command::caller("sh").args(["-c", &script]))
+            .await
+            .unwrap();
         assert_eq!(out.stdout.text.trim(), "done");
-        assert!(started.elapsed() < Duration::from_secs(10), "waited on a held pipe");
-        let pid: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "waited on a held pipe"
+        );
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
         assert!(gone(pid).await, "background child {pid} was left running");
     }
 
@@ -1106,23 +1125,33 @@ mod tests {
         let (s, t) = spawner(&["sh"], "", CALLER);
         let pidfile = t.path().join("pid");
         let script = format!("sleep 300 & echo $! > '{}'; wait", pidfile.display());
-        let child = s.spawn(Command::caller("sh").args(["-c", &script])).unwrap();
+        let child = s
+            .spawn(Command::caller("sh").args(["-c", &script]))
+            .unwrap();
         for _ in 0..100 {
             if std::fs::read_to_string(&pidfile).is_ok_and(|s| !s.trim().is_empty()) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        let pid: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
         drop(child);
-        assert!(gone(pid).await, "grandchild {pid} survived dropping the child");
+        assert!(
+            gone(pid).await,
+            "grandchild {pid} survived dropping the child"
+        );
     }
 
     #[tokio::test]
     async fn missing_program_is_reported() {
         let (s, _t) = spawner(&["definitely-not-a-real-binary-xyz"], "", CALLER);
         assert!(matches!(
-            s.run(Command::caller("definitely-not-a-real-binary-xyz")).await,
+            s.run(Command::caller("definitely-not-a-real-binary-xyz"))
+                .await,
             Err(ToolError::ProgramNotFound(_))
         ));
     }

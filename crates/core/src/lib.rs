@@ -36,4 +36,6 @@ pub use dispatch::{Call, CallFailure, Dispatcher, UnknownTool};
 pub use error::{Result, ToolError};
 pub use metrics::{Metrics, Outcome};
 pub use store::ConfigStore;
-pub use tool::{Category, Content, Effects, Gate, Platforms, Tool, ToolOutput, ToolRegistry, ToolSpec};
+pub use tool::{
+    Category, Content, Effects, Gate, Platforms, Tool, ToolOutput, ToolRegistry, ToolSpec,
+};

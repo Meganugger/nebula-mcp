@@ -447,7 +447,10 @@ impl ToolRegistry {
     #[must_use]
     pub fn catalog(&self) -> Catalog {
         Catalog {
-            categories: Category::ALL.iter().map(|c| c.as_str().to_string()).collect(),
+            categories: Category::ALL
+                .iter()
+                .map(|c| c.as_str().to_string())
+                .collect(),
             tools: self.tools.keys().map(|k| (*k).to_string()).collect(),
         }
     }
@@ -471,7 +474,9 @@ fn check_spec(spec: &ToolSpec) -> std::result::Result<(), String> {
         return Err(format!("tool name '{name}' must start with '{prefix}'"));
     }
     if spec.title.trim().is_empty() || spec.description.trim().len() < 20 {
-        return Err(format!("tool '{name}' needs a title and a real description"));
+        return Err(format!(
+            "tool '{name}' needs a title and a real description"
+        ));
     }
     crate::schema::check_input_schema(&spec.input)
         .map_err(|e| format!("tool '{name}' input schema: {e}"))?;
@@ -529,9 +534,12 @@ mod tests {
     #[test]
     fn exposure_follows_categories_tools_and_platform() {
         let mut reg = ToolRegistry::new();
-        reg.register(Arc::new(Dummy(spec("fs_read", Category::Fs)))).unwrap();
-        reg.register(Arc::new(Dummy(spec("fs_delete", Category::Fs)))).unwrap();
-        reg.register(Arc::new(Dummy(spec("git_status", Category::Git)))).unwrap();
+        reg.register(Arc::new(Dummy(spec("fs_read", Category::Fs))))
+            .unwrap();
+        reg.register(Arc::new(Dummy(spec("fs_delete", Category::Fs))))
+            .unwrap();
+        reg.register(Arc::new(Dummy(spec("git_status", Category::Git))))
+            .unwrap();
         let mut other = spec("windows_env", Category::Windows);
         other.platforms = Platforms {
             linux: !cfg!(target_os = "linux"),
@@ -554,11 +562,20 @@ mod tests {
     #[test]
     fn malformed_definitions_are_rejected() {
         let mut reg = ToolRegistry::new();
-        reg.register(Arc::new(Dummy(spec("fs_read", Category::Fs)))).unwrap();
-        assert!(reg.register(Arc::new(Dummy(spec("fs_read", Category::Fs)))).is_err());
-        assert!(reg.register(Arc::new(Dummy(spec("fs.read", Category::Fs)))).is_err());
-        assert!(reg.register(Arc::new(Dummy(spec("read", Category::Fs)))).is_err());
-        assert!(reg.register(Arc::new(Dummy(spec("git_x", Category::Fs)))).is_err());
+        reg.register(Arc::new(Dummy(spec("fs_read", Category::Fs))))
+            .unwrap();
+        assert!(reg
+            .register(Arc::new(Dummy(spec("fs_read", Category::Fs))))
+            .is_err());
+        assert!(reg
+            .register(Arc::new(Dummy(spec("fs.read", Category::Fs))))
+            .is_err());
+        assert!(reg
+            .register(Arc::new(Dummy(spec("read", Category::Fs))))
+            .is_err());
+        assert!(reg
+            .register(Arc::new(Dummy(spec("git_x", Category::Fs))))
+            .is_err());
         let mut lying = spec("fs_wipe", Category::Fs);
         lying.effects = Effects::read_only().destructive(Gate::Always);
         assert!(reg.register(Arc::new(Dummy(lying))).is_err());
