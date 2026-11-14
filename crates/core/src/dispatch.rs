@@ -71,6 +71,23 @@ pub struct CallFailure {
     pub text: String,
 }
 
+/// Calls currently inside [`Dispatcher::call`].
+#[derive(Default)]
+struct Active {
+    count: AtomicUsize,
+    changed: tokio::sync::Notify,
+}
+
+struct ActiveGuard(Arc<Active>);
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        if self.0.count.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.0.changed.notify_waiters();
+        }
+    }
+}
+
 /// Runs tool calls.
 pub struct Dispatcher {
     registry: Arc<ToolRegistry>,
@@ -78,6 +95,7 @@ pub struct Dispatcher {
     metrics: Metrics,
     working_dir: PathBuf,
     permits: Arc<Semaphore>,
+    active: Arc<Active>,
     waiting: AtomicUsize,
     shutdown: CancellationToken,
 }
@@ -102,6 +120,7 @@ impl Dispatcher {
             metrics: Metrics::new(),
             working_dir,
             permits: Arc::new(Semaphore::new(slots)),
+            active: Arc::new(Active::default()),
             waiting: AtomicUsize::new(0),
             shutdown,
         }
@@ -137,6 +156,28 @@ impl Dispatcher {
         &self.shutdown
     }
 
+    /// Number of calls in progress, including queued ones.
+    #[must_use]
+    pub fn active_calls(&self) -> usize {
+        self.active.count.load(Ordering::SeqCst)
+    }
+
+    /// Resolve when no call is in progress. Used at shutdown, after the
+    /// shutdown token fired, to let calls kill what they started.
+    pub async fn idle(&self) {
+        loop {
+            let changed = self.active.changed.notified();
+            tokio::pin!(changed);
+            // Register before reading the count, so a call that ends in
+            // between is not missed.
+            changed.as_mut().enable();
+            if self.active_calls() == 0 {
+                return;
+            }
+            changed.await;
+        }
+    }
+
     /// The tools exposed under the current configuration, sorted by name.
     #[must_use]
     pub fn exposed(&self) -> Vec<Arc<dyn Tool>> {
@@ -149,6 +190,8 @@ impl Dispatcher {
     /// `Err(UnknownTool)` is a protocol-level failure. Otherwise the inner
     /// result is the tool's outcome, to be reported to the model.
     pub async fn call(&self, call: Call) -> Result<Result<ToolOutput, CallFailure>, UnknownTool> {
+        self.active.count.fetch_add(1, Ordering::SeqCst);
+        let _active = ActiveGuard(self.active.clone());
         let loaded = self.store.snapshot();
         let tool = self.lookup(&call.name, &loaded.config)?;
         let policy = loaded.policies.for_tool(&call.name);
