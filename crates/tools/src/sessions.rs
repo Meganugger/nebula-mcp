@@ -326,7 +326,7 @@ impl Sessions {
                 buffered: s.buffer.len(),
             });
         }
-        out.sort_by(|a, b| b.age.cmp(&a.age));
+        out.sort_by_key(|s| std::cmp::Reverse(s.age));
         out
     }
 

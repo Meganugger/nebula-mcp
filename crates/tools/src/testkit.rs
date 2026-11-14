@@ -32,20 +32,15 @@ impl Kit {
     /// A dispatcher with every category enabled and `root` allowed.
     /// `security` is appended to the `[security]` table.
     pub(crate) fn new(security: &str) -> Self {
-        Self::build(None, security, "")
+        Self::build(security, "")
     }
 
     /// Like [`Kit::new`], with further TOML appended after `[security]`.
     pub(crate) fn with_config(security: &str, rest: &str) -> Self {
-        Self::build(None, security, rest)
+        Self::build(security, rest)
     }
 
-    /// Like [`Kit::new`], with only the named categories enabled.
-    pub(crate) fn with_categories(categories: &[&str], security: &str) -> Self {
-        Self::build(Some(categories), security, "")
-    }
-
-    fn build(categories: Option<&[&str]>, security: &str, rest: &str) -> Self {
+    fn build(security: &str, rest: &str) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let base = simplify(&std::fs::canonicalize(tmp.path()).unwrap());
         let root = base.join("root");
@@ -55,15 +50,12 @@ impl Kit {
 
         let mut registry = ToolRegistry::new();
         let state = crate::register_all(&mut registry).unwrap();
-        let categories: Vec<String> = match categories {
-            Some(list) => list.iter().map(|c| format!("\"{c}\"")).collect(),
-            None => registry
-                .catalog()
-                .categories
-                .iter()
-                .map(|c| format!("\"{c}\""))
-                .collect(),
-        };
+        let categories: Vec<String> = registry
+            .catalog()
+            .categories
+            .iter()
+            .map(|c| format!("\"{c}\""))
+            .collect();
         let categories = categories.join(", ");
         let config = Self::config(&categories, &root, security, rest);
         config.validate(&registry.catalog()).unwrap();
