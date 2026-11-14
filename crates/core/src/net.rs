@@ -652,7 +652,7 @@ impl Net {
     /// [`ToolError::Cancelled`] when `cancel` fires, and in-memory response
     /// bodies are capped at `max_bytes`.
     #[must_use]
-    pub fn new(policy: NetPolicy, cancel: CancellationToken, max_bytes: usize) -> Self {
+    pub(crate) fn new(policy: NetPolicy, cancel: CancellationToken, max_bytes: usize) -> Self {
         Self {
             policy,
             cancel,
