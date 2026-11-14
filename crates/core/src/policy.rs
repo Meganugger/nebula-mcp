@@ -61,6 +61,8 @@ pub const BUILTIN_DENIED: &[&str] = &[
     "**/.pgpass",
     "**/.htpasswd",
     "**/.git-credentials",
+    // Remote URLs and extra headers in a repository config can carry tokens.
+    "**/.git/config",
 ];
 
 /// `.env.<suffix>` files that hold placeholders rather than secrets.
