@@ -2,7 +2,6 @@
 resolver = "3"
 members = [
     # Re-added as each crate is ported to the 0.2 core (see OVERHAUL_LOG.md).
-    "crates/protocol",
     "crates/core",
     "crates/tools",
     "crates/server",

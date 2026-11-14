@@ -29,14 +29,74 @@ const REV_STRUCTURED: &str = "2025-06-18";
 #[derive(Clone)]
 pub struct Handler {
     app: Arc<App>,
+    scope: Scope,
+}
+
+/// Whose long-lived state (terminal sessions, jobs) a handler's calls use.
+#[derive(Clone)]
+enum Scope {
+    /// One owner for the whole connection (stdio).
+    Fixed(OwnerId),
+    /// An HTTP handler. Inside a legacy session the session is the owner,
+    /// and its state is released when the session ends. A stateless request
+    /// has no session, so the authenticated principal is the owner.
+    Http(Arc<SessionScope>),
+}
+
+struct SessionScope {
     owner: OwnerId,
+    app: Arc<App>,
+}
+
+impl Drop for SessionScope {
+    fn drop(&mut self) {
+        // The session (or the stateless request, which never used this
+        // owner) is over: stop what belongs to it.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let (app, owner) = (self.app.clone(), self.owner.clone());
+            runtime.spawn(async move { app.state().close_owner(&owner).await });
+        }
+    }
 }
 
 impl Handler {
     /// A handler whose long-lived state belongs to `owner`.
     #[must_use]
     pub fn new(app: Arc<App>, owner: OwnerId) -> Self {
-        Self { app, owner }
+        Self {
+            app,
+            scope: Scope::Fixed(owner),
+        }
+    }
+
+    /// A handler for one legacy HTTP session or one stateless HTTP request.
+    #[must_use]
+    pub fn for_http(app: Arc<App>) -> Self {
+        let owner = OwnerId::new(format!("session:{}", uuid::Uuid::new_v4().simple()));
+        Self {
+            scope: Scope::Http(Arc::new(SessionScope {
+                owner,
+                app: app.clone(),
+            })),
+            app,
+        }
+    }
+
+    fn owner(&self, context: &RequestContext<RoleServer>) -> OwnerId {
+        match &self.scope {
+            Scope::Fixed(owner) => owner.clone(),
+            Scope::Http(session) => {
+                let parts = context.extensions.get::<axum::http::request::Parts>();
+                let in_session = parts.is_some_and(|p| p.headers.contains_key("mcp-session-id"));
+                if in_session {
+                    return session.owner.clone();
+                }
+                let principal = parts
+                    .and_then(|p| p.extensions.get::<crate::http::Principal>())
+                    .map_or("anonymous", crate::http::Principal::id);
+                OwnerId::new(format!("client:{principal}"))
+            }
+        }
     }
 }
 
@@ -167,7 +227,7 @@ impl ServerHandler for Handler {
             .call(Call {
                 name: request.name.to_string(),
                 arguments,
-                owner: self.owner.clone(),
+                owner: self.owner(&context),
                 request_id: context.id.to_string(),
                 cancel: context.ct.clone(),
                 progress,

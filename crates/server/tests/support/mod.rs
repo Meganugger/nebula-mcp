@@ -6,6 +6,8 @@
 
 #![allow(dead_code)]
 
+pub mod http;
+
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};

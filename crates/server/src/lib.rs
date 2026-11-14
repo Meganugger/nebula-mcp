@@ -8,4 +8,5 @@
 pub mod app;
 pub mod cli;
 pub mod handler;
+pub mod http;
 pub mod stdio;
