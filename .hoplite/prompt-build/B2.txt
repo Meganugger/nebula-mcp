@@ -1,0 +1,31 @@
+### The overhaul branch, as of 2026-11-14
+
+The work is on branch `hoplite/amisos-peiraieus-405652a0`, eight commits on top of 66dcb54 with head 902fe2a, and on draft pull request #2 against main ("Overhaul Nebula MCP security and reliability", empty description). Continue on that branch and that pull request. Do not start again from main and do not open a second pull request. A new thread's workspace is a shallow checkout of main on a branch of its own, so if that is where you are, fetch the overhaul branch, work from its head, push to it with an explicit refspec (`git push origin HEAD:hoplite/amisos-peiraieus-405652a0`), and take over #2 as this thread's pull request. If the head is no longer 902fe2a, read what was added before going on.
+
+Two temporary files on the branch carry the earlier sessions' state. Read both in full first.
+
+- `OVERHAUL_LOG.md` holds the baseline, a threat model with numbered guarantees, decisions D1 to D11, the plan with its status, and a table of what was verified where.
+- `HANDOFF.md` is the earlier session's notes for its successor. It describes the new core file by file, lists the remaining work per crate and per tool category, and records facts that were expensive to find: the 2026-07-28 revision in one paragraph, which clients can send a static token and which need OAuth, and how cap-std treats symlinks.
+
+Where this brief and those files disagree, this brief wins.
+
+What exists on the branch:
+
+- CI that runs format and lint, tests on Linux, Windows and macOS without fail-fast, a release and feature-build job, and a Linux-to-Windows type-check.
+- A black-box harness that drives the real binary over stdio (`crates/server/tests/support`) and six regression tests for the reproduced defects (`crates/server/tests/security_regressions.rs`). All six failed against 0.1. They are `#[ignore]`d and written against 0.1 tool names and config syntax, so they need porting before they can be switched on.
+- A rewritten `crates/core` of about 11,000 lines: strict config v2, a policy engine, checked filesystem access built on cap-std directory handles, a process spawner that owns the environment and the process-tree lifecycle, an outbound network guard, schema validation and typed arguments, tool metadata and a registry, a capability-based tool context, per-owner state, and a dispatcher meant to be the single choke point. The handoff says its 156 tests pass on Linux.
+
+What does not exist yet:
+
+- Anything that runs. The root `Cargo.toml` lists only `crates/protocol` and `crates/core` as members and excludes `crates/tools` and `crates/server`, whose sources are still the 0.1 code and do not compile against the new core. No fix in the core has been exercised through the real dispatcher or the real binary, and CI's green jobs cover two crates out of four.
+- Any ported tool, any server code on the new core, anything for the 2026-07-28 revision, any OS confinement, and every document. The version is still 0.1.0 and `rust-version` is still 1.82.
+
+Known problems on the head:
+
+- The macOS test job fails 13 of the core's `fs::tests`, including the basic read, write and root-is-allowed cases. The checked-path layer is therefore unverified on macOS, and it is the foundation of everything else.
+- The "Release and feature builds" job fails in its OpenTelemetry feature-build step.
+- The handoff says `schema.rs`, `args.rs` and `net.rs` "were written quickly and deserve a read-through before tools depend on them", and that clippy over all targets and the Windows type-check had not yet been run on the finished core.
+- The log contradicts itself in two places. Decision D7 adopts the official Rust SDK and deletes the hand-written protocol crate, while plan step 3 still describes building that crate. Plan step 5 says the tool categories are ported "fs first, then parallel", and they are not to be parallelised. Correct both when you update the log.
+
+Treat the branch as a draft by a colleague you cannot question. Its decisions were made with care and you do not need to reargue them. But nobody has reviewed the core as a whole, parts of it were written fast, and none of it has been tested end to end, so its "done" marks are claims to check.
+

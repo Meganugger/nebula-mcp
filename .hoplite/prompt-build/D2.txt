@@ -1,0 +1,2 @@
+- Nothing is left at 0.1. Every crate is back in the workspace and builds, every tool that ships runs on the new core, and no code path reaches the filesystem, a process or the network except through it.
+

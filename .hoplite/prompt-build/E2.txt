@@ -1,0 +1,43 @@
+**Protocol layer.** The log's decision is to build on the official Rust SDK (`rmcp`) and delete the hand-written protocol crate. No server code has been written on either, so this is the one decision to confirm before you invest in it. Check that the SDK version you would use really implements the 2026-07-28 revision alongside the legacy ones, and that it leaves you enough control over transport security, per-request policy and connection state. If it does not, keeping a hand-written layer is a legitimate answer. Either way, separate connection state from the engine: per process on stdio, per real session on legacy HTTP, none for modern requests.
+
+**Remote access.** The handoff records which clients can send a static bearer token and which need OAuth. Confirm it against the clients' current documentation, because if a static token does not work with the platforms a user would paste this URL into, the headline use case does not work. Implement what the specification's authorization section requires of a server. The log commits to an embedded single-operator authorization server; that is security-critical code, so hold it to the same standard as the permission core, with tests that attack it, and state precisely which clients are supported.
+
+**What the owner chose.** Keep the name, the dual license, the general-purpose scope, both transports, and the `"*"` switch, which should stay but be documented and announced loudly at startup. Defaults may change where the docs already promise the safer behavior; `allow_network` defaulting to on contradicts "nothing is allowed by default".
+
+**Breaking changes.** At 0.1.0, breaking config keys, tool names, defaults and tool arguments is acceptable when it buys safety or correctness. Record each with migration notes. Tool names have already moved from dots to underscores (D1), because several major clients reject or rewrite dots.
+
+**Tools.** Port every category. A tool leaves the project only by a recorded decision, never because time ran out. Prefer making the existing tools correct over adding more. Add only what an agent cannot work without or what the docs already promise. Hide tools that cannot run on the current platform. Measure the size of `tools/list`, because 110 definitions is a heavy load on a client's context, and make it easy to expose only the categories in use. If a tool cannot be made safe or cannot be verified at all, say so in its description and docs or disable it by default, and record why.
+
+**The roadmap.** ROADMAP.md is not the plan. Rewrite it at the end to say what is true.
+
+## How to work
+
+**Start by knowing the whole thing.** Get onto the branch and read `OVERHAUL_LOG.md` and `HANDOFF.md`. Then read the code yourself: all of the new core, then the 0.1 tools and server you are about to port. Rerun what the handoff says passes. Reading it all is what lets you do the rest without handing any of it off.
+
+**Make the core trustworthy before building on it.** Review it against the threat model as you would someone else's pull request, since in effect it is one. Fix what you find, get clippy clean over all targets, type-check it for Windows, and get its tests green on all three operating systems in CI, starting with the macOS failures. Every later step inherits its mistakes.
+
+**Then get one path working end to end.** Bring the server up on the new core with the `fs` category, over stdio first, so that there is a real binary again. Port the six regression tests to the new names and config and switch each one on as its fix becomes reachable. The handoff proposes porting all the tools before the server. A thin working slice first is safer, because otherwise 110 tools get written against an API that has never served a request, and from that point every commit can be tested through the real dispatcher and the real binary.
+
+**After that, order still matters.** Do the rest of the protocol and session architecture (both eras, HTTP, client isolation, authorization), then the remaining tool categories one at a time, then platform work (process-tree kill on Windows, OS confinement where you can verify it), then dependency and CI hygiene, then the documents. Re-add each crate to the workspace as it is ported, so that every pushed commit builds and passes for what it contains. Nothing may remain excluded at the end.
+
+**CI is your only evidence for Windows and macOS.** Every push to any branch runs it. Push often and read the logs. Locally, `cargo check --target x86_64-pc-windows-gnu` type-checks Windows code for crates without C dependencies. Do not build further on top of a red job: a failure on one platform in the core usually means a wrong assumption that the tools will then copy.
+
+**Tests.** The 0.1 suite passed while everything above was broken, so a green suite is not evidence by itself. For each defect, write the test that fails first and drive it through the real dispatcher. Run the real binary over stdio and HTTP as well. Do not weaken, ignore or delete a test to get a pass. The six ignored regression tests are a debt, and none of them may still be ignored at the end.
+
+**Sources.** Read the specification instead of relying on memory or on the handoff's summary of it. Several dependencies are at least one breaking release behind (for example `thiserror` 1, `axum` 0.7, `notify` 6). The handoff lists the upgrades it intended; check current versions and advisories before choosing.
+
+**Keep the state on the branch.** Your context will turn over during this work, and the sandbox was restored from a snapshot once during the audit, so unpushed work can vanish. Commit in steps that each build and pass, push each one, and keep `OVERHAUL_LOG.md` current with the plan and status, the decisions and their reasons, and what was verified where. Keep `HANDOFF.md` accurate as well, or fold it into the log. When your context turns over, the next thing to do is in the log: read it again and continue, because a context turnover is not a stopping point. Before you finish, fold both files into the changelog, the architecture document and SECURITY.md, and delete them.
+
+**Public repository.** Keep working exploits for unfixed holes out of issues, the log and PR text. Describe what was hardened and let the tests carry the detail alongside the fix.
+
+**Sandbox facts.** Linux only, 2 vCPU and 8 GiB, Rust 1.100, Node present, no Docker, no Landlock, and a cold build takes about three minutes. PID 2 is `sleep infinity`, the sandbox's keepalive; a `pkill -x sleep` during the audit killed it and restarted the sandbox. When testing process cleanup, kill only PIDs or groups your test started, and give `timeout` a `-k`, because the server can ignore SIGTERM. The workspace's source-control policy rejected commands that fed command substitution into `gh` and commands that wrote and ran large heredoc scripts; literal arguments and plain pipelines went through.
+
+## Finishing
+
+Before you call it finished, go through "What the result should be" one outcome at a time and point to the evidence for each: the test, the CI run, the document. Where the evidence is missing, the work is missing, so go and do it. Do the same for every reproduced defect, for the six regression tests, and for the tool list, where each 0.1 tool should be ported, replaced, or removed by a recorded decision. Then search the diff for leftovers: ignored tests, placeholder code, excluded crates, and 0.1 tool names in documents and prompts.
+
+Deliver on the overhaul branch as pull request #2 against main, marked ready for review, with every check green on the final commit. Set the version to reflect the breaking changes. Do not merge it, and do not publish a release or a crate.
+
+The owner will not review tens of thousands of lines, so the PR description and your final report are how they will understand what changed. In the PR description, say what changed and why, list breaking changes with migration notes, and list the decisions the owner might want to reverse.
+
+End with a report that leads with what the server can now be trusted to do. Then give the evidence: what was tested, where, and on which platforms. Then state plainly what is not done or not verified and why, and what needs the owner because it lies outside the repository. That list should be short, and every entry on it should be something you could not do, not something you chose to leave. Report facts. Do not close with a question, an offer, or a suggestion of what could come next.

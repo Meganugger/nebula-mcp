@@ -1,0 +1,4 @@
+## What is wrong
+
+This is what was wrong with 0.1 at 66dcb54, and for the running server all of it still is: the new core answers part of it as a library, but no tool or transport uses that library yet. Count an item as fixed only when a test drives it through the real dispatcher and passes. The list is a floor from one day of auditing, not the full set, and the working log adds findings from a later pass. You are about to port every tool and the whole server, and that code is small enough to read completely, so read all of it yourself before you continue.
+

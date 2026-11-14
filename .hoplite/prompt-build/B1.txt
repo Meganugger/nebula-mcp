@@ -1,0 +1,8 @@
+## Where it stands
+
+Two things are described here: the 0.1 code on main, which an earlier session of you audited, and the unfinished overhaul branch built on top of it. Both descriptions are other sessions' findings, so check anything again before relying on it.
+
+### Main at 66dcb54: the 0.1 baseline
+
+The audit ran on 2026-11-12. "Reproduced" means it was run against the built debug binary. "Read" means that session confirmed it in the source. "Reported" means a delegated code audit found it and the session did not confirm it independently. The overhaul's working log says a later pass confirmed every reported finding, but you have not seen that evidence, so treat those items as likely and not as proven.
+

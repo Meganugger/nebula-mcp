@@ -1,0 +1,4 @@
+## Judgment calls
+
+The earlier session made most of these calls and recorded them as D1 to D11 in the log: snake-case tool names, opt-in categories, directory roots, network off by default, an environment allowlist for children, the official SDK for the protocol layer, embedded OAuth next to static bearer tokens, strict config keys, version 0.2.0. They stand. Build on them without rearguing them, and overturn one only when building on it shows it to be wrong, recording why. The reasoning below is what those decisions were meant to satisfy, and it is the bar to hold the existing core to.
+

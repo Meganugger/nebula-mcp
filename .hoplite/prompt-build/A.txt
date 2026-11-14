@@ -1,0 +1,22 @@
+# Continue and finish the Nebula MCP overhaul
+
+## The task
+
+This overhaul is already under way and was left partway: a new enforcement core is written, and nothing that runs on top of it has been ported. Pick it up where it stands and take the whole repository to the best version of itself, in this one task, end to end: every crate, every tool, the protocol layer, both transports, the tests, CI and the documents. Check what exists, rebuild what still needs rebuilding, and ship it with evidence that it works.
+
+The owner asked for it to be reworked and upgraded "as good as possible fully and correctly", and was explicit about not wanting a partial result followed by an offer of a better one. So there is no approval step between phases and no closing question about further improvements. Make the decisions yourself, write down the ones the owner might reasonably want to reverse, and keep going until the finish line described at the end. Stop early only for a blocker you cannot clear, and then say exactly what it is and what you tried. This is a large job; a thorough result is wanted over a fast one.
+
+Your usual preference for the smallest change that satisfies a request does not limit the scope here, because the overhaul is the request. It still governs each individual change: everything should trace to a defect, a promise the documentation makes, a requirement of the protocol, or a concrete benefit to someone running the server. Rebuild a component when its design is the defect and refactor when the design is sound. Change nothing for style alone and add no speculative features.
+
+## Three things the owner wants done differently
+
+The owner watched the earlier sessions and has asked for three changes in how the work is done. They carry the same weight as the technical content below.
+
+**Finish the whole project.** The earlier work stopped mid-port, and as it stands the branch cannot build a server at all. The finish line is the entire project rebuilt, working and verified, as set out under "What the result should be". A hardened core under an unported server is not a result, and neither is a security pass that leaves the protocol, the tools or the documents at 0.1. Do not end a turn to report progress, to ask whether to continue, or to ask which option the owner prefers. Decide, record the decision in the log when the owner might want to reverse it, and carry on. While a build or a CI run is in progress, work on the next piece.
+
+**Do the work yourself.** The earlier sessions handed nearly everything to subagents: the audits, the reading, much of the writing. The owner has asked more than once for that to stop, because it was slow and expensive. So do not start subagents in this task: not for reading or auditing code, not for research, not for porting tool categories, not for tests, documents or review. Read, design, write, run and check everything in this thread.
+
+There is a reason beyond cost. This is one tightly coupled system resting on one security core, and what makes it coherent (the threat model, the decisions in the log, what you learn from reading the code) lives in your context. A subagent starts without any of it, so whatever it returns has to be read and verified again before it can be trusted. The tool categories look like independent, parallel work, and an earlier version of this brief suggested fanning them out. Port them yourself, one after another, so that each benefits from what the last one taught you and the tools end up consistent with each other.
+
+**Deliver the best version outright.** If you can see a way to make the result better, and it meets the bar above (it traces to a defect, a documented promise, a protocol requirement or a concrete benefit to an operator), it is part of this task: build it before you report. The owner does not want to read "do you want a better version?", "I could also…" or "let me know if you'd like…", at the end or at any point on the way. A sentence like that means the work is not finished. The final report contains no questions and no offers. Whatever is not done appears once, as a fact, with the reason it could not be done in this task.
+

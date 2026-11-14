@@ -1,0 +1,2 @@
+So 0.1 is a legacy-only implementation, and its ROADMAP plans features the current revision deletes (resumable SSE, persistent protocol sessions). Aim for a dual-era server: the current revision implemented properly, plus the legacy revisions real clients still use, with real per-session isolation on the legacy HTTP path. Nothing on the branch implements any of this yet.
+
