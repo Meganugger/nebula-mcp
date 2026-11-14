@@ -33,6 +33,68 @@ pub struct Cli {
     /// Directory relative paths resolve against (default: current directory).
     #[arg(short, long, global = true, env = "NEBULA_MCP_WORKDIR")]
     workdir: Option<PathBuf>,
+
+    /// Serve MCP over HTTP instead of stdin/stdout (same as
+    /// [transport.http] enabled = true).
+    #[arg(long, global = true)]
+    http: bool,
+
+    /// Address for the HTTP transport, for example 127.0.0.1:8765.
+    #[arg(long, global = true, env = "NEBULA_MCP_HTTP_ADDR")]
+    http_addr: Option<String>,
+
+    /// A bearer token HTTP clients may authenticate with (repeatable, 16
+    /// characters or more). Prefer the environment variable to keep it out of
+    /// the process list.
+    #[arg(
+        long,
+        global = true,
+        env = "NEBULA_MCP_AUTH_TOKEN",
+        hide_env_values = true
+    )]
+    auth_token: Vec<String>,
+
+    /// Serve HTTP without authentication. Only accepted on a loopback address.
+    #[arg(long, global = true)]
+    no_auth: bool,
+
+    /// Also serve Prometheus metrics, without authentication, on this
+    /// loopback address.
+    #[arg(long, global = true, env = "NEBULA_MCP_METRICS_ADDR")]
+    metrics_addr: Option<std::net::SocketAddr>,
+}
+
+impl Cli {
+    /// Command-line settings layered over the configuration file on every
+    /// load, so they survive a hot reload.
+    fn overlay(&self) -> Option<Overlay> {
+        let (http, addr, tokens, no_auth) = (
+            self.http,
+            self.http_addr.clone(),
+            self.auth_token.clone(),
+            self.no_auth,
+        );
+        if !http && addr.is_none() && tokens.is_empty() && !no_auth {
+            return None;
+        }
+        Some(Arc::new(move |config: &mut Config| {
+            let t = &mut config.transport.http;
+            if http {
+                t.enabled = true;
+            }
+            if let Some(addr) = &addr {
+                t.bind = addr.clone();
+            }
+            for token in &tokens {
+                if !t.auth_tokens.contains(token) {
+                    t.auth_tokens.push(token.clone());
+                }
+            }
+            if no_auth {
+                t.require_auth = false;
+            }
+        }))
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -82,10 +144,11 @@ fn run(cli: Cli) -> Result<(), String> {
         None => std::env::current_dir().map_err(|e| format!("current directory: {e}"))?,
     };
     let config_path = resolve_config_path(cli.config.as_deref(), &workdir)?;
+    let overlay = cli.overlay();
     match cli.command.unwrap_or(Command::Run) {
         Command::Init { path, force } => init(&path, force, &workdir),
         Command::ValidateConfig => {
-            let (_, warnings) = load(config_path.as_deref(), workdir)?;
+            let (_, warnings) = load(config_path.as_deref(), overlay, workdir)?;
             for w in &warnings {
                 println!("warning: {w}");
             }
@@ -93,16 +156,16 @@ fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
         Command::PrintConfig => {
-            let (app, _) = load(config_path.as_deref(), workdir)?;
+            let (app, _) = load(config_path.as_deref(), overlay, workdir)?;
             let text = redacted(&app.store().snapshot().config)?;
             print!("{text}");
             Ok(())
         }
         Command::ListTools { all, json } => {
-            let (app, _) = load(config_path.as_deref(), workdir)?;
+            let (app, _) = load(config_path.as_deref(), overlay, workdir)?;
             list_tools(&app, all, json)
         }
-        Command::Run => serve(config_path.as_deref(), workdir),
+        Command::Run => serve(config_path.as_deref(), overlay, workdir, cli.metrics_addr),
     }
 }
 
@@ -122,13 +185,21 @@ fn resolve_config_path(explicit: Option<&Path>, workdir: &Path) -> Result<Option
     Ok(default.is_file().then_some(default))
 }
 
-fn load(config: Option<&Path>, workdir: PathBuf) -> Result<(Arc<App>, Vec<String>), String> {
-    let overlay: Option<Overlay> = None;
+fn load(
+    config: Option<&Path>,
+    overlay: Option<Overlay>,
+    workdir: PathBuf,
+) -> Result<(Arc<App>, Vec<String>), String> {
     App::load(config, overlay, workdir).map_err(|e| e.to_string())
 }
 
-fn serve(config: Option<&Path>, workdir: PathBuf) -> Result<(), String> {
-    let (app, warnings) = load(config, workdir)?;
+fn serve(
+    config: Option<&Path>,
+    overlay: Option<Overlay>,
+    workdir: PathBuf,
+    metrics_addr: Option<std::net::SocketAddr>,
+) -> Result<(), String> {
+    let (app, warnings) = load(config, overlay, workdir)?;
     let loaded = app.store().snapshot();
     let (_telemetry, _log_control) =
         telemetry::init(&loaded.config.logging).map_err(|e| e.to_string())?;
@@ -158,7 +229,26 @@ fn serve(config: Option<&Path>, workdir: PathBuf) -> Result<(), String> {
             },
             None => None,
         };
-        let mut transport = tokio::spawn(crate::stdio::serve(app.clone()));
+        let http = loaded.config.transport.http.clone();
+        let mut transport = if http.enabled {
+            match bind_http(&http).await {
+                Ok(listener) => tokio::spawn(crate::http::serve(app.clone(), listener)),
+                Err(e) => return Err(e),
+            }
+        } else {
+            tokio::spawn(crate::stdio::serve(app.clone()))
+        };
+        if let Some(addr) = metrics_addr {
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .map_err(|e| format!("binding the metrics listener on {addr}: {e}"))?;
+            let metrics_app = app.clone();
+            tokio::spawn(async move {
+                if let Err(e) = crate::http::serve_metrics(metrics_app, listener).await {
+                    tracing::error!("{e}");
+                }
+            });
+        }
         let result = tokio::select! {
             joined = &mut transport => joined.unwrap_or_else(|e| Err(format!("transport task: {e}"))),
             () = shutdown_signal() => {
@@ -176,6 +266,28 @@ fn serve(config: Option<&Path>, workdir: PathBuf) -> Result<(), String> {
     runtime.shutdown_timeout(RUNTIME_SHUTDOWN);
     tracing::info!("stopped");
     result
+}
+
+/// Bind the HTTP listener, refusing configurations that would expose the
+/// server without authentication.
+async fn bind_http(
+    http: &nebula_mcp_core::config::HttpConfig,
+) -> Result<tokio::net::TcpListener, String> {
+    let listener = tokio::net::TcpListener::bind(&http.bind)
+        .await
+        .map_err(|e| format!("binding the HTTP transport on {}: {e}", http.bind))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|e| format!("HTTP listener: {e}"))?;
+    crate::http::check_exposure(http, &addr)?;
+    // The address is logged in full so a port chosen by the system (":0")
+    // can be read from the log.
+    tracing::info!(
+        url = %format!("http://{addr}{}", http.path),
+        auth = http.require_auth,
+        "HTTP transport listening"
+    );
+    Ok(listener)
 }
 
 /// Resolves on SIGINT or SIGTERM (Ctrl-C or Ctrl-Break on Windows).
