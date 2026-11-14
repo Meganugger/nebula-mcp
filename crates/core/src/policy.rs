@@ -652,6 +652,21 @@ pub fn resolve_on_path(name: &str) -> Result<PathBuf, ToolError> {
     invocation_path(&found).map_err(|_| ToolError::ProgramNotFound(name.to_string()))
 }
 
+/// Find a program a typed tool declared, on the server's `PATH`. Refused
+/// when the file is somewhere tools can write, so an agent cannot plant its
+/// own `git` ahead of the real one.
+pub fn resolve_trusted_program(name: &str, paths: &PathRules) -> Result<PathBuf, ToolError> {
+    let resolved = resolve_on_path(name)?;
+    if writable_by_tools(paths, &resolved) {
+        return Err(ToolError::PermissionDenied(format!(
+            "'{name}' resolves to '{}', which is inside an allowed directory that tools can \
+             write to; refusing to run it",
+            resolved.display()
+        )));
+    }
+    Ok(resolved)
+}
+
 /// Which environment variables a child process receives.
 #[derive(Debug)]
 pub struct EnvPolicy {
