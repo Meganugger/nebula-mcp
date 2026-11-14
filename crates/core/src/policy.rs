@@ -128,9 +128,10 @@ const NEVER_PASSED_PREFIX: &str = "NEBULA_MCP_";
 pub struct Root {
     /// Canonical absolute path.
     path: PathBuf,
-    /// The path as configured, when it differs (for example `/tmp/x` on a
-    /// system where `/tmp` is a symlink).
-    alias: Option<PathBuf>,
+    /// Other spellings of the root that callers may use: the path as
+    /// configured when it differs (for example `/tmp/x` where `/tmp` is a
+    /// symlink), and on macOS the form without the `/private` prefix.
+    aliases: Vec<PathBuf>,
 }
 
 impl Root {
@@ -222,7 +223,7 @@ impl PathRules {
     #[must_use]
     pub fn unalias(&self, path: &Path) -> Option<PathBuf> {
         for r in &self.roots {
-            if let Some(alias) = &r.alias {
+            for alias in &r.aliases {
                 if path_starts_with(path, alias) {
                     let rest: PathBuf =
                         path.components().skip(alias.components().count()).collect();
@@ -328,11 +329,32 @@ fn compile_root(entry: &str, warnings: &mut Vec<String>) -> Result<Option<Root>,
         return Ok(None);
     }
     let lexical = lexical_normalize(&expanded);
-    let alias = (!paths_equal(&lexical, &canonical)).then_some(lexical);
+    let mut aliases = Vec::new();
+    if !paths_equal(&lexical, &canonical) {
+        aliases.push(lexical);
+    }
+    if let Some(short) = macos_public_form(&canonical) {
+        if !aliases.iter().any(|a| paths_equal(a, &short)) {
+            aliases.push(short);
+        }
+    }
     Ok(Some(Root {
         path: canonical,
-        alias,
+        aliases,
     }))
+}
+
+/// On macOS `/tmp`, `/var` and `/etc` are links into `/private`, and paths
+/// are usually written in the short form. Returns that form for a canonical
+/// path under `/private`.
+fn macos_public_form(canonical: &Path) -> Option<PathBuf> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let rest = canonical.strip_prefix("/private").ok()?;
+    let first = rest.components().next()?;
+    matches!(first.as_os_str().to_str(), Some("tmp" | "var" | "etc"))
+        .then(|| Path::new("/").join(rest))
 }
 
 /// Expand a leading `~` to the user's home directory.
@@ -949,6 +971,21 @@ impl PolicySet {
         let commands = Arc::new(CommandPolicy::compile(&s.allowed_commands, &mut warnings));
         let env = Arc::new(EnvPolicy::compile(s)?);
         let hosts: Vec<String> = s.allowed_hosts.clone();
+        if !crate::process::CONFINEMENT_AVAILABLE {
+            match s.sandbox.mode {
+                SandboxMode::Off => {}
+                SandboxMode::Auto => warnings.push(
+                    "[security.sandbox] mode = \"auto\": this build cannot confine processes on \
+                     this platform, so programs run with your full privileges."
+                        .to_string(),
+                ),
+                SandboxMode::Require => warnings.push(
+                    "[security.sandbox] mode = \"require\": this build cannot confine processes \
+                     on this platform, so every tool that starts a program will be refused."
+                        .to_string(),
+                ),
+            }
+        }
         let sandbox = Arc::new(SandboxPolicy {
             mode: s.sandbox.mode,
             read_paths: s

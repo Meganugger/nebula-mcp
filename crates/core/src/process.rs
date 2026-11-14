@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
+use crate::config::SandboxMode;
 use crate::context::ProgressSink;
 use crate::error::{Result, ToolError};
 use crate::fs::CheckedPath;
@@ -34,6 +35,11 @@ const TERMINATE_GRACE: Duration = Duration::from_secs(2);
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 /// Interval between progress heartbeats for a running command.
 const HEARTBEAT: Duration = Duration::from_secs(5);
+
+/// Whether this build can confine child processes with an operating-system
+/// mechanism on the current platform. While it cannot, `sandbox.mode =
+/// "require"` refuses to start anything rather than run it unconfined.
+pub const CONFINEMENT_AVAILABLE: bool = false;
 
 /// What programs a tool may run. Declared in the tool's metadata and
 /// enforced here.
@@ -408,6 +414,14 @@ impl Spawner {
     }
 
     fn build(&self, command: &Command) -> Result<(tokio::process::Command, PathBuf)> {
+        if self.policy.sandbox().mode == SandboxMode::Require && !CONFINEMENT_AVAILABLE {
+            return Err(ToolError::PermissionDenied(
+                "[security.sandbox] mode = \"require\" is set, and this build cannot confine \
+                 processes on this platform, so no program is started. The operator can set \
+                 mode = \"off\" to run programs unconfined."
+                    .to_string(),
+            ));
+        }
         let executable = self.resolve(command)?;
         let mut cmd = tokio::process::Command::new(&executable);
         cmd.args(&command.args)
@@ -513,11 +527,20 @@ impl Spawner {
             TimedOut,
         }
         let mut status: Option<std::process::ExitStatus> = None;
+        // Set when the leader has exited but something outside its group
+        // still holds a pipe open; the output read so far is returned.
+        let mut pipes_abandoned = false;
         let end = loop {
             tokio::select! {
                 biased;
                 () = self.cancel.cancelled() => break End::Cancelled,
-                () = &mut deadline => break End::TimedOut,
+                () = &mut deadline => {
+                    if status.is_some() {
+                        pipes_abandoned = true;
+                        break End::Exited;
+                    }
+                    break End::TimedOut;
+                },
                 () = &mut write_stdin, if !stdin_done => stdin_done = true,
                 n = read_some(&mut out, &mut scratch_out), if out_open => match n {
                     Some(n) => out_buf.push(&scratch_out[..n]),
@@ -530,9 +553,12 @@ impl Spawner {
                 waited = tree.wait_leader(), if status.is_none() => match waited {
                     Ok(s) => {
                         status = Some(s);
-                        // Whatever the command left running goes with it,
-                        // which also closes the pipes we are still reading.
-                        tree.kill_all();
+                        // The group died with its leader, which closes the
+                        // pipes. A process that left the group can keep one
+                        // open, so the wait for them is bounded.
+                        deadline
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + DRAIN_GRACE);
                     }
                     Err(e) => {
                         tree.kill_all();
@@ -558,21 +584,23 @@ impl Spawner {
         }
         // Collect what is already in the pipes, but never wait on a pipe
         // held open by something that escaped the group.
-        let drain = async {
-            while out_open || err_open {
-                tokio::select! {
-                    n = read_some(&mut out, &mut scratch_out), if out_open => match n {
-                        Some(n) => out_buf.push(&scratch_out[..n]),
-                        None => out_open = false,
-                    },
-                    n = read_some(&mut err, &mut scratch_err), if err_open => match n {
-                        Some(n) => err_buf.push(&scratch_err[..n]),
-                        None => err_open = false,
-                    },
+        if !pipes_abandoned {
+            let drain = async {
+                while out_open || err_open {
+                    tokio::select! {
+                        n = read_some(&mut out, &mut scratch_out), if out_open => match n {
+                            Some(n) => out_buf.push(&scratch_out[..n]),
+                            None => out_open = false,
+                        },
+                        n = read_some(&mut err, &mut scratch_err), if err_open => match n {
+                            Some(n) => err_buf.push(&scratch_err[..n]),
+                            None => err_open = false,
+                        },
+                    }
                 }
-            }
-        };
-        let _ = tokio::time::timeout(DRAIN_GRACE, drain).await;
+            };
+            let _ = tokio::time::timeout(DRAIN_GRACE, drain).await;
+        }
         tree.finish();
 
         let output = Output {
@@ -741,16 +769,27 @@ mod imp {
 
         pub(super) async fn wait_leader(&mut self) -> std::io::Result<ExitStatus> {
             let status = self.child.wait().await?;
-            self.exited = true;
+            self.leader_exited();
             Ok(status)
         }
 
         pub(super) fn try_wait_leader(&mut self) -> std::io::Result<Option<ExitStatus>> {
             let status = self.child.try_wait()?;
             if status.is_some() {
-                self.exited = true;
+                self.leader_exited();
             }
             Ok(status)
+        }
+
+        /// Whatever the leader left running goes with it. The group id is
+        /// then forgotten: once the leader is reaped the id can be reused by
+        /// an unrelated process, and a later signal would hit that instead.
+        fn leader_exited(&mut self) {
+            if !self.exited {
+                self.exited = true;
+                self.signal(libc::SIGKILL);
+                self.pgid = None;
+            }
         }
 
         fn signal(&self, signal: libc::c_int) {
@@ -836,16 +875,24 @@ mod imp {
         /// wait for everything the leader started.
         pub(super) async fn wait_leader(&mut self) -> std::io::Result<ExitStatus> {
             let status = self.child.inner_mut().wait().await?;
-            self.exited = true;
+            self.leader_exited();
             Ok(status)
         }
 
         pub(super) fn try_wait_leader(&mut self) -> std::io::Result<Option<ExitStatus>> {
             let status = self.child.inner_mut().try_wait()?;
             if status.is_some() {
-                self.exited = true;
+                self.leader_exited();
             }
             Ok(status)
+        }
+
+        /// Whatever the leader left running in the job goes with it.
+        fn leader_exited(&mut self) {
+            if !self.exited {
+                self.exited = true;
+                self.kill_all();
+            }
         }
 
         /// Terminate every process in the job.
@@ -1067,6 +1114,57 @@ mod tests {
             .parse()
             .unwrap();
         assert!(gone(pid).await, "background child {pid} was left running");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_process_that_left_the_group_cannot_hold_the_call_open() {
+        if which::which("perl").is_err() {
+            return;
+        }
+        let (s, t) = spawner(&["sh"], "", CALLER);
+        let pidfile = t.path().join("pid");
+        // The background process starts its own session, so the group kill
+        // does not reach it, and it keeps the output pipes open.
+        let script = format!(
+            "perl -MPOSIX -e 'POSIX::setsid(); open(F, q(>), q({p})); print F $$; close F; \
+             sleep 60' & while [ ! -s '{p}' ]; do sleep 0.05; done; echo done",
+            p = pidfile.display()
+        );
+        let started = Instant::now();
+        let out = s
+            .run(
+                Command::caller("sh")
+                    .args(["-c", &script])
+                    .timeout(Duration::from_secs(40)),
+            )
+            .await;
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: plain syscall on the one process this test started.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        let out = out.unwrap();
+        assert!(out.success());
+        assert_eq!(out.stdout.text.trim(), "done");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the call waited for a pipe held outside its process group"
+        );
+    }
+
+    #[tokio::test]
+    async fn required_confinement_that_is_unavailable_refuses_to_spawn() {
+        if CONFINEMENT_AVAILABLE {
+            return;
+        }
+        let (s, _t) = spawner(&["sh"], "[security.sandbox]\nmode = \"require\"", CALLER);
+        let r = s.run(Command::caller("sh").args(["-c", "echo hi"])).await;
+        assert!(matches!(r, Err(ToolError::PermissionDenied(_))), "{r:?}");
     }
 
     #[cfg(unix)]

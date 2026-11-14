@@ -92,6 +92,10 @@ impl Dispatcher {
         shutdown: CancellationToken,
     ) -> Self {
         let slots = store.snapshot().config.server.max_concurrent_calls.max(1);
+        // Relative paths are joined to this directory and then compared with
+        // the canonical roots, so it has to be canonical itself.
+        let working_dir = std::fs::canonicalize(&working_dir)
+            .map_or(working_dir, |c| crate::policy::simplify(&c));
         Self {
             registry,
             store,
@@ -217,10 +221,11 @@ impl Dispatcher {
         call: Call,
     ) -> Result<ToolOutput, ToolError> {
         let spec = tool.spec();
-        let arguments = match call.arguments {
+        let mut arguments = match call.arguments {
             Value::Null => Value::Object(serde_json::Map::new()),
             other => other,
         };
+        drop_optional_nulls(&spec.input, &mut arguments);
         crate::schema::validate(&spec.input, &arguments).map_err(ToolError::InvalidArguments)?;
 
         if spec.effects.network {
@@ -310,16 +315,23 @@ impl Dispatcher {
                 config.server.max_concurrent_calls
             )));
         }
-        let waited = tokio::select! {
+        // Released on every exit, including when this future is dropped
+        // while it waits.
+        struct Waiting<'a>(&'a AtomicUsize);
+        impl Drop for Waiting<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let _waiting = Waiting(&self.waiting);
+        tokio::select! {
             biased;
             () = cancel.cancelled() => Err(ToolError::Cancelled),
             () = self.shutdown.cancelled() => Err(ToolError::Cancelled),
             permit = self.permits.clone().acquire_owned() => {
                 permit.map_err(|_| ToolError::Cancelled)
             }
-        };
-        self.waiting.fetch_sub(1, Ordering::SeqCst);
-        waited
+        }
     }
 
     /// Render an error for the model: the stable category, the message, and
@@ -359,6 +371,34 @@ impl Dispatcher {
         }
         text
     }
+}
+
+/// Remove top-level arguments sent as `null` for optional properties whose
+/// schema does not accept `null`. Many clients serialise an omitted optional
+/// argument that way, and the typed accessors already read `null` as absent.
+fn drop_optional_nulls(schema: &Value, arguments: &mut Value) {
+    let Some(args) = arguments.as_object_mut() else {
+        return;
+    };
+    let required: Vec<&str> = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|names| names.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let accepts_null = |name: &str| {
+        let Some(prop) = schema.get("properties").and_then(|p| p.get(name)) else {
+            // Undeclared: leave it for the validator to report.
+            return true;
+        };
+        match prop.get("type") {
+            Some(Value::String(t)) => t == "null",
+            Some(Value::Array(types)) => types.iter().any(|t| t == "null"),
+            _ => true,
+        }
+    };
+    args.retain(|name, value| {
+        !value.is_null() || required.contains(&name.as_str()) || accepts_null(name)
+    });
 }
 
 #[cfg(test)]
@@ -476,6 +516,9 @@ mod tests {
         let ok = d.call(call("fs_echo", json!({"n": 1}))).await.unwrap();
         assert_eq!(ok.unwrap().structured, Some(json!({"n": 1})));
         assert!(d.call(call("fs_echo", Value::Null)).await.unwrap().is_ok());
+        // An optional argument sent as null is read as absent.
+        let ok = d.call(call("fs_echo", json!({"n": null}))).await.unwrap();
+        assert_eq!(ok.unwrap().structured, Some(json!({})));
 
         for bad in [json!({"n": "one"}), json!({"m": 1}), json!([1])] {
             let failure = d.call(call("fs_echo", bad)).await.unwrap().unwrap_err();

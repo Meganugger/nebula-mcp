@@ -28,7 +28,9 @@ use cap_std::fs::{Dir, OpenOptions};
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{Result, ToolError};
-use crate::policy::{lexical_normalize, path_starts_with, simplify, Access, PathRules};
+use crate::policy::{
+    lexical_normalize, path_starts_with, paths_equal, simplify, Access, PathRules,
+};
 
 /// A path that passed the policy. Only [`Fs`] can create one.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -768,6 +770,13 @@ impl Fs {
     /// Copy a file.
     pub fn copy_file(&self, from: &CheckedPath, to: &CheckedPath, replace: bool) -> Result<u64> {
         self.need_write(to)?;
+        // Opening the destination truncates it, which would empty the source.
+        if paths_equal(&from.abs(), &to.abs()) {
+            return Err(ToolError::invalid(format!(
+                "cannot copy '{}' onto itself",
+                from.display()
+            )));
+        }
         let mut src = self.open(from)?;
         let mode = if replace {
             WriteMode::Replace
@@ -1046,7 +1055,7 @@ mod tests {
         std::fs::create_dir_all(&outside).unwrap();
         let mut cfg = Config::default();
         cfg.security.allowed_paths = vec![slash_string(&root)];
-        cfg.security.denied_paths = vec!["**/private/**".into()];
+        cfg.security.denied_paths = vec!["**/vault/**".into()];
         let policy = PolicySet::compile(&cfg, &[]).unwrap().for_tool("t");
         let make = |writable| {
             Fs::new(
@@ -1125,11 +1134,11 @@ mod tests {
     #[test]
     fn deny_patterns_apply_to_the_requested_and_resolved_path() {
         let f = fixture();
-        std::fs::create_dir_all(f.root.join("private")).unwrap();
-        std::fs::write(f.root.join("private/k.txt"), "k").unwrap();
+        std::fs::create_dir_all(f.root.join("vault")).unwrap();
+        std::fs::write(f.root.join("vault/k.txt"), "k").unwrap();
         std::fs::write(f.root.join(".env"), "S=1").unwrap();
         assert!(matches!(
-            f.fs.resolve("private/k.txt", Access::Read),
+            f.fs.resolve("vault/k.txt", Access::Read),
             Err(ToolError::PermissionDenied(_))
         ));
         assert!(f.fs.resolve(".env", Access::Read).is_err());
@@ -1197,9 +1206,9 @@ mod tests {
     #[test]
     fn listing_and_walking_hide_denied_entries() {
         let f = fixture();
-        std::fs::create_dir_all(f.root.join("src/private")).unwrap();
+        std::fs::create_dir_all(f.root.join("src/vault")).unwrap();
         std::fs::write(f.root.join("src/a.rs"), "").unwrap();
-        std::fs::write(f.root.join("src/private/key"), "").unwrap();
+        std::fs::write(f.root.join("src/vault/key"), "").unwrap();
         std::fs::write(f.root.join("src/.env"), "").unwrap();
         let root = f.fs.resolve(".", Access::Read).unwrap();
         let mut names = Vec::new();
@@ -1281,6 +1290,36 @@ mod tests {
             f.fs.copy_tree(&a, &nested),
             Err(ToolError::InvalidArguments(_))
         ));
+    }
+
+    #[test]
+    fn copying_a_file_onto_itself_keeps_its_content() {
+        let f = fixture();
+        std::fs::write(f.root.join("keep.txt"), "data").unwrap();
+        let from = f.fs.resolve("keep.txt", Access::Read).unwrap();
+        let to = f.fs.resolve("./keep.txt", Access::Write).unwrap();
+        assert!(matches!(
+            f.fs.copy_file(&from, &to, true),
+            Err(ToolError::InvalidArguments(_))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(f.root.join("keep.txt")).unwrap(),
+            "data"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_short_form_of_a_private_path_is_accepted() {
+        // Temp directories live under /private/var; callers write /var.
+        let f = fixture();
+        std::fs::write(f.root.join("s.txt"), "s").unwrap();
+        let rest = f
+            .root
+            .strip_prefix("/private")
+            .expect("temp dir under /private");
+        let short = Path::new("/").join(rest).join("s.txt");
+        assert_eq!(text(&f.fs, &short.to_string_lossy()).unwrap(), "s");
     }
 
     #[test]
