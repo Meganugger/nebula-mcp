@@ -56,6 +56,8 @@ notify = "6.1"
 notify-debouncer-mini = "0.4"
 which = "6.0"
 sysinfo = { version = "0.40", default-features = false, features = ["system"] }
+x509-parser = "0.18"
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 cap-std = "4.0"
 cap-fs-ext = "4.0"
 time = { version = "0.3", features = ["formatting", "macros"] }
