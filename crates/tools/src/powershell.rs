@@ -1,208 +1,193 @@
-//! PowerShell tools: non-interactive command/script execution, elevated
-//! execution, and remoting. Windows-only; on other hosts every tool returns a
-//! structured [`nebula_mcp_core::ToolError::PlatformUnsupported`].
+//! PowerShell tools, and the helpers the Windows tools use to run fixed
+//! scripts.
+//!
+//! `powershell_run` runs a script the caller wrote. Like the terminal tools
+//! this is arbitrary execution with the server user's privileges; enabling
+//! the category is the grant. When the server itself runs elevated the
+//! script would too, so the elevated gate then applies.
+//!
+//! The typed Windows tools never put caller text into a script. Their
+//! scripts are constants, and every value travels in an environment variable
+//! that the script reads as data.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use async_trait::async_trait;
-use nebula_mcp_core::{Result, Tool, ToolContext};
-use nebula_mcp_protocol::mcp::ToolAnnotations;
-use nebula_mcp_protocol::CallToolResult;
+use base64::Engine;
+use nebula_mcp_core::args::Args;
+use nebula_mcp_core::process::{Command, Exec};
+use nebula_mcp_core::schema::ObjectSchema;
+use nebula_mcp_core::{
+    Category, Effects, Gate, Platforms, Result, Tool, ToolContext, ToolError, ToolOutput,
+};
 use serde_json::Value;
 
-use crate::common::exec::{run_checked, CommandSpec};
-use crate::common::output::exec_result;
-use crate::common::platform::{ensure_windows, run_powershell, POWERSHELL};
-use crate::common::{Args, ObjectSchema};
+use crate::common::{handler, spec, tool, SpecExt};
+use crate::terminal::render_run;
 
-const CATEGORY: &str = "powershell";
+/// Windows PowerShell 5.1, part of every Windows installation.
+pub(crate) const WINDOWS_POWERSHELL: &str = "powershell";
+/// PowerShell 7, on every platform.
+pub(crate) const PWSH: &str = "pwsh";
+/// Both shells, for tool metadata.
+pub(crate) const SHELLS: Exec = Exec::Programs(&[WINDOWS_POWERSHELL, PWSH]);
 
-/// Build PowerShell tools.
-pub fn tools() -> Vec<Arc<dyn Tool>> {
-    vec![Arc::new(PsRun), Arc::new(PsElevated), Arc::new(PsRemote)]
-}
+/// Runs before every script: no progress records in the output, and UTF-8.
+const PRELUDE: &str = "$ProgressPreference='SilentlyContinue';\
+                       [Console]::OutputEncoding=[Text.Encoding]::UTF8;";
 
-fn open_world() -> Option<ToolAnnotations> {
-    Some(ToolAnnotations {
-        open_world_hint: Some(true),
-        ..Default::default()
-    })
-}
+/// For the server's own scripts: an error ends the script with a failure
+/// instead of being printed and passed over.
+pub(crate) const STOP_ON_ERROR: &str = "$ErrorActionPreference='Stop';";
 
-/// Non-interactive PowerShell command execution.
-struct PsRun;
+const IS_ELEVATED: &str = "if ($IsLinux -or $IsMacOS) { (id -u) -eq 0 } else { \
+     ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent())\
+     .IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) }";
 
-#[async_trait]
-impl Tool for PsRun {
-    fn name(&self) -> &str {
-        "powershell.run"
-    }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "Run a PowerShell command non-interactively (-NoProfile -NonInteractive). \
-         Have the script emit JSON (e.g. '... | ConvertTo-Json') for structured output. Windows only."
-    }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new()
-            .string("script", "PowerShell command/script to run.", true)
-            .enumerated("shell", "Shell to use.", &["powershell", "pwsh"], false)
-            .integer("timeoutSecs", "Timeout override.", false)
-            .build()
-    }
-    fn annotations(&self) -> Option<ToolAnnotations> {
-        open_world()
-    }
-    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
-        ensure_windows(self.name())?;
-        let a = Args::new(&args)?;
-        let script = a.str("script")?;
-        let shell = a.str_or("shell", POWERSHELL)?;
-        let result = run_powershell(ctx, shell, script, a.opt_u64("timeoutSecs")?).await?;
-        Ok(exec_result("powershell", &result))
+/// The shell a typed tool uses on this platform.
+pub(crate) fn platform_shell() -> &'static str {
+    if cfg!(windows) {
+        WINDOWS_POWERSHELL
+    } else {
+        PWSH
     }
 }
 
-/// Elevated PowerShell execution via a self-elevating Start-Process.
-struct PsElevated;
-
-#[async_trait]
-impl Tool for PsElevated {
-    fn name(&self) -> &str {
-        "powershell.elevated"
-    }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "Run a PowerShell command elevated (UAC). Output is redirected to a file and returned. \
-         Requires allow_elevated. Windows only."
-    }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new()
-            .string("script", "PowerShell command to run elevated.", true)
-            .integer("timeoutSecs", "Timeout override.", false)
-            .build()
-    }
-    fn annotations(&self) -> Option<ToolAnnotations> {
-        open_world()
-    }
-    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
-        ensure_windows(self.name())?;
-        let a = Args::new(&args)?;
-        ctx.policy.ensure_elevation_allowed()?;
-        let script = a.str("script")?;
-        // Launch an elevated child that writes combined output to a temp file,
-        // then read it back. Escaping single quotes for the inner script.
-        let escaped = script.replace('\'', "''");
-        let wrapper = format!(
-            "$tmp = [System.IO.Path]::GetTempFileName(); \
-             $p = Start-Process -FilePath powershell -Verb RunAs -Wait -PassThru \
-                 -ArgumentList '-NoProfile','-Command',\"& {{ {escaped} }} *> $tmp\"; \
-             Get-Content -Raw $tmp; Remove-Item $tmp -ErrorAction SilentlyContinue; \
-             exit $p.ExitCode"
-        );
-        let result = run_powershell(ctx, POWERSHELL, &wrapper, a.opt_u64("timeoutSecs")?).await?;
-        Ok(exec_result("powershell (elevated)", &result))
-    }
+/// A command that runs `script` in `shell`. The script is passed encoded, so
+/// no quoting rule of the command line applies to it.
+pub(crate) fn script(shell: &'static str, script: &str) -> Command {
+    let text = format!("{PRELUDE}{script}");
+    let utf16: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    Command::typed(shell)
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-EncodedCommand",
+        ])
+        .arg(base64::engine::general_purpose::STANDARD.encode(utf16))
 }
 
-/// PowerShell remoting via Invoke-Command.
-struct PsRemote;
+/// Whether the server, and so every script it starts, runs with
+/// administrator (or root) rights. Asked once.
+pub(crate) async fn elevated(ctx: &ToolContext, shell: &'static str) -> Result<bool> {
+    static ELEVATED: OnceLock<bool> = OnceLock::new();
+    if let Some(known) = ELEVATED.get() {
+        return Ok(*known);
+    }
+    let out = ctx
+        .run(script(shell, IS_ELEVATED).timeout(ctx.timeout(None)))
+        .await?
+        .check("checking for administrator rights")?;
+    let answer = out.stdout.text.trim().eq_ignore_ascii_case("true");
+    Ok(*ELEVATED.get_or_init(|| answer))
+}
 
-#[async_trait]
-impl Tool for PsRemote {
-    fn name(&self) -> &str {
-        "powershell.remote"
-    }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "Run a PowerShell command on a remote computer via Invoke-Command (WinRM must be configured). Windows only."
-    }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new()
-            .string("computer", "Remote computer name.", true)
-            .string("script", "Command to run remotely.", true)
-            .string(
-                "credentialUser",
-                "Optional user name for the remote session.",
-                false,
-            )
-            .integer("timeoutSecs", "Timeout override.", false)
-            .build()
-    }
-    fn annotations(&self) -> Option<ToolAnnotations> {
-        open_world()
-    }
-    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
-        ensure_windows(self.name())?;
-        let a = Args::new(&args)?;
-        let computer = a.str("computer")?;
-        let script = a.str("script")?.replace('\'', "''");
-        let cred = a.opt_str("credentialUser")?;
-        let cred_clause = match cred {
-            Some(u) => format!(
-                "-Credential (Get-Credential -UserName '{}' -Message 'nebula-mcp remote')",
-                u.replace('\'', "''")
+/// The `powershell` tools.
+pub(crate) fn tools() -> Vec<Arc<dyn Tool>> {
+    let c = Category::Powershell;
+    let run_effects = Effects::writes()
+        .overwrites()
+        .open_world()
+        .elevated(Gate::Sometimes)
+        .exec(SHELLS);
+    vec![
+        tool(
+            spec(
+                "powershell_run",
+                c,
+                "Run PowerShell",
+                "Run a PowerShell script and return its output and exit code. The script runs \
+                 with the server user's privileges and is not confined by the file or network \
+                 policy. `shell` picks Windows PowerShell 5.1 (`powershell`, Windows only) or \
+                 PowerShell 7 (`pwsh`).",
+                ObjectSchema::new()
+                    .string("script", "The script text.", true)
+                    .string_enum(
+                        "shell",
+                        "Which PowerShell (default: powershell on Windows, pwsh elsewhere).",
+                        &[WINDOWS_POWERSHELL, PWSH],
+                        false,
+                    )
+                    .integer_min(
+                        "timeoutSecs",
+                        "Seconds before the script and everything it started are stopped.",
+                        1,
+                        false,
+                    )
+                    .build(),
+                run_effects,
             ),
-            None => String::new(),
-        };
-        let wrapper = format!(
-            "Invoke-Command -ComputerName '{}' {} -ScriptBlock {{ {} }} | ConvertTo-Json -Depth 6",
-            computer.replace('\'', "''"),
-            cred_clause,
-            script
-        );
-        let spec = CommandSpec::new(POWERSHELL, ctx.working_dir.clone(), ctx).args(vec![
-            "-NoProfile".to_string(),
-            "-NonInteractive".to_string(),
-            "-Command".to_string(),
-            wrapper,
-        ]);
-        let result = run_checked(ctx, spec, a.opt_u64("timeoutSecs")?).await?;
-        Ok(exec_result("powershell (remote)", &result))
+            handler!(run),
+        ),
+        tool(
+            spec(
+                "powershell_remote",
+                c,
+                "Run PowerShell remotely",
+                "Run a script on another Windows computer over PowerShell remoting (WinRM), as \
+                 the server's user. The computer is checked against the network policy. The \
+                 project's CI does not exercise this tool.",
+                ObjectSchema::new()
+                    .string(
+                        "computer",
+                        "Host name or address of the remote computer.",
+                        true,
+                    )
+                    .string("script", "The script text to run there.", true)
+                    .integer_min(
+                        "timeoutSecs",
+                        "Seconds before the call is abandoned.",
+                        1,
+                        false,
+                    )
+                    .build(),
+                run_effects.network(),
+            )
+            .on(Platforms::WINDOWS),
+            handler!(remote),
+        ),
+    ]
+}
+
+async fn run(ctx: &ToolContext, args: Value) -> Result<ToolOutput> {
+    let a = Args::new(&args)?;
+    let shell = match a.opt_enum("shell", &[WINDOWS_POWERSHELL, PWSH])? {
+        Some(PWSH) => PWSH,
+        Some(_) if cfg!(windows) => WINDOWS_POWERSHELL,
+        Some(_) => {
+            return Err(ToolError::PlatformUnsupported(
+                "Windows PowerShell exists only on Windows; use shell \"pwsh\"".to_string(),
+            ))
+        }
+        None => platform_shell(),
+    };
+    if elevated(ctx, shell).await? {
+        ctx.require_elevated("running a script while the server has administrator rights")?;
     }
+    let cmd = script(shell, a.str("script")?)
+        .timeout(ctx.timeout(a.opt_u64("timeoutSecs")?))
+        .timeout_is_result();
+    Ok(render_run("powershell_run", &ctx.run(cmd).await?))
+}
+
+async fn remote(ctx: &ToolContext, args: Value) -> Result<ToolOutput> {
+    const REMOTE: &str = "Invoke-Command -ComputerName $env:NB_COMPUTER \
+                          -ScriptBlock ([scriptblock]::Create($env:NB_SCRIPT))";
+    let a = Args::new(&args)?;
+    let computer = a.str("computer")?;
+    // WinRM over HTTP; 5986 is the TLS port of the same service.
+    ctx.net()?.vet(computer, 5985).await?;
+    if elevated(ctx, WINDOWS_POWERSHELL).await? {
+        ctx.require_elevated("running a script while the server has administrator rights")?;
+    }
+    let cmd = script(WINDOWS_POWERSHELL, REMOTE)
+        .env("NB_COMPUTER", computer)
+        .env("NB_SCRIPT", a.str("script")?)
+        .timeout(ctx.timeout(a.opt_u64("timeoutSecs")?))
+        .timeout_is_result();
+    Ok(render_run("powershell_remote", &ctx.run(cmd).await?))
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use nebula_mcp_core::config::SecurityConfig;
-    use nebula_mcp_core::security::EffectivePolicy;
-    use nebula_mcp_core::{Metrics, ToolError};
-    use serde_json::json;
-    use tokio_util::sync::CancellationToken;
-
-    fn ctx() -> ToolContext {
-        let base = SecurityConfig {
-            allowed_commands: vec!["powershell".into(), "pwsh".into()],
-            allow_elevated: true,
-            ..Default::default()
-        };
-        let policy = EffectivePolicy::build("powershell.run", &base, None).unwrap();
-        ToolContext {
-            policy: Arc::new(policy),
-            working_dir: std::env::temp_dir(),
-            cancel: CancellationToken::new(),
-            metrics: Metrics::new(),
-            config: Arc::new(Default::default()),
-            request_id: "r".into(),
-            progress: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn returns_platform_unsupported_off_windows() {
-        if cfg!(windows) {
-            return;
-        }
-        let err = PsRun
-            .call(&ctx(), json!({"script": "Get-Process"}))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, ToolError::PlatformUnsupported(_)));
-    }
-}
+#[path = "powershell_tests.rs"]
+mod tests;

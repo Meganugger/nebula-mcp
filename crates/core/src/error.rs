@@ -1,19 +1,19 @@
 //! Error taxonomy shared by the core runtime and every tool.
 //!
-//! Tools return [`ToolError`]. The server maps these onto JSON-RPC error codes
-//! or, more commonly, onto MCP `CallToolResult` objects with `isError = true`
-//! so the model can read and react to the failure text.
+//! Tools return [`ToolError`]. The server turns it into an `isError` tool
+//! result whose text starts with the stable category, so the model can read
+//! the failure and correct its next call.
 
-use nebula_mcp_protocol::error_codes;
+use std::time::Duration;
 
 /// The result type used throughout the runtime.
 pub type Result<T> = std::result::Result<T, ToolError>;
 
 /// A structured, categorised tool error.
 ///
-/// Each variant carries a stable category so telemetry and clients can reason
-/// about failures without string matching, plus a human-readable message.
-#[derive(Debug, thiserror::Error)]
+/// Messages are written for the model that will read them: say what was
+/// wrong and, where it helps, what a valid call looks like.
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ToolError {
     /// The caller supplied invalid or missing arguments.
     #[error("invalid arguments: {0}")]
@@ -24,9 +24,9 @@ pub enum ToolError {
     PermissionDenied(String),
 
     /// The requested path is outside every allowed root.
-    #[error("path '{path}' is not within an allowed root")]
+    #[error("path '{path}' is not inside an allowed root")]
     PathNotAllowed {
-        /// The offending path.
+        /// The offending path as the caller wrote it.
         path: String,
     },
 
@@ -34,62 +34,49 @@ pub enum ToolError {
     #[error("command '{0}' is not permitted by policy")]
     CommandNotAllowed(String),
 
-    /// The operation exceeded its configured timeout.
-    #[error("operation timed out after {0:?}")]
-    Timeout(std::time::Duration),
+    /// A network destination is not permitted by policy.
+    #[error("network destination not permitted: {0}")]
+    NetworkNotAllowed(String),
 
-    /// The operation was cancelled by the client or a shutdown signal.
+    /// The operation exceeded its timeout.
+    #[error("operation timed out after {0:?}")]
+    Timeout(Duration),
+
+    /// The operation was cancelled by the client or by shutdown.
     #[error("operation cancelled")]
     Cancelled,
 
-    /// Output exceeded the configured maximum size.
-    #[error("output exceeded the maximum of {limit} bytes")]
-    OutputTooLarge {
-        /// Configured byte limit.
-        limit: usize,
-    },
+    /// A configured limit (sessions, jobs, queue, size) was reached.
+    #[error("limit exceeded: {0}")]
+    LimitExceeded(String),
 
-    /// A required external tool (git, cargo, docker, ...) was not found.
-    #[error("required external tool not found: {0}")]
-    ToolNotFound(String),
+    /// A file, directory, session, job or other named thing does not exist.
+    #[error("not found: {0}")]
+    NotFound(String),
 
-    /// The feature requires a platform this build is not running on.
-    #[error("operation is not supported on this platform: {0}")]
+    /// A required external program (git, docker, node, ...) is not installed.
+    #[error("required program not found: {0}")]
+    ProgramNotFound(String),
+
+    /// The feature needs a platform this build is not running on.
+    #[error("not supported on this platform: {0}")]
     PlatformUnsupported(String),
 
     /// An underlying I/O error.
     #[error("I/O error: {0}")]
     Io(String),
 
-    /// The tool ran but reported a failure (e.g. non-zero exit, test failure).
+    /// The operation ran and reported failure (non-zero exit, HTTP error).
     #[error("execution failed: {0}")]
     Execution(String),
 
-    /// A dependency or subsystem returned an unexpected internal error.
+    /// An unexpected internal error. Always a bug in the server.
     #[error("internal error: {0}")]
     Internal(String),
 }
 
 impl ToolError {
-    /// Map the error onto the most appropriate JSON-RPC error code.
-    #[must_use]
-    pub fn json_rpc_code(&self) -> i64 {
-        match self {
-            ToolError::InvalidArguments(_) => error_codes::INVALID_PARAMS,
-            ToolError::PermissionDenied(_)
-            | ToolError::PathNotAllowed { .. }
-            | ToolError::CommandNotAllowed(_) => error_codes::PERMISSION_DENIED,
-            ToolError::Timeout(_) | ToolError::Cancelled => error_codes::REQUEST_CANCELLED,
-            ToolError::OutputTooLarge { .. }
-            | ToolError::ToolNotFound(_)
-            | ToolError::PlatformUnsupported(_)
-            | ToolError::Io(_)
-            | ToolError::Execution(_) => error_codes::TOOL_EXECUTION_ERROR,
-            ToolError::Internal(_) => error_codes::INTERNAL_ERROR,
-        }
-    }
-
-    /// A short, stable category label for metrics/telemetry.
+    /// A short, stable category label used in results, logs and metrics.
     #[must_use]
     pub fn category(&self) -> &'static str {
         match self {
@@ -97,14 +84,49 @@ impl ToolError {
             ToolError::PermissionDenied(_) => "permission_denied",
             ToolError::PathNotAllowed { .. } => "path_not_allowed",
             ToolError::CommandNotAllowed(_) => "command_not_allowed",
+            ToolError::NetworkNotAllowed(_) => "network_not_allowed",
             ToolError::Timeout(_) => "timeout",
             ToolError::Cancelled => "cancelled",
-            ToolError::OutputTooLarge { .. } => "output_too_large",
-            ToolError::ToolNotFound(_) => "tool_not_found",
+            ToolError::LimitExceeded(_) => "limit_exceeded",
+            ToolError::NotFound(_) => "not_found",
+            ToolError::ProgramNotFound(_) => "program_not_found",
             ToolError::PlatformUnsupported(_) => "platform_unsupported",
             ToolError::Io(_) => "io",
             ToolError::Execution(_) => "execution",
             ToolError::Internal(_) => "internal",
+        }
+    }
+
+    /// Whether the error is a policy refusal (as opposed to a failure).
+    #[must_use]
+    pub fn is_denial(&self) -> bool {
+        matches!(
+            self,
+            ToolError::PermissionDenied(_)
+                | ToolError::PathNotAllowed { .. }
+                | ToolError::CommandNotAllowed(_)
+                | ToolError::NetworkNotAllowed(_)
+        )
+    }
+
+    /// Shorthand for an [`ToolError::InvalidArguments`] error.
+    pub fn invalid(msg: impl Into<String>) -> Self {
+        ToolError::InvalidArguments(msg.into())
+    }
+
+    /// Shorthand for a [`ToolError::PermissionDenied`] error.
+    pub fn denied(msg: impl Into<String>) -> Self {
+        ToolError::PermissionDenied(msg.into())
+    }
+
+    /// Map an I/O error for `what`, keeping "not found" distinguishable.
+    pub fn from_io(what: &str, e: &std::io::Error) -> Self {
+        match e.kind() {
+            std::io::ErrorKind::NotFound => ToolError::NotFound(what.to_string()),
+            std::io::ErrorKind::PermissionDenied => {
+                ToolError::Io(format!("{what}: the operating system denied access"))
+            }
+            _ => ToolError::Io(format!("{what}: {e}")),
         }
     }
 }
@@ -132,16 +154,27 @@ mod tests {
             "path_not_allowed"
         );
         assert_eq!(
-            ToolError::Timeout(std::time::Duration::from_secs(1)).category(),
+            ToolError::Timeout(Duration::from_secs(1)).category(),
             "timeout"
+        );
+        assert_eq!(
+            ToolError::ProgramNotFound("git".into()).category(),
+            "program_not_found"
         );
     }
 
     #[test]
-    fn permission_errors_map_to_permission_code() {
-        assert_eq!(
-            ToolError::CommandNotAllowed("rm".into()).json_rpc_code(),
-            error_codes::PERMISSION_DENIED
-        );
+    fn denials_are_distinguished_from_failures() {
+        assert!(ToolError::CommandNotAllowed("rm".into()).is_denial());
+        assert!(!ToolError::Execution("exit 1".into()).is_denial());
+    }
+
+    #[test]
+    fn io_not_found_maps_to_not_found() {
+        let e = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(matches!(
+            ToolError::from_io("a.txt", &e),
+            ToolError::NotFound(_)
+        ));
     }
 }

@@ -1,614 +1,523 @@
-//! Diagnostics tools.
+//! Diagnostics: what the server can do here, how it has been doing, its
+//! configuration, and on Windows the crash-analysis tools.
 //!
-//! A cross-platform capability probe (which external toolchains are available)
-//! plus Windows crash-analysis wrappers: WER report enumeration, crash-dump
-//! discovery, process dump creation (`procdump`), minidump analysis and live
-//! stack capture (`cdb`), and ETW session control (`logman`).
+//! The debugger tools take no debugger commands from the caller: `cdb` runs
+//! one of a fixed set of analyses. Dumps and live stacks are limited to
+//! processes inside the caller's own terminal sessions, because a memory
+//! dump of an arbitrary process is a copy of its secrets.
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use nebula_mcp_core::{Result, Tool, ToolContext, ToolError};
-use nebula_mcp_protocol::mcp::ToolAnnotations;
-use nebula_mcp_protocol::CallToolResult;
-use serde_json::{json, Value};
+use nebula_mcp_core::args::Args;
+use nebula_mcp_core::fs::Kind;
+use nebula_mcp_core::policy::Access;
+use nebula_mcp_core::process::{Command, Exec, CONFINEMENT_AVAILABLE};
+use nebula_mcp_core::schema::ObjectSchema;
+use nebula_mcp_core::{
+    Category, Effects, Gate, Platforms, Result, Tool, ToolContext, ToolError, ToolOutput,
+};
+use serde_json::{json, Map, Value};
 
-use crate::common::exec::{program_available, run_checked, CommandSpec};
-use crate::common::output::{exec_result, json_value_result};
-use crate::common::platform::{ensure_windows, run_powershell, POWERSHELL};
-use crate::common::{Args, ObjectSchema};
+use crate::common::{handler, rfc3339, spec, tool, SpecExt};
+use crate::powershell::SHELLS;
+use crate::process::in_my_sessions;
+use crate::sessions::Sessions;
+use crate::terminal::render_run;
+use crate::windows::{answer, failure, typed};
 
-const CATEGORY: &str = "diagnostics";
+/// Programs the tools of this server run, for the capability report.
+const PROGRAMS: &[&str] = &[
+    "git",
+    "docker",
+    "node",
+    "pwsh",
+    "powershell",
+    "curl",
+    "ping",
+    "iperf3",
+    "tcpdump",
+    "schtasks",
+    "cdb",
+    "procdump",
+    "logman",
+];
 
-/// Build diagnostics tools.
-pub fn tools() -> Vec<Arc<dyn Tool>> {
+/// The analyses `diagnostics_analyze_dump` offers, and the debugger commands
+/// behind them.
+const ANALYSES: &[(&str, &str)] = &[
+    ("analyze", "!analyze -v"),
+    ("stacks", "~*k"),
+    ("modules", "lm"),
+    ("threads", "~"),
+];
+
+/// The `diagnostics` tools.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn tools(sessions: &Arc<Sessions>) -> Vec<Arc<dyn Tool>> {
+    let c = Category::Diagnostics;
+    let win = |t: nebula_mcp_core::ToolSpec| t.on(Platforms::WINDOWS);
+    let (dump_sessions, stack_sessions) = (sessions.clone(), sessions.clone());
     vec![
-        Arc::new(Capabilities),
-        Arc::new(ServerMetrics),
-        Arc::new(EffectiveConfig),
-        Arc::new(WerReports),
-        Arc::new(CrashDumps),
-        Arc::new(CreateDump),
-        Arc::new(AnalyzeDump),
-        Arc::new(StackTrace),
-        Arc::new(EtwTrace),
+        tool(
+            spec(
+                "diagnostics_capabilities",
+                c,
+                "Server capabilities",
+                "What this server runs on and which external programs its tools can find: \
+                 platform, version, enabled categories, and whether child processes are \
+                 confined by the operating system.",
+                ObjectSchema::new().build(),
+                Effects::read_only(),
+            )
+            .returns(
+                ObjectSchema::open()
+                    .string("version", "Server version.", true)
+                    .string("os", "Operating system.", true)
+                    .string("arch", "CPU architecture.", true)
+                    .string_array("categories", "Enabled tool categories.", true)
+                    .boolean(
+                        "confinement",
+                        "Whether child processes are confined by the OS.",
+                        true,
+                    )
+                    .prop(
+                        "programs",
+                        json!({"type": "object", "additionalProperties": {"type": "boolean"},
+                               "description": "External programs and whether each was found."}),
+                        true,
+                    )
+                    .build(),
+            ),
+            handler!(capabilities),
+        ),
+        tool(
+            spec(
+                "diagnostics_metrics",
+                c,
+                "Tool call metrics",
+                "Per-tool call counts, failures, cancellations and durations since the server \
+                 started.",
+                ObjectSchema::new().build(),
+                Effects::read_only(),
+            )
+            .returns(
+                ObjectSchema::open()
+                    .object_array(
+                        "tools",
+                        "One entry per tool that has been called.",
+                        ObjectSchema::open()
+                            .string("tool", "Tool name.", true)
+                            .integer("calls", "Calls.", true)
+                            .integer("successes", "Calls that succeeded.", true)
+                            .integer("failures", "Calls that failed.", true)
+                            .integer("cancellations", "Calls cancelled or timed out.", true)
+                            .integer("meanDurationMs", "Mean duration.", true)
+                            .integer("maxDurationMs", "Longest duration.", true)
+                            .integer("outputBytes", "Output returned in total.", true),
+                        true,
+                    )
+                    .build(),
+            ),
+            handler!(metrics),
+        ),
+        tool(
+            spec(
+                "diagnostics_config",
+                c,
+                "Show configuration",
+                "The server's configuration as TOML, with tokens and secrets replaced.",
+                ObjectSchema::new().build(),
+                Effects::read_only(),
+            ),
+            handler!(config),
+        ),
+        tool(
+            win(spec(
+                "diagnostics_wer_reports",
+                c,
+                "Windows error reports",
+                "Recent Windows Error Reporting entries (application crashes and hangs) from \
+                 the Application event log, as JSON.",
+                ObjectSchema::new()
+                    .integer_range(
+                        "maxEvents",
+                        "Entries to return (default 20).",
+                        1,
+                        200,
+                        false,
+                    )
+                    .build(),
+                Effects::read_only().exec(SHELLS),
+            )),
+            handler!(wer_reports),
+        ),
+        tool(
+            win(spec(
+                "diagnostics_crash_dumps",
+                c,
+                "List crash dumps",
+                "Crash dump files (*.dmp) in a directory inside the allowed directories, newest \
+                 first.",
+                ObjectSchema::new()
+                    .string("directory", "Directory to look in.", true)
+                    .build(),
+                Effects::read_only(),
+            ))
+            .returns(
+                ObjectSchema::open()
+                    .object_array(
+                        "dumps",
+                        "Dump files, newest first.",
+                        ObjectSchema::open()
+                            .string("path", "The file.", true)
+                            .integer("bytes", "Size.", true)
+                            .nullable_string("modified", "Last modification, RFC 3339.", true),
+                        true,
+                    )
+                    .build(),
+            ),
+            handler!(crash_dumps),
+        ),
+        tool(
+            win(spec(
+                "diagnostics_create_dump",
+                c,
+                "Dump process memory",
+                "Write a full memory dump of a process that runs inside one of your terminal \
+                 sessions, with Sysinternals procdump. Other processes are refused.",
+                ObjectSchema::new()
+                    .integer_min("pid", "Process id.", 1, true)
+                    .string("outputPath", "Dump file to write (.dmp).", true)
+                    .build(),
+                Effects::writes().exec(Exec::Programs(&["procdump"])),
+            )),
+            move |ctx, args| {
+                let sessions = dump_sessions.clone();
+                Box::pin(async move { create_dump(ctx, &sessions, args).await })
+            },
+        ),
+        tool(
+            win(spec(
+                "diagnostics_stack_trace",
+                c,
+                "Capture thread stacks",
+                "The call stacks of every thread of a process that runs inside one of your \
+                 terminal sessions, captured with cdb without stopping it.",
+                ObjectSchema::new()
+                    .integer_min("pid", "Process id.", 1, true)
+                    .integer_min("timeoutSecs", "Seconds before cdb is stopped.", 1, false)
+                    .build(),
+                Effects::read_only().exec(Exec::Programs(&["cdb"])),
+            )),
+            move |ctx, args| {
+                let sessions = stack_sessions.clone();
+                Box::pin(async move { stack_trace(ctx, &sessions, args).await })
+            },
+        ),
+        tool(
+            win(spec(
+                "diagnostics_analyze_dump",
+                c,
+                "Analyse crash dump",
+                "Open a crash dump in cdb and return one analysis: `analyze` (the automatic \
+                 crash analysis), `stacks`, `modules` or `threads`. Debugger commands cannot be \
+                 passed.",
+                ObjectSchema::new()
+                    .string("dump", "The dump file.", true)
+                    .string_enum(
+                        "analysis",
+                        "Which analysis (default analyze).",
+                        &["analyze", "stacks", "modules", "threads"],
+                        false,
+                    )
+                    .integer_min("timeoutSecs", "Seconds before cdb is stopped.", 1, false)
+                    .build(),
+                Effects::read_only().exec(Exec::Programs(&["cdb"])),
+            )),
+            handler!(analyze_dump),
+        ),
+        tool(
+            win(spec(
+                "diagnostics_etw_trace",
+                c,
+                "ETW trace session",
+                "Create, start, stop, delete or query an Event Tracing for Windows session \
+                 with logman. A trace can record system-wide activity, so every action is \
+                 elevated; stop and delete are destructive.",
+                ObjectSchema::new()
+                    .string_enum(
+                        "action",
+                        "What to do.",
+                        &["create", "start", "stop", "delete", "query"],
+                        true,
+                    )
+                    .string(
+                        "session",
+                        "Session name: letters, digits, '-' and '_'.",
+                        true,
+                    )
+                    .string("provider", "Provider name or {GUID}, for create.", false)
+                    .string(
+                        "outputEtl",
+                        "Trace file to write (.etl), for create.",
+                        false,
+                    )
+                    .build(),
+                Effects::writes()
+                    .elevated(Gate::Always)
+                    .destructive(Gate::Sometimes)
+                    .exec(Exec::Programs(&["logman"])),
+            )),
+            handler!(etw_trace),
+        ),
     ]
 }
 
-async fn run_cmd(
-    ctx: &ToolContext,
-    program: &str,
-    args: Vec<String>,
-    label: &str,
-    timeout: Option<u64>,
-) -> Result<CallToolResult> {
-    let spec = CommandSpec::new(program, ctx.working_dir.clone(), ctx).args(args);
-    let result = run_checked(ctx, spec, timeout).await?;
-    Ok(exec_result(label, &result))
-}
-
-/// Report the host OS and which external toolchains are installed. This lets an
-/// agent plan work against the tools actually available.
-struct Capabilities;
-
-#[async_trait]
-impl Tool for Capabilities {
-    fn name(&self) -> &str {
-        "diagnostics.capabilities"
-    }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "Report the host platform and availability of common external toolchains (git, cargo, node, python, go, docker, ffmpeg, cdb, ...). Cross-platform."
-    }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new().build()
-    }
-    fn annotations(&self) -> Option<ToolAnnotations> {
-        Some(ToolAnnotations {
-            read_only_hint: Some(true),
-            ..Default::default()
-        })
-    }
-    async fn call(&self, _ctx: &ToolContext, _args: Value) -> Result<CallToolResult> {
-        const PROBES: &[&str] = &[
-            "git",
-            "gh",
-            "cargo",
-            "rustc",
-            "node",
-            "npm",
-            "npx",
-            "pnpm",
-            "python",
-            "python3",
-            "pip",
-            "go",
-            "java",
-            "dotnet",
-            "gcc",
-            "clang",
-            "cmake",
-            "make",
-            "docker",
-            "curl",
-            "ffmpeg",
-            "iperf3",
-            "ping",
-            "powershell",
-            "pwsh",
-            "msbuild",
-            "cdb",
-            "procdump",
-            "logman",
-            "dumpcap",
-            "tcpdump",
-        ];
-        let available: Vec<Value> = PROBES
-            .iter()
-            .map(|p| json!({ "tool": p, "available": program_available(p) }))
-            .collect();
-        Ok(json_value_result(json!({
-            "os": std::env::consts::OS,
-            "arch": std::env::consts::ARCH,
-            "family": std::env::consts::FAMILY,
-            "isWindows": cfg!(windows),
-            "tools": available,
-        })))
-    }
-}
-
-/// Live per-tool metrics snapshot.
-struct ServerMetrics;
-
-#[async_trait]
-impl Tool for ServerMetrics {
-    fn name(&self) -> &str {
-        "diagnostics.metrics"
-    }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "Return live per-tool metrics (call counts, successes, failures, cancellations, mean/max durations, output bytes). Cross-platform."
-    }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new().build()
-    }
-    fn annotations(&self) -> Option<ToolAnnotations> {
-        Some(ToolAnnotations {
-            read_only_hint: Some(true),
-            ..Default::default()
-        })
-    }
-    async fn call(&self, ctx: &ToolContext, _args: Value) -> Result<CallToolResult> {
-        let snapshot = ctx.metrics.snapshot();
-        Ok(json_value_result(json!({
-            "toolCount": snapshot.len(),
-            "tools": snapshot,
-        })))
-    }
-}
-
-/// Effective configuration / policy summary (no secrets).
-struct EffectiveConfig;
-
-#[async_trait]
-impl Tool for EffectiveConfig {
-    fn name(&self) -> &str {
-        "diagnostics.config"
-    }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "Summarise the server's effective configuration and permission policy (path/command counts, gates, disabled categories/tools). Cross-platform."
-    }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new().build()
-    }
-    fn annotations(&self) -> Option<ToolAnnotations> {
-        Some(ToolAnnotations {
-            read_only_hint: Some(true),
-            ..Default::default()
-        })
-    }
-    async fn call(&self, ctx: &ToolContext, _args: Value) -> Result<CallToolResult> {
-        let c = &ctx.config;
-        let disabled_categories: Vec<&String> = c
-            .categories
-            .iter()
-            .filter(|(_, v)| !v.enabled)
-            .map(|(k, _)| k)
-            .collect();
-        let disabled_tools: Vec<&String> = c
-            .tools
-            .iter()
-            .filter(|(_, v)| v.enabled == Some(false))
-            .map(|(k, _)| k)
-            .collect();
-        Ok(json_value_result(json!({
-            "server": {
-                "name": c.server.name,
-                "version": c.server.version,
-                "maxConcurrentCalls": c.server.max_concurrent_calls,
-            },
-            "security": {
-                "allowedPathCount": c.security.allowed_paths.len(),
-                "deniedPathCount": c.security.denied_paths.len(),
-                "allowedCommandCount": c.security.allowed_commands.len(),
-                "defaultTimeoutSecs": c.security.default_timeout_secs,
-                "maxRuntimeSecs": c.security.max_runtime_secs,
-                "maxOutputBytes": c.security.max_output_bytes,
-                "allowElevated": c.security.allow_elevated,
-                "allowNetwork": c.security.allow_network,
-                "allowDestructive": c.security.allow_destructive,
-            },
-            "workingDir": ctx.working_dir.display().to_string(),
-            "disabledCategories": disabled_categories,
-            "disabledTools": disabled_tools,
-        })))
-    }
-}
-
-/// Windows Error Reporting event enumeration.
-struct WerReports;
-
-#[async_trait]
-impl Tool for WerReports {
-    fn name(&self) -> &str {
-        "diagnostics.wer_reports"
-    }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "List recent Windows Error Reporting (application crash) events as JSON. Windows only."
-    }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new()
-            .integer("maxEvents", "Maximum events (default 30).", false)
-            .build()
-    }
-    fn annotations(&self) -> Option<ToolAnnotations> {
-        Some(ToolAnnotations {
-            read_only_hint: Some(true),
-            ..Default::default()
-        })
-    }
-    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
-        ensure_windows(self.name())?;
-        let a = Args::new(&args)?;
-        let max = a.u64_or("maxEvents", 30)?;
-        let script = format!(
-            "Get-WinEvent -FilterHashtable @{{LogName='Application';ProviderName='Windows Error Reporting'}} -MaxEvents {max} \
-             | Select-Object TimeCreated,Id,LevelDisplayName,Message | ConvertTo-Json -Depth 4"
+async fn capabilities(ctx: &ToolContext, _: Value) -> Result<ToolOutput> {
+    let mut programs = Map::new();
+    for program in PROGRAMS {
+        programs.insert(
+            (*program).to_string(),
+            json!(ctx.spawner().available(program)),
         );
-        let r = run_powershell(ctx, POWERSHELL, &script, None).await?;
-        Ok(exec_result("WER reports", &r))
     }
+    Ok(ToolOutput::json(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "categories": ctx.config().server.categories,
+        "confinement": CONFINEMENT_AVAILABLE,
+        "programs": programs,
+    })))
 }
 
-/// Enumerate crash-dump files in the standard WER locations (or a custom dir).
-struct CrashDumps;
-
-#[async_trait]
-impl Tool for CrashDumps {
-    fn name(&self) -> &str {
-        "diagnostics.crash_dumps"
-    }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "List crash dump (.dmp) files under the local WER CrashDumps directory or a provided directory. Windows only."
-    }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new()
-            .string(
-                "directory",
-                "Directory to scan (default %LOCALAPPDATA%\\CrashDumps).",
-                false,
-            )
-            .build()
-    }
-    fn annotations(&self) -> Option<ToolAnnotations> {
-        Some(ToolAnnotations {
-            read_only_hint: Some(true),
-            ..Default::default()
+async fn metrics(ctx: &ToolContext, _: Value) -> Result<ToolOutput> {
+    let tools: Vec<Value> = ctx
+        .metrics()
+        .snapshot()
+        .into_iter()
+        .map(|m| {
+            json!({
+                "tool": m.tool,
+                "calls": m.calls,
+                "successes": m.successes,
+                "failures": m.failures,
+                "cancellations": m.cancellations,
+                "meanDurationMs": m.mean_duration_us / 1000,
+                "maxDurationMs": m.max_duration_us / 1000,
+                "outputBytes": m.output_bytes,
+            })
         })
-    }
-    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
-        ensure_windows(self.name())?;
-        let a = Args::new(&args)?;
-        let dir = match a.opt_str("directory")? {
-            Some(d) => d.to_string(),
-            None => {
-                let local = std::env::var("LOCALAPPDATA")
-                    .map_err(|_| ToolError::Execution("LOCALAPPDATA not set".into()))?;
-                format!("{local}\\CrashDumps")
-            }
-        };
-        let script = format!(
-            "Get-ChildItem -Path '{}' -Filter *.dmp -ErrorAction SilentlyContinue \
-             | Select-Object FullName,Length,LastWriteTime | ConvertTo-Json -Depth 3",
-            dir.replace('\'', "''")
-        );
-        let r = run_powershell(ctx, POWERSHELL, &script, None).await?;
-        Ok(exec_result("crash dumps", &r))
-    }
+        .collect();
+    Ok(ToolOutput::json(json!({"tools": tools})))
 }
 
-/// Create a process dump with procdump.
-struct CreateDump;
-
-#[async_trait]
-impl Tool for CreateDump {
-    fn name(&self) -> &str {
-        "diagnostics.create_dump"
-    }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "Create a full memory dump of a process with procdump (Sysinternals). Windows only."
-    }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new()
-            .integer("pid", "Process id.", true)
-            .string(
-                "outputPath",
-                "Dump output path (within an allowed root).",
-                true,
-            )
-            .build()
-    }
-    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
-        ensure_windows(self.name())?;
-        let a = Args::new(&args)?;
-        let pid = a
-            .opt_u64("pid")?
-            .ok_or_else(|| ToolError::InvalidArguments("missing 'pid'".into()))?;
-        let out = ctx.resolve_path(a.str("outputPath")?)?;
-        run_cmd(
-            ctx,
-            "procdump",
-            vec![
-                "-accepteula".into(),
-                "-ma".into(),
-                pid.to_string(),
-                out.display().to_string(),
-            ],
-            "procdump",
-            Some(120),
-        )
-        .await
-    }
+async fn config(ctx: &ToolContext, _: Value) -> Result<ToolOutput> {
+    let text = ctx
+        .config()
+        .to_redacted_toml()
+        .map_err(|e| ToolError::Internal(e.to_string()))?;
+    Ok(ToolOutput::text(text))
 }
 
-/// Analyse a minidump with cdb.
-struct AnalyzeDump;
+async fn wer_reports(ctx: &ToolContext, args: Value) -> Result<ToolOutput> {
+    const BODY: &str = "try {\
+           @(Get-WinEvent -FilterHashtable @{ LogName='Application'; ProviderName='Windows Error Reporting' } \
+             -MaxEvents ([int]$env:NB_MAX) | Select-Object @{n='time';e={$_.TimeCreated.ToString('o')}}, \
+             @{n='id';e={$_.Id}}, @{n='message';e={$_.Message}}) | ConvertTo-Json -Depth 3\
+         } catch { if ($_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*') { '[]' } else { throw } }";
+    let a = Args::new(&args)?;
+    let max = a.u64_or("maxEvents", 20)?.clamp(1, 200).to_string();
+    answer(
+        ctx,
+        "reading the error reports",
+        typed(BODY, &[("NB_MAX", max.as_str())]),
+    )
+    .await
+}
 
-#[async_trait]
-impl Tool for AnalyzeDump {
-    fn name(&self) -> &str {
-        "diagnostics.analyze_dump"
-    }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "Analyse a crash dump with cdb (!analyze -v) and return the analysis text. cdb must be allowlisted. Windows only."
-    }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new()
-            .string("dump", "Path to the .dmp file.", true)
-            .string(
-                "commands",
-                "Debugger commands (default '!analyze -v').",
-                false,
-            )
-            .integer("timeoutSecs", "Timeout override.", false)
-            .build()
-    }
-    fn annotations(&self) -> Option<ToolAnnotations> {
-        Some(ToolAnnotations {
-            read_only_hint: Some(true),
-            ..Default::default()
+async fn crash_dumps(ctx: &ToolContext, args: Value) -> Result<ToolOutput> {
+    let a = Args::new(&args)?;
+    let input = a.str("directory")?.to_string();
+    let mut dumps = ctx
+        .fs()
+        .blocking(move |fs| {
+            let dir = fs.resolve(&input, Access::Read)?;
+            let (entries, _) = fs.read_dir(&dir)?;
+            Ok(entries
+                .into_iter()
+                .filter(|e| {
+                    e.meta.kind == Kind::File && e.name.to_ascii_lowercase().ends_with(".dmp")
+                })
+                .map(|e| (e.meta.modified, e.path.display(), e.meta.len))
+                .collect::<Vec<_>>())
         })
-    }
-    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
-        ensure_windows(self.name())?;
-        let a = Args::new(&args)?;
-        let dump = ctx.resolve_path(a.str("dump")?)?;
-        let commands = a.str_or("commands", "!analyze -v")?;
-        let script = format!("{commands}; q");
-        run_cmd(
-            ctx,
-            "cdb",
-            vec!["-z".into(), dump.display().to_string(), "-c".into(), script],
-            "cdb !analyze",
-            a.opt_u64("timeoutSecs")?,
-        )
-        .await
-    }
-}
-
-/// Capture live thread stacks of a process with cdb (non-invasive attach).
-struct StackTrace;
-
-#[async_trait]
-impl Tool for StackTrace {
-    fn name(&self) -> &str {
-        "diagnostics.stack_trace"
-    }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "Capture stacks of all threads in a running process via cdb (~*k). Windows only."
-    }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new()
-            .integer("pid", "Process id to attach to.", true)
-            .integer("timeoutSecs", "Timeout override.", false)
-            .build()
-    }
-    fn annotations(&self) -> Option<ToolAnnotations> {
-        Some(ToolAnnotations {
-            read_only_hint: Some(true),
-            ..Default::default()
+        .await?;
+    dumps.sort_by_key(|a| std::cmp::Reverse(a.0));
+    let dumps: Vec<Value> = dumps
+        .into_iter()
+        .map(|(modified, path, bytes)| {
+            json!({"path": path, "bytes": bytes, "modified": modified.and_then(rfc3339)})
         })
+        .collect();
+    Ok(ToolOutput::json(json!({"dumps": dumps})))
+}
+
+/// The pid of a process the caller may inspect.
+async fn own_pid(ctx: &ToolContext, sessions: &Sessions, a: &Args<'_>) -> Result<u32> {
+    let pid = u32::try_from(a.u64("pid")?)
+        .map_err(|_| ToolError::invalid("`pid` is not a process id"))?;
+    if !in_my_sessions(ctx, sessions, pid).await? {
+        return Err(ToolError::denied(format!(
+            "process {pid} does not run inside one of your terminal sessions; only those can be \
+             dumped or inspected"
+        )));
     }
-    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
-        ensure_windows(self.name())?;
-        let a = Args::new(&args)?;
-        let pid = a
-            .opt_u64("pid")?
-            .ok_or_else(|| ToolError::InvalidArguments("missing 'pid'".into()))?;
-        run_cmd(
-            ctx,
-            "cdb",
-            vec![
-                "-pv".into(),
-                "-p".into(),
-                pid.to_string(),
-                "-c".into(),
-                "~*k; q".into(),
-            ],
-            "cdb stacks",
-            a.opt_u64("timeoutSecs")?,
-        )
-        .await
+    Ok(pid)
+}
+
+async fn create_dump(ctx: &ToolContext, sessions: &Sessions, args: Value) -> Result<ToolOutput> {
+    let a = Args::new(&args)?;
+    let pid = own_pid(ctx, sessions, &a).await?;
+    let dest = ctx.write_path(a.str("outputPath")?)?;
+    if !dest.display().to_ascii_lowercase().ends_with(".dmp") {
+        return Err(ToolError::invalid("`outputPath` must end in .dmp"));
+    }
+    let cmd = Command::typed("procdump")
+        .args(["-accepteula", "-ma"])
+        .arg(pid.to_string())
+        .arg_path(&dest)
+        .timeout(ctx.timeout(None));
+    let out = ctx.run(cmd).await?;
+    // procdump reports success with a non-zero code on some versions; the
+    // file is what counts.
+    let written = ctx.fs().try_metadata(&dest)?.map_or(0, |m| m.len);
+    if written == 0 {
+        return Err(failure("procdump", &out));
+    }
+    Ok(ToolOutput::text(format!(
+        "[diagnostics_create_dump: wrote {} ({written} bytes)]",
+        dest.display()
+    )))
+}
+
+async fn stack_trace(ctx: &ToolContext, sessions: &Sessions, args: Value) -> Result<ToolOutput> {
+    let a = Args::new(&args)?;
+    let pid = own_pid(ctx, sessions, &a).await?;
+    let cmd = Command::typed("cdb")
+        // Attach without becoming the debugger, print stacks, detach.
+        .args(["-pv", "-p"])
+        .arg(pid.to_string())
+        .args(["-c", "~*k;qd"])
+        .timeout(ctx.timeout(a.opt_u64("timeoutSecs")?))
+        .timeout_is_result();
+    Ok(render_run("diagnostics_stack_trace", &ctx.run(cmd).await?))
+}
+
+async fn analyze_dump(ctx: &ToolContext, args: Value) -> Result<ToolOutput> {
+    let a = Args::new(&args)?;
+    let wanted = a.str_or("analysis", "analyze")?;
+    let commands = ANALYSES
+        .iter()
+        .find(|(name, _)| *name == wanted)
+        .map(|(_, commands)| *commands)
+        .ok_or_else(|| ToolError::invalid(format!("unknown analysis '{wanted}'")))?;
+    let input = a.str("dump")?.to_string();
+    let dump = ctx
+        .fs()
+        .blocking(move |fs| {
+            let path = fs.resolve(&input, Access::Read)?;
+            match fs.metadata(&path)?.kind {
+                Kind::File => Ok(path),
+                _ => Err(ToolError::invalid("`dump` must be a file")),
+            }
+        })
+        .await?;
+    let cmd = Command::typed("cdb")
+        .arg("-z")
+        .arg_path(&dump)
+        .arg("-c")
+        .arg(format!("{commands};q"))
+        .timeout(ctx.timeout(a.opt_u64("timeoutSecs")?))
+        .timeout_is_result();
+    Ok(render_run("diagnostics_analyze_dump", &ctx.run(cmd).await?))
+}
+
+/// A session name: it may not start with '-', where logman reads options.
+fn session_name(name: &str) -> Result<String> {
+    let mut chars = name.chars();
+    let ok = chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && name.len() <= 64
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if ok {
+        Ok(name.to_string())
+    } else {
+        Err(ToolError::invalid(
+            "`session` must start with a letter or digit and contain only letters, digits, '-' \
+             and '_'",
+        ))
     }
 }
 
-/// ETW session control via logman.
-struct EtwTrace;
+/// An ETW provider: a name or a `{GUID}`.
+fn provider_name(name: &str) -> Result<String> {
+    let ok = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '{')
+        && name.len() <= 200
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || " _.-{}".contains(c));
+    if ok {
+        Ok(name.to_string())
+    } else {
+        Err(ToolError::invalid(
+            "`provider` must be a provider name or a {GUID}",
+        ))
+    }
+}
 
-#[async_trait]
-impl Tool for EtwTrace {
-    fn name(&self) -> &str {
-        "diagnostics.etw_trace"
-    }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "Control an ETW trace session with logman: create/start/stop/delete/query. Windows only."
-    }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new()
-            .enumerated(
-                "action",
-                "Action.",
-                &["create", "start", "stop", "delete", "query"],
-                true,
-            )
-            .string("session", "Trace session name.", true)
-            .string("provider", "Provider GUID/name for 'create'.", false)
-            .string(
-                "outputEtl",
-                "Output ETL path for 'create' (within an allowed root).",
-                false,
-            )
-            .build()
-    }
-    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
-        ensure_windows(self.name())?;
-        let a = Args::new(&args)?;
-        let session = a.str("session")?.to_string();
-        match a.str("action")? {
-            "create" => {
-                let provider = a.str("provider")?;
-                let out = ctx.resolve_path(a.str("outputEtl")?)?;
-                run_cmd(
-                    ctx,
-                    "logman",
-                    vec![
-                        "create".into(),
-                        "trace".into(),
-                        session,
-                        "-p".into(),
-                        provider.into(),
-                        "-o".into(),
-                        out.display().to_string(),
-                        "-ets".into(),
-                    ],
-                    "logman create trace",
-                    None,
-                )
-                .await
-            }
-            "start" => {
-                run_cmd(
-                    ctx,
-                    "logman",
-                    vec!["start".into(), session, "-ets".into()],
-                    "logman start",
-                    None,
-                )
-                .await
-            }
-            "stop" => {
-                run_cmd(
-                    ctx,
-                    "logman",
-                    vec!["stop".into(), session, "-ets".into()],
-                    "logman stop",
-                    None,
-                )
-                .await
-            }
-            "delete" => {
-                run_cmd(
-                    ctx,
-                    "logman",
-                    vec!["delete".into(), session, "-ets".into()],
-                    "logman delete",
-                    None,
-                )
-                .await
-            }
-            "query" => {
-                run_cmd(
-                    ctx,
-                    "logman",
-                    vec!["query".into(), session, "-ets".into()],
-                    "logman query",
-                    None,
-                )
-                .await
-            }
-            other => Err(ToolError::InvalidArguments(format!(
-                "unknown action '{other}'"
-            ))),
+async fn etw_trace(ctx: &ToolContext, args: Value) -> Result<ToolOutput> {
+    let a = Args::new(&args)?;
+    let action = a.str("action")?;
+    let session = session_name(a.str("session")?)?;
+    let mut cmd = Command::typed("logman");
+    match action {
+        "create" => {
+            let provider = provider_name(
+                a.opt_str("provider")?
+                    .ok_or_else(|| ToolError::invalid("`provider` is required for create"))?,
+            )?;
+            let output = ctx.write_path(
+                a.opt_str("outputEtl")?
+                    .ok_or_else(|| ToolError::invalid("`outputEtl` is required for create"))?,
+            )?;
+            cmd = cmd
+                .args([
+                    "create",
+                    "trace",
+                    session.as_str(),
+                    "-p",
+                    provider.as_str(),
+                    "-o",
+                ])
+                .arg_path(&output);
         }
+        "start" | "query" => cmd = cmd.args([action, session.as_str()]),
+        "stop" | "delete" => {
+            ctx.require_destructive("stopping or deleting a trace session")?;
+            cmd = cmd.args([action, session.as_str()]);
+        }
+        other => return Err(ToolError::invalid(format!("unknown action '{other}'"))),
     }
+    let out = ctx.run(cmd.timeout(ctx.timeout(None))).await?;
+    if !out.success() {
+        return Err(failure("logman", &out));
+    }
+    Ok(ToolOutput::text(out.stdout.text.trim().to_string()))
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use nebula_mcp_core::config::SecurityConfig;
-    use nebula_mcp_core::security::EffectivePolicy;
-    use nebula_mcp_core::Metrics;
-    use tokio_util::sync::CancellationToken;
-
-    fn ctx() -> ToolContext {
-        let base = SecurityConfig {
-            allowed_paths: vec!["/**".into()],
-            allowed_commands: vec!["cdb".into(), "procdump".into(), "logman".into()],
-            ..Default::default()
-        };
-        let policy = EffectivePolicy::build("diagnostics.capabilities", &base, None).unwrap();
-        ToolContext {
-            policy: Arc::new(policy),
-            working_dir: std::env::temp_dir(),
-            cancel: CancellationToken::new(),
-            metrics: Metrics::new(),
-            config: Arc::new(Default::default()),
-            request_id: "r".into(),
-            progress: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn capabilities_reports_platform() {
-        let res = Capabilities.call(&ctx(), json!({})).await.unwrap();
-        assert_eq!(res.is_error, Some(false));
-        let text = match &res.content[0] {
-            nebula_mcp_protocol::Content::Text { text } => text.clone(),
-            _ => panic!(),
-        };
-        assert!(text.contains("\"os\""));
-        assert!(text.contains("\"tools\""));
-    }
-
-    #[tokio::test]
-    async fn analyze_dump_gated_off_windows() {
-        if cfg!(windows) {
-            return;
-        }
-        let err = AnalyzeDump
-            .call(&ctx(), json!({"dump": "/tmp/x.dmp"}))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, ToolError::PlatformUnsupported(_)));
-    }
-
-    #[tokio::test]
-    async fn metrics_and_config_are_readonly_cross_platform() {
-        let m = ServerMetrics.call(&ctx(), json!({})).await.unwrap();
-        assert_eq!(m.is_error, Some(false));
-        let c = EffectiveConfig.call(&ctx(), json!({})).await.unwrap();
-        assert_eq!(c.is_error, Some(false));
-        let text = match &c.content[0] {
-            nebula_mcp_protocol::Content::Text { text } => text.clone(),
-            _ => panic!(),
-        };
-        assert!(text.contains("allowElevated"));
-        assert!(text.contains("maxRuntimeSecs"));
-    }
-}
+#[path = "diagnostics_tests.rs"]
+mod tests;

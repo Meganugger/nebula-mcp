@@ -1,327 +1,412 @@
-//! Browser automation via Playwright.
+//! Browser tools: load a page in headless Chromium through Playwright.
 //!
-//! Rather than binding a browser protocol directly, these tools generate a
-//! self-contained Playwright (Node.js) script and execute it with `node` (which
-//! must be on the command allowlist). This supports Chromium, Firefox and
-//! WebKit and yields screenshots, PDFs, console logs, network activity and
-//! Playwright traces. Configuration is passed to the script via a temp JSON
-//! file (never string-interpolated) to avoid script injection.
+//! The browser is driven by a constant Node.js script; what the caller sends
+//! reaches it as a JSON document, never as code. The browser is started with
+//! the server's own forward proxy as its only way out, so every connection a
+//! page makes (the navigation, redirects, scripts, fetches, WebSockets) is
+//! vetted against the network policy and pinned, like a connection of the
+//! server itself. Only http and https pages are loaded.
 //!
-//! Node and Playwright must be installed on the host; when they are not, the
-//! tools return a clear `tool not found` / execution error.
+//! Playwright is taken from Node's global module directory (or `NODE_PATH`
+//! when the operator passes it through), never from a directory the client
+//! can write. The browser is the one Playwright installed, or the system's
+//! Chrome or Edge, or the binary the operator names in `CHROME_PATH`.
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use nebula_mcp_core::{Result, Tool, ToolContext, ToolError};
-use nebula_mcp_protocol::mcp::ToolAnnotations;
-use nebula_mcp_protocol::{CallToolResult, Content};
+use nebula_mcp_core::args::Args;
+use nebula_mcp_core::fs::CheckedPath;
+use nebula_mcp_core::policy::Access;
+use nebula_mcp_core::process::{Command, Exec};
+use nebula_mcp_core::schema::ObjectSchema;
+use nebula_mcp_core::{Category, Effects, Result, Tool, ToolContext, ToolError, ToolOutput};
 use serde_json::{json, Value};
 
-use crate::common::exec::{run_checked, CommandSpec};
-use crate::common::{Args, ObjectSchema};
+use crate::common::{clip, handler, spec, tool, SpecExt};
 
-const CATEGORY: &str = "browser";
+const EFFECTS: Effects = Effects::writes()
+    .overwrites()
+    .network()
+    .exec(Exec::Programs(&["node"]));
+const WAIT_UNTIL: [&str; 4] = ["load", "domcontentloaded", "networkidle", "commit"];
+const MAX_TEXT: usize = 200_000;
 
-/// The Playwright driver script (reads a JSON config path from argv[2]).
-const DRIVER_SCRIPT: &str = r#"
-const fs = require('fs');
-const cfg = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
-(async () => {
-  let pw;
-  try { pw = require('playwright'); }
-  catch (e) { process.stderr.write('playwright is not installed: ' + e.message); process.exit(3); }
-  const btype = pw[cfg.browser] || pw.chromium;
-  const browser = await btype.launch({ headless: true });
-  const context = await browser.newContext();
-  if (cfg.tracePath) await context.tracing.start({ screenshots: true, snapshots: true });
-  const page = await context.newPage();
-  const consoleMsgs = [];
-  const requests = [];
-  if (cfg.collectConsole) page.on('console', m => consoleMsgs.push({ type: m.type(), text: m.text() }));
-  if (cfg.collectNetwork) page.on('requestfinished', async r => {
-    let status = null;
-    try { const resp = await r.response(); status = resp ? resp.status() : null; } catch (_) {}
-    requests.push({ url: r.url(), method: r.method(), status });
-  });
-  const result = {};
-  try {
-    const resp = await page.goto(cfg.url, { waitUntil: cfg.waitUntil || 'load', timeout: cfg.timeoutMs || 30000 });
-    if (cfg.waitMs) await page.waitForTimeout(cfg.waitMs);
-    result.status = resp ? resp.status() : null;
-    result.title = await page.title();
-    result.finalUrl = page.url();
-    if (cfg.screenshotPath) { await page.screenshot({ path: cfg.screenshotPath, fullPage: !!cfg.fullPage }); result.screenshot = cfg.screenshotPath; }
-    if (cfg.pdfPath && cfg.browser === 'chromium') { await page.pdf({ path: cfg.pdfPath }); result.pdf = cfg.pdfPath; }
-    if (cfg.tracePath) { await context.tracing.stop({ path: cfg.tracePath }); result.trace = cfg.tracePath; }
-    result.console = consoleMsgs;
-    result.network = requests;
-  } finally {
-    await browser.close();
+/// Exit codes of the driver that are not page failures.
+const NO_PLAYWRIGHT: i32 = 3;
+const NO_BROWSER: i32 = 4;
+
+/// The driver. `process.argv[1]` is the JSON configuration.
+const DRIVER: &str = r#"
+const path = require('path');
+const cfg = JSON.parse(process.argv[1]);
+function load() {
+  const exe = path.dirname(process.execPath);
+  const dirs = [path.join(exe, '..', 'lib', 'node_modules'), path.join(exe, 'node_modules')];
+  if (process.env.APPDATA) dirs.push(path.join(process.env.APPDATA, 'npm', 'node_modules'));
+  for (const d of (process.env.NODE_PATH || '').split(path.delimiter)) if (d) dirs.push(d);
+  const tried = [];
+  for (const d of dirs) for (const name of ['playwright', 'playwright-core']) {
+    const p = path.resolve(d, name);
+    const low = p.toLowerCase();
+    if (cfg.writable.some(r => low.startsWith(r.toLowerCase()))) continue;
+    try { return require(p); } catch (e) { tried.push(p); }
   }
-  process.stdout.write(JSON.stringify(result));
-})().catch(e => { process.stderr.write(String((e && e.stack) || e)); process.exit(1); });
+  process.stderr.write(tried.join(', '));
+  process.exit(3);
+}
+(async () => {
+  const pw = load();
+  const launch = {
+    headless: true,
+    proxy: { server: cfg.proxy, bypass: '<-loopback>' },
+    args: ['--force-webrtc-ip-handling-policy=disable_non_proxied_udp', '--disable-quic'],
+  };
+  // An operator-chosen browser first, then Playwright's own, then the
+  // system's Chrome or Edge.
+  const tries = [{}, { channel: 'chrome' }, { channel: 'msedge' }];
+  if (process.env.CHROME_PATH) tries.unshift({ executablePath: process.env.CHROME_PATH });
+  let browser = null;
+  const why = [];
+  for (const extra of tries) {
+    try { browser = await pw.chromium.launch({ ...launch, ...extra }); break; }
+    catch (e) { why.push(String(e && e.message || e).split('\n')[0]); }
+  }
+  if (!browser) { process.stderr.write(why.join(' | ')); process.exit(4); }
+  const out = { console: [], requests: [], blocked: 0 };
+  try {
+    const context = await browser.newContext({ acceptDownloads: false, serviceWorkers: 'block' });
+    await context.route('**/*', route => {
+      if (/^(https?|data|blob|about):/i.test(route.request().url())) return route.continue();
+      out.blocked++;
+      return route.abort('blockedbyclient');
+    });
+    const page = await context.newPage();
+    if (cfg.collectConsole) page.on('console', m => {
+      if (out.console.length < 200) out.console.push({ type: m.type(), text: m.text().slice(0, 2000) });
+    });
+    const note = (r, status, failure) => {
+      if (cfg.collectNetwork && out.requests.length < 300) out.requests.push({
+        url: r.url().slice(0, 2000), method: r.method(), type: r.resourceType(), status, failure,
+      });
+    };
+    page.on('response', r => note(r.request(), r.status(), null));
+    page.on('requestfailed', r => note(r, null, (r.failure() || {}).errorText || 'failed'));
+    const response = await page.goto(cfg.url, { waitUntil: cfg.waitUntil, timeout: cfg.timeoutMs });
+    if (cfg.waitMs) await page.waitForTimeout(cfg.waitMs);
+    out.status = response ? response.status() : null;
+    out.finalUrl = page.url();
+    out.title = await page.title();
+    if (cfg.text) {
+      const text = await page.evaluate(() => document.body ? document.body.innerText : '');
+      out.text = text.slice(0, cfg.maxText);
+      out.textTruncated = text.length > cfg.maxText;
+    }
+    if (cfg.screenshot) await page.screenshot({ path: cfg.screenshot, fullPage: !!cfg.fullPage, type: 'png' });
+    if (cfg.pdf) await page.pdf({ path: cfg.pdf });
+  } catch (e) {
+    out.error = String(e && e.message || e).split('\n')[0];
+  } finally {
+    await browser.close().catch(() => {});
+  }
+  process.stdout.write(JSON.stringify(out));
+})();
 "#;
 
-/// Build browser tools.
-pub fn tools() -> Vec<Arc<dyn Tool>> {
-    vec![Arc::new(BrowserCapture), Arc::new(BrowserScreenshot)]
+fn page_schema() -> ObjectSchema {
+    ObjectSchema::new()
+        .string("url", "http:// or https:// address of the page.", true)
+        .string_enum(
+            "waitUntil",
+            "When the page counts as loaded (default load).",
+            &WAIT_UNTIL,
+            false,
+        )
+        .boolean(
+            "fullPage",
+            "Capture the whole scrollable page, not just the viewport.",
+            false,
+        )
+        .boolean("overwrite", "Replace output files that exist.", false)
+        .integer_min(
+            "timeoutSecs",
+            "Seconds before the browser is stopped (default and ceiling set by the operator).",
+            1,
+            false,
+        )
 }
 
-async fn run_driver(ctx: &ToolContext, cfg: Value, timeout: Option<u64>) -> Result<CallToolResult> {
-    ctx.policy.ensure_network_allowed()?;
-
-    // Write the driver + config to temp files.
-    let dir = std::env::temp_dir();
-    let script_path = dir.join(format!("nebula-pw-{}.cjs", uuid::Uuid::new_v4()));
-    let config_path = dir.join(format!("nebula-pw-{}.json", uuid::Uuid::new_v4()));
-    tokio::fs::write(&script_path, DRIVER_SCRIPT)
-        .await
-        .map_err(|e| ToolError::Io(format!("writing driver script: {e}")))?;
-    tokio::fs::write(&config_path, serde_json::to_vec(&cfg)?)
-        .await
-        .map_err(|e| ToolError::Io(format!("writing driver config: {e}")))?;
-
-    let spec = CommandSpec::new("node", ctx.working_dir.clone(), ctx).args(vec![
-        script_path.display().to_string(),
-        config_path.display().to_string(),
-    ]);
-    let result = run_checked(ctx, spec, timeout).await;
-
-    // Best-effort cleanup of temp files.
-    let _ = tokio::fs::remove_file(&script_path).await;
-    let _ = tokio::fs::remove_file(&config_path).await;
-
-    let result = result?;
-    if result.success() {
-        // The script prints JSON to stdout.
-        let parsed: Value = serde_json::from_str(result.stdout.trim())
-            .unwrap_or_else(|_| json!({ "raw": result.stdout }));
-        let text = serde_json::to_string_pretty(&parsed).unwrap_or(result.stdout.clone());
-        Ok(CallToolResult {
-            content: vec![Content::text(text)],
-            is_error: Some(false),
-        })
-    } else {
-        Ok(CallToolResult::error_text(format!(
-            "browser automation failed (exit {}): {}",
-            result
-                .code
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| "signal".into()),
-            result.stderr.trim()
-        )))
-    }
+/// The `browser` tools.
+pub(crate) fn tools() -> Vec<Arc<dyn Tool>> {
+    let c = Category::Browser;
+    vec![
+        tool(
+            spec(
+                "browser_screenshot",
+                c,
+                "Screenshot page",
+                "Load a web page in headless Chromium and save a PNG screenshot inside an \
+                 allowed directory. Everything the page requests is subject to the network \
+                 policy. Needs Node.js with Playwright installed globally.",
+                page_schema()
+                    .string("outputPath", "PNG file to write.", true)
+                    .build(),
+                EFFECTS,
+            )
+            .returns(
+                ObjectSchema::open()
+                    .string("path", "The screenshot.", true)
+                    .nullable_integer("status", "HTTP status of the page.", true)
+                    .string("finalUrl", "Address after redirects.", true)
+                    .string("title", "Page title.", true)
+                    .integer(
+                        "blockedRequests",
+                        "Requests the network policy refused.",
+                        true,
+                    )
+                    .build(),
+            ),
+            handler!(screenshot),
+        ),
+        tool(
+            spec(
+                "browser_capture",
+                c,
+                "Capture page",
+                "Load a web page in headless Chromium and return its title, visible text and \
+                 optionally its console messages and network requests; can also save a \
+                 screenshot and a PDF. Use it for pages that need JavaScript to render. \
+                 Everything the page requests is subject to the network policy.",
+                page_schema()
+                    .integer_range(
+                        "waitMs",
+                        "Extra milliseconds to wait after loading.",
+                        0,
+                        30_000,
+                        false,
+                    )
+                    .boolean("collectConsole", "Return console messages.", false)
+                    .boolean(
+                        "collectNetwork",
+                        "Return the requests the page made.",
+                        false,
+                    )
+                    .string("screenshotPath", "Also save a PNG screenshot here.", false)
+                    .string("pdfPath", "Also save the page as PDF here.", false)
+                    .build(),
+                EFFECTS,
+            )
+            .returns(
+                ObjectSchema::open()
+                    .nullable_integer("status", "HTTP status of the page.", true)
+                    .string("finalUrl", "Address after redirects.", true)
+                    .string("title", "Page title.", true)
+                    .string("text", "Visible text of the page.", true)
+                    .boolean("textTruncated", "Whether the text was cut.", true)
+                    .integer(
+                        "blockedRequests",
+                        "Requests the network policy refused.",
+                        true,
+                    )
+                    .object_array(
+                        "console",
+                        "Console messages, when asked for.",
+                        ObjectSchema::open()
+                            .string("type", "log, warning, error, ...", true)
+                            .string("text", "The message.", true),
+                        true,
+                    )
+                    .object_array(
+                        "requests",
+                        "Requests the page made, when asked for.",
+                        ObjectSchema::open()
+                            .string("url", "Requested address.", true)
+                            .string("method", "HTTP method.", true)
+                            .string("type", "Resource type.", true)
+                            .nullable_integer("status", "HTTP status, when answered.", true)
+                            .nullable_string("failure", "Why it failed, when it did.", true),
+                        true,
+                    )
+                    .nullable_string("screenshotPath", "The screenshot, when saved.", true)
+                    .nullable_string("pdfPath", "The PDF, when saved.", true)
+                    .build(),
+            ),
+            handler!(capture),
+        ),
+    ]
 }
 
-/// Full-capability capture: navigate + optional screenshot/pdf/trace + logs.
-struct BrowserCapture;
-
-#[async_trait]
-impl Tool for BrowserCapture {
-    fn name(&self) -> &str {
-        "browser.capture"
-    }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "Drive Playwright to navigate a URL and optionally capture a screenshot, PDF (Chromium), \
-         Playwright trace, console logs and network activity. Requires Node.js + Playwright."
-    }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new()
-            .string("url", "URL to open.", true)
-            .enumerated(
-                "browser",
-                "Browser engine.",
-                &["chromium", "firefox", "webkit"],
-                false,
-            )
-            .string(
-                "screenshotPath",
-                "Screenshot output path (within an allowed root).",
-                false,
-            )
-            .string(
-                "pdfPath",
-                "PDF output path (Chromium only, within an allowed root).",
-                false,
-            )
-            .string(
-                "tracePath",
-                "Playwright trace zip output path (within an allowed root).",
-                false,
-            )
-            .boolean("collectConsole", "Collect console messages.", true)
-            .boolean("collectNetwork", "Collect finished network requests.", true)
-            .boolean(
-                "fullPage",
-                "Capture the full scrollable page for screenshots.",
-                false,
-            )
-            .enumerated(
-                "waitUntil",
-                "Navigation wait condition.",
-                &["load", "domcontentloaded", "networkidle", "commit"],
-                false,
-            )
-            .integer("waitMs", "Extra wait after navigation in ms.", false)
-            .integer(
-                "timeoutMs",
-                "Navigation timeout in ms (default 30000).",
-                false,
-            )
-            .integer(
-                "timeoutSecs",
-                "Overall process timeout override in seconds.",
-                false,
-            )
-            .build()
-    }
-    fn annotations(&self) -> Option<ToolAnnotations> {
-        Some(ToolAnnotations {
-            open_world_hint: Some(true),
-            ..Default::default()
-        })
-    }
-    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
-        let a = Args::new(&args)?;
-        let url = a.str("url")?.to_string();
-        let browser = a.str_or("browser", "chromium")?.to_string();
-        let mut cfg = json!({
-            "url": url,
-            "browser": browser,
-            "collectConsole": a.bool_or("collectConsole", true)?,
-            "collectNetwork": a.bool_or("collectNetwork", true)?,
-            "fullPage": a.bool_or("fullPage", false)?,
-            "waitUntil": a.str_or("waitUntil", "load")?,
-            "waitMs": a.u64_or("waitMs", 0)?,
-            "timeoutMs": a.u64_or("timeoutMs", 30000)?,
-        });
-        // Resolve output paths against policy before handing them to the script.
-        if let Some(p) = a.opt_str("screenshotPath")? {
-            cfg["screenshotPath"] = json!(ctx.resolve_path(p)?.display().to_string());
-        }
-        if let Some(p) = a.opt_str("pdfPath")? {
-            cfg["pdfPath"] = json!(ctx.resolve_path(p)?.display().to_string());
-        }
-        if let Some(p) = a.opt_str("tracePath")? {
-            cfg["tracePath"] = json!(ctx.resolve_path(p)?.display().to_string());
-        }
-        run_driver(ctx, cfg, a.opt_u64("timeoutSecs")?).await
-    }
+/// A file the browser writes: it goes to a sibling first and is moved into
+/// place by the server, under the file policy.
+struct Output {
+    dest: CheckedPath,
+    partial: CheckedPath,
 }
 
-/// Convenience screenshot tool.
-struct BrowserScreenshot;
+fn output(ctx: &ToolContext, input: &str, overwrite: bool) -> Result<Output> {
+    let dest = ctx.write_path(input)?;
+    if !overwrite && ctx.fs().try_metadata(&dest)?.is_some() {
+        return Err(ToolError::invalid(format!(
+            "'{}' exists; pass overwrite to replace it",
+            dest.display()
+        )));
+    }
+    let not_a_file = || ToolError::invalid(format!("'{input}' does not name a file"));
+    let name = dest.file_name().ok_or_else(not_a_file)?;
+    let parent = ctx.fs().parent(&dest).ok_or_else(not_a_file)?;
+    let partial = ctx.fs().child(
+        &parent,
+        &format!(".{name}.{}.part", uuid::Uuid::new_v4().simple()),
+        Access::Write,
+    )?;
+    Ok(Output { dest, partial })
+}
 
-#[async_trait]
-impl Tool for BrowserScreenshot {
-    fn name(&self) -> &str {
-        "browser.screenshot"
+/// Run the driver for `a`, with the extra settings in `config`.
+async fn drive(
+    ctx: &ToolContext,
+    a: &Args<'_>,
+    mut config: Value,
+    outputs: &[&Output],
+) -> Result<(Value, u64)> {
+    let net = ctx.net()?;
+    let url = a.str("url")?;
+    // A clear answer for the page itself; the proxy covers the rest.
+    let vetted = net.vet_url(url, &["http", "https"]).await?;
+    let proxy = net.proxy().await?;
+    let timeout = ctx.timeout(a.opt_u64("timeoutSecs")?);
+    let navigation = timeout.saturating_sub(std::time::Duration::from_secs(5));
+    let writable: Vec<String> = ctx
+        .policy()
+        .paths()
+        .roots()
+        .iter()
+        .map(|r| r.path().display().to_string())
+        .collect();
+    config["url"] = json!(vetted.url.as_str());
+    config["proxy"] = json!(proxy.url());
+    config["waitUntil"] = json!(a.opt_enum("waitUntil", &WAIT_UNTIL)?.unwrap_or("load"));
+    config["fullPage"] = json!(a.bool_or("fullPage", false)?);
+    config["timeoutMs"] =
+        json!(u64::try_from(navigation.as_millis().max(1000)).unwrap_or(u64::MAX));
+    config["writable"] = json!(writable);
+    let cmd = Command::typed("node")
+        .arg("-e")
+        .arg(DRIVER)
+        .arg(config.to_string())
+        .pass_env("NODE_PATH")
+        .pass_env("PLAYWRIGHT_BROWSERS_PATH")
+        .pass_env("CHROME_PATH")
+        .timeout(timeout);
+    let ran = ctx.run(cmd).await;
+    let refused = proxy.refused();
+    drop(proxy);
+    let finished = ran.and_then(|out| match out.code {
+        Some(0) => serde_json::from_str::<Value>(&out.stdout.text).map_err(|e| {
+            ToolError::Execution(format!("the browser driver sent an unreadable result: {e}"))
+        }),
+        Some(NO_PLAYWRIGHT) => Err(ToolError::ProgramNotFound(format!(
+            "Playwright is not installed where the server looks for it ({}). The operator can \
+             install it with: npm install -g playwright && npx playwright install chromium",
+            clip(out.stderr.text.trim(), 600)
+        ))),
+        Some(NO_BROWSER) => Err(ToolError::ProgramNotFound(format!(
+            "Playwright found no browser to start ({}). The operator can install one with: npx \
+             playwright install chromium, or point CHROME_PATH at a Chrome or Chromium binary",
+            clip(out.stderr.text.trim(), 600)
+        ))),
+        _ => Err(ToolError::Execution(format!(
+            "the browser driver failed: {}",
+            clip(out.stderr.text.trim(), 1000)
+        ))),
+    });
+    let result = finished.and_then(|result| match result.get("error").and_then(Value::as_str) {
+        Some(error) if refused > 0 => Err(ToolError::NetworkNotAllowed(format!(
+            "the page could not be loaded and {refused} connection(s) were refused by the \
+             network policy ({})",
+            clip(error, 300)
+        ))),
+        Some(error) => Err(ToolError::Execution(format!(
+            "the page could not be loaded: {}",
+            clip(error, 500)
+        ))),
+        None => Ok(result),
+    });
+    let result = match result {
+        Ok(result) => result,
+        Err(e) => {
+            for o in outputs {
+                let _ = ctx.fs().remove_file(&o.partial);
+            }
+            return Err(e);
+        }
+    };
+    let overwrite = a.bool_or("overwrite", false)?;
+    for o in outputs {
+        ctx.fs().rename(&o.partial, &o.dest, overwrite)?;
     }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "Capture a screenshot of a URL to a file with Playwright. Requires Node.js + Playwright."
-    }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new()
-            .string("url", "URL to open.", true)
-            .string(
-                "outputPath",
-                "Screenshot output path (within an allowed root).",
-                true,
-            )
-            .enumerated(
-                "browser",
-                "Browser engine.",
-                &["chromium", "firefox", "webkit"],
-                false,
-            )
-            .boolean("fullPage", "Capture the full scrollable page.", false)
-            .integer("timeoutSecs", "Process timeout override.", false)
-            .build()
-    }
-    fn annotations(&self) -> Option<ToolAnnotations> {
-        Some(ToolAnnotations {
-            open_world_hint: Some(true),
-            ..Default::default()
-        })
-    }
-    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
-        let a = Args::new(&args)?;
-        let url = a.str("url")?.to_string();
-        let out = ctx.resolve_path(a.str("outputPath")?)?;
-        let cfg = json!({
-            "url": url,
-            "browser": a.str_or("browser", "chromium")?,
-            "screenshotPath": out.display().to_string(),
-            "fullPage": a.bool_or("fullPage", false)?,
-            "collectConsole": false,
-            "collectNetwork": false,
-            "waitUntil": "load",
-            "timeoutMs": 30000,
-        });
-        run_driver(ctx, cfg, a.opt_u64("timeoutSecs")?).await
-    }
+    let blocked = refused + result.get("blocked").and_then(Value::as_u64).unwrap_or(0);
+    Ok((result, blocked))
+}
+
+fn text_field(result: &Value, key: &str) -> String {
+    result
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+async fn screenshot(ctx: &ToolContext, args: Value) -> Result<ToolOutput> {
+    let a = Args::new(&args)?;
+    let shot = output(ctx, a.str("outputPath")?, a.bool_or("overwrite", false)?)?;
+    let config = json!({"screenshot": shot.partial.display()});
+    let (result, blocked) = drive(ctx, &a, config, &[&shot]).await?;
+    Ok(ToolOutput::json(json!({
+        "path": shot.dest.display(),
+        "status": result.get("status").cloned().unwrap_or(Value::Null),
+        "finalUrl": text_field(&result, "finalUrl"),
+        "title": text_field(&result, "title"),
+        "blockedRequests": blocked,
+    })))
+}
+
+async fn capture(ctx: &ToolContext, args: Value) -> Result<ToolOutput> {
+    let a = Args::new(&args)?;
+    let overwrite = a.bool_or("overwrite", false)?;
+    let shot = match a.opt_str("screenshotPath")? {
+        Some(p) => Some(output(ctx, p, overwrite)?),
+        None => None,
+    };
+    let pdf = match a.opt_str("pdfPath")? {
+        Some(p) => Some(output(ctx, p, overwrite)?),
+        None => None,
+    };
+    let config = json!({
+        "text": true,
+        "maxText": MAX_TEXT.min(ctx.max_output_bytes()),
+        "waitMs": a.u64_or("waitMs", 0)?.min(30_000),
+        "collectConsole": a.bool_or("collectConsole", false)?,
+        "collectNetwork": a.bool_or("collectNetwork", false)?,
+        "screenshot": shot.as_ref().map(|o| o.partial.display()),
+        "pdf": pdf.as_ref().map(|o| o.partial.display()),
+    });
+    let outputs: Vec<&Output> = shot.iter().chain(pdf.iter()).collect();
+    let (result, blocked) = drive(ctx, &a, config, &outputs).await?;
+    let list = |key: &str| result.get(key).cloned().unwrap_or_else(|| json!([]));
+    Ok(ToolOutput::json(json!({
+        "status": result.get("status").cloned().unwrap_or(Value::Null),
+        "finalUrl": text_field(&result, "finalUrl"),
+        "title": text_field(&result, "title"),
+        "text": text_field(&result, "text"),
+        "textTruncated": result.get("textTruncated").and_then(Value::as_bool).unwrap_or(false),
+        "blockedRequests": blocked,
+        "console": list("console"),
+        "requests": list("requests"),
+        "screenshotPath": shot.map(|o| o.dest.display()),
+        "pdfPath": pdf.map(|o| o.dest.display()),
+    })))
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use nebula_mcp_core::config::SecurityConfig;
-    use nebula_mcp_core::security::EffectivePolicy;
-    use nebula_mcp_core::Metrics;
-    use tokio_util::sync::CancellationToken;
-
-    fn ctx(network: bool) -> ToolContext {
-        let base = SecurityConfig {
-            allowed_paths: vec!["/**".into()],
-            allowed_commands: vec!["node".into()],
-            allow_network: network,
-            default_timeout_secs: 10,
-            max_runtime_secs: 60,
-            max_output_bytes: 1 << 20,
-            ..Default::default()
-        };
-        let policy = EffectivePolicy::build("browser.capture", &base, None).unwrap();
-        ToolContext {
-            policy: Arc::new(policy),
-            working_dir: std::env::temp_dir(),
-            cancel: CancellationToken::new(),
-            metrics: Metrics::new(),
-            config: Arc::new(Default::default()),
-            request_id: "r".into(),
-            progress: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn network_gate_blocks_capture() {
-        let err = BrowserCapture
-            .call(&ctx(false), json!({"url": "https://example.com"}))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, ToolError::PermissionDenied(_)));
-    }
-
-    #[tokio::test]
-    async fn missing_node_is_reported() {
-        // With node allowlisted but (likely) absent, we get a ToolNotFound.
-        let c = ctx(true);
-        if crate::common::exec::program_available("node") {
-            return; // node present; skip negative assertion
-        }
-        let err = BrowserScreenshot
-            .call(
-                &c,
-                json!({"url": "https://example.com", "outputPath": "/tmp/s.png"}),
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(err, ToolError::ToolNotFound(_)));
-    }
-}
+#[path = "browser_tests.rs"]
+mod tests;

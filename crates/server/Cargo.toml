@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Nebula MCP server: a production, general-purpose autonomous software-engineering backend exposed over the Model Context Protocol (stdio and remote HTTP)."
+description = "Nebula MCP: a Model Context Protocol server that gives an AI agent policy-checked control of a machine over stdio or HTTP."
 default-run = "nebula-mcp"
 
 [lib]
@@ -19,35 +19,33 @@ path = "src/main.rs"
 
 [features]
 default = []
-# Forwards to nebula-mcp-core's OpenTelemetry export support.
+# Export traces via OTLP/gRPC when `logging.otel_endpoint` is set.
 otel = ["nebula-mcp-core/otel"]
 
 [dependencies]
-nebula-mcp-protocol = { path = "../protocol" }
 nebula-mcp-core = { path = "../core" }
 nebula-mcp-tools = { path = "../tools" }
 
+rmcp = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
-serde = { workspace = true }
+futures = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-anyhow = { workspace = true }
-clap = { version = "4.5", features = ["derive", "env"] }
-dashmap = { workspace = true }
+clap = { workspace = true }
+axum = { version = "0.8", default-features = false, features = ["http1", "http2", "tokio"] }
+hyper = { workspace = true, features = ["server"] }
+hyper-util = { workspace = true, features = ["server", "server-auto", "server-graceful", "http1", "http2"] }
+http-body = "1"
+tower = { version = "0.5", features = ["util"] }
+sha2 = { workspace = true }
+hex = { workspace = true }
+url = { workspace = true }
 uuid = { workspace = true }
-walkdir = { workspace = true }
-base64 = "0.22"
-notify = { workspace = true }
-notify-debouncer-mini = { workspace = true }
-
-# Remote HTTP (MCP Streamable HTTP) transport.
-axum = { version = "0.7", features = ["json", "tokio", "http1"] }
-async-stream = "0.3"
-futures = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-tokio = { workspace = true }
-which = { workspace = true }
-reqwest = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

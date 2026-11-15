@@ -1,237 +1,300 @@
-//! Scheduler tools: run allowlisted commands after a delay or on an interval,
-//! and poll their captured results. Cross-platform. Scheduled commands run
-//! under the same permission policy as the scheduling call.
+//! Scheduler tools: run an allowed program later, or repeatedly.
+//!
+//! A job is a deferred `terminal_run` call. It is checked against the policy
+//! when it is scheduled and again, through the dispatcher, each time it
+//! fires, so tightening the configuration stops jobs that were scheduled
+//! under a looser one.
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use async_trait::async_trait;
-use nebula_mcp_core::{Result, Tool, ToolContext, ToolError};
-use nebula_mcp_protocol::mcp::ToolAnnotations;
-use nebula_mcp_protocol::CallToolResult;
-use serde_json::{json, Value};
+use nebula_mcp_core::args::Args;
+use nebula_mcp_core::schema::ObjectSchema;
+use nebula_mcp_core::{Category, Effects, Result, Tool, ToolContext, ToolError, ToolOutput};
+use serde_json::{json, Map, Value};
 
-use crate::common::output::json_value_result;
-use crate::common::scheduler::{JobEnv, SchedulerManager};
-use crate::common::{Args, ObjectSchema};
-use crate::ToolServices;
+use crate::common::{rfc3339, spec, tool, SpecExt};
+use crate::jobs::{JobInfo, Jobs, Schedule, RUN_TOOL};
 
-const CATEGORY: &str = "scheduler";
+/// Longest delay or interval accepted: 30 days.
+const MAX_SECS: i64 = 30 * 24 * 3600;
 
-/// Build scheduler tools.
-pub fn tools(services: &ToolServices) -> Vec<Arc<dyn Tool>> {
+fn job_schema() -> Value {
+    ObjectSchema::open()
+        .string("jobId", "Job id.", true)
+        .string("program", "Program the job runs.", true)
+        .string_enum(
+            "kind",
+            "Whether it runs once or repeats.",
+            &["once", "repeating"],
+            true,
+        )
+        .string_enum(
+            "state",
+            "Where the job is in its life.",
+            &["waiting", "running", "finished", "cancelled"],
+            true,
+        )
+        .integer("runs", "Times it has run.", true)
+        .integer("ageSecs", "Seconds since it was scheduled.", true)
+        .build()
+}
+
+fn job_json(info: &JobInfo) -> Value {
+    json!({
+        "jobId": info.id,
+        "program": info.program,
+        "kind": info.kind,
+        "state": info.state,
+        "runs": info.runs,
+        "ageSecs": info.age.as_secs(),
+    })
+}
+
+fn command_schema() -> ObjectSchema {
+    ObjectSchema::new()
+        .string(
+            "program",
+            "Program to run, as for terminal_run: it must be allowed by the operator.",
+            true,
+        )
+        .string_array_max(
+            "args",
+            "Arguments, passed verbatim as separate strings (no shell).",
+            1000,
+            false,
+        )
+        .string(
+            "cwd",
+            "Directory to run in, inside an allowed directory.",
+            false,
+        )
+        .integer_min(
+            "timeoutSecs",
+            "Seconds each run may take before it is stopped.",
+            1,
+            false,
+        )
+}
+
+/// The `scheduler` tools.
+pub(crate) fn tools(jobs: &Arc<Jobs>) -> Vec<Arc<dyn Tool>> {
+    let c = Category::Scheduler;
+    let (after, every, list, results, cancel) = (
+        jobs.clone(),
+        jobs.clone(),
+        jobs.clone(),
+        jobs.clone(),
+        jobs.clone(),
+    );
+    // Scheduling changes nothing by itself, but what it schedules is
+    // arbitrary execution, and clients should treat it that way.
+    let scheduling = Effects::writes().overwrites().open_world();
     vec![
-        Arc::new(ScheduleAfter {
-            mgr: services.scheduler.clone(),
-        }),
-        Arc::new(ScheduleEvery {
-            mgr: services.scheduler.clone(),
-        }),
-        Arc::new(ScheduleList {
-            mgr: services.scheduler.clone(),
-        }),
-        Arc::new(ScheduleResults {
-            mgr: services.scheduler.clone(),
-        }),
-        Arc::new(ScheduleCancel {
-            mgr: services.scheduler.clone(),
-        }),
+        tool(
+            spec(
+                "scheduler_after",
+                c,
+                "Run later",
+                "Schedule an allowed program to run once after a delay. The job belongs to this \
+                 client and runs as a terminal_run call, under the server's policy at that \
+                 time. Read its output with scheduler_results.",
+                command_schema()
+                    .integer_range(
+                        "delaySecs",
+                        "Seconds to wait before running.",
+                        0,
+                        MAX_SECS,
+                        true,
+                    )
+                    .build(),
+                scheduling,
+            )
+            .returns(job_schema()),
+            move |ctx, args| {
+                let jobs = after.clone();
+                Box::pin(async move { schedule(ctx, &jobs, args, false).await })
+            },
+        ),
+        tool(
+            spec(
+                "scheduler_every",
+                c,
+                "Run repeatedly",
+                "Schedule an allowed program to run at a fixed interval until it is cancelled, \
+                 its run limit is reached or this client goes away. Each run is a terminal_run \
+                 call under the server's policy at that time.",
+                command_schema()
+                    .integer_range("intervalSecs", "Seconds between runs.", 5, MAX_SECS, true)
+                    .integer_range(
+                        "delaySecs",
+                        "Seconds before the first run (default 0).",
+                        0,
+                        MAX_SECS,
+                        false,
+                    )
+                    .integer_min("maxRuns", "Stop after this many runs.", 1, false)
+                    .build(),
+                scheduling,
+            )
+            .returns(job_schema()),
+            move |ctx, args| {
+                let jobs = every.clone();
+                Box::pin(async move { schedule(ctx, &jobs, args, true).await })
+            },
+        ),
+        tool(
+            spec(
+                "scheduler_list",
+                c,
+                "List jobs",
+                "List the jobs this client has scheduled, including finished ones from the last \
+                 hour.",
+                ObjectSchema::new().build(),
+                Effects::read_only(),
+            )
+            .returns(
+                ObjectSchema::open()
+                    .prop(
+                        "jobs",
+                        json!({
+                            "type": "array",
+                            "description": "Jobs, oldest first.",
+                            "items": job_schema(),
+                        }),
+                        true,
+                    )
+                    .build(),
+            ),
+            move |ctx, _args| {
+                let jobs = list.clone();
+                Box::pin(async move {
+                    let all: Vec<Value> = jobs.list(ctx).iter().map(job_json).collect();
+                    Ok(ToolOutput::json(json!({"jobs": all})))
+                })
+            },
+        ),
+        tool(
+            spec(
+                "scheduler_results",
+                c,
+                "Job results",
+                "Show the output of a job's most recent runs (the last 10 are kept, each cut to \
+                 a few thousand characters).",
+                ObjectSchema::new()
+                    .string(
+                        "jobId",
+                        "Job id from scheduler_after or scheduler_every.",
+                        true,
+                    )
+                    .build(),
+                Effects::read_only(),
+            ),
+            move |ctx, args| {
+                let jobs = results.clone();
+                Box::pin(async move { show_results(ctx, &jobs, args) })
+            },
+        ),
+        tool(
+            spec(
+                "scheduler_cancel",
+                c,
+                "Cancel job",
+                "Cancel a job. A run in progress is stopped together with everything it started.",
+                ObjectSchema::new()
+                    .string(
+                        "jobId",
+                        "Job id from scheduler_after or scheduler_every.",
+                        true,
+                    )
+                    .build(),
+                Effects::writes().idempotent(true),
+            )
+            .returns(job_schema()),
+            move |ctx, args| {
+                let jobs = cancel.clone();
+                Box::pin(async move {
+                    let a = Args::new(&args)?;
+                    let info = jobs.cancel(ctx, a.str("jobId")?)?;
+                    Ok(ToolOutput::json(job_json(&info)))
+                })
+            },
+        ),
     ]
 }
 
-fn schedule_schema(interval: bool) -> Value {
-    let s = ObjectSchema::new()
-        .string("program", "Executable to run (must be allowlisted).", true)
-        .string_array("args", "Arguments passed verbatim.", false);
-    if interval {
-        s.integer("intervalSecs", "Seconds between runs.", true)
-            .integer(
-                "delaySecs",
-                "Initial delay before the first run (default 0).",
-                false,
-            )
-            .build()
-    } else {
-        s.integer("delaySecs", "Delay before running, in seconds.", true)
-            .build()
-    }
-}
+async fn schedule(
+    ctx: &ToolContext,
+    jobs: &Arc<Jobs>,
+    args: Value,
+    repeating: bool,
+) -> Result<ToolOutput> {
+    let a = Args::new(&args)?;
+    let program = a.str("program")?.to_string();
 
-/// Run a command once after a delay.
-struct ScheduleAfter {
-    mgr: Arc<SchedulerManager>,
-}
+    // Refuse now what would be refused when the job fires.
+    let exposed = ctx
+        .config()
+        .is_tool_enabled(Category::Terminal.as_str(), RUN_TOOL);
+    if !exposed {
+        return Err(ToolError::denied(format!(
+            "scheduled jobs run through {RUN_TOOL}, which is not enabled on this server; the \
+             operator needs the terminal category in [server] categories"
+        )));
+    }
+    ctx.policy()
+        .commands()
+        .authorize(&program, ctx.working_dir(), ctx.policy().paths())?;
 
-#[async_trait]
-impl Tool for ScheduleAfter {
-    fn name(&self) -> &str {
-        "scheduler.after"
-    }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "Schedule an allowlisted command to run once after a delay. Returns a job id; poll with scheduler.results."
-    }
-    fn input_schema(&self) -> Value {
-        schedule_schema(false)
-    }
-    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
-        let a = Args::new(&args)?;
-        let program = a.str("program")?.to_string();
-        ctx.policy.check_command(&program)?;
-        let cmd_args = a.opt_str_array("args")?;
-        let delay = a
-            .opt_u64("delaySecs")?
-            .ok_or_else(|| ToolError::InvalidArguments("missing 'delaySecs'".into()))?;
-        let id = self
-            .mgr
-            .schedule(JobEnv::from_context(ctx), program, cmd_args, delay, None);
-        Ok(json_value_result(json!({ "jobId": id })))
-    }
-}
-
-/// Run a command repeatedly on an interval.
-struct ScheduleEvery {
-    mgr: Arc<SchedulerManager>,
-}
-
-#[async_trait]
-impl Tool for ScheduleEvery {
-    fn name(&self) -> &str {
-        "scheduler.every"
-    }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "Schedule an allowlisted command to run repeatedly on an interval. Returns a job id; cancel with scheduler.cancel."
-    }
-    fn input_schema(&self) -> Value {
-        schedule_schema(true)
-    }
-    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
-        let a = Args::new(&args)?;
-        let program = a.str("program")?.to_string();
-        ctx.policy.check_command(&program)?;
-        let cmd_args = a.opt_str_array("args")?;
-        let interval = a
-            .opt_u64("intervalSecs")?
-            .ok_or_else(|| ToolError::InvalidArguments("missing 'intervalSecs'".into()))?;
-        let delay = a.u64_or("delaySecs", 0)?;
-        let id = self.mgr.schedule(
-            JobEnv::from_context(ctx),
-            program,
-            cmd_args,
-            delay,
-            Some(interval.max(1)),
-        );
-        Ok(json_value_result(json!({ "jobId": id })))
-    }
-}
-
-/// List scheduled jobs.
-struct ScheduleList {
-    mgr: Arc<SchedulerManager>,
-}
-
-#[async_trait]
-impl Tool for ScheduleList {
-    fn name(&self) -> &str {
-        "scheduler.list"
-    }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "List scheduled jobs and their run counts."
-    }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new().build()
-    }
-    fn annotations(&self) -> Option<ToolAnnotations> {
-        Some(ToolAnnotations {
-            read_only_hint: Some(true),
-            ..Default::default()
-        })
-    }
-    async fn call(&self, _ctx: &ToolContext, _args: Value) -> Result<CallToolResult> {
-        Ok(json_value_result(json!({ "jobs": self.mgr.list() })))
-    }
-}
-
-/// Fetch a job's captured results.
-struct ScheduleResults {
-    mgr: Arc<SchedulerManager>,
-}
-
-#[async_trait]
-impl Tool for ScheduleResults {
-    fn name(&self) -> &str {
-        "scheduler.results"
-    }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "Fetch the captured results (stdout/stderr/exit) of a scheduled job's recent runs."
-    }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new()
-            .string("jobId", "Job id from scheduler.after/every.", true)
-            .build()
-    }
-    fn annotations(&self) -> Option<ToolAnnotations> {
-        Some(ToolAnnotations {
-            read_only_hint: Some(true),
-            ..Default::default()
-        })
-    }
-    async fn call(&self, _ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
-        let a = Args::new(&args)?;
-        let id = a.str("jobId")?;
-        match self.mgr.results(id) {
-            Some((info, results)) => Ok(json_value_result(json!({
-                "job": info,
-                "results": results,
-            }))),
-            None => Err(ToolError::InvalidArguments(format!("no such job '{id}'"))),
+    // The arguments of the terminal_run call the job will make.
+    let mut call = Map::new();
+    call.insert("program".into(), json!(program));
+    for key in ["args", "cwd", "timeoutSecs"] {
+        if let Some(value) = a.opt_value(key) {
+            call.insert(key.into(), value.clone());
         }
     }
+
+    let delay = Duration::from_secs(a.u64_or("delaySecs", 0)?);
+    let when = if repeating {
+        Schedule::Every {
+            delay,
+            interval: Duration::from_secs(a.u64("intervalSecs")?),
+            max_runs: a.opt_u64("maxRuns")?,
+        }
+    } else {
+        Schedule::Once { delay }
+    };
+    let id = jobs.schedule(ctx, program, Value::Object(call), when)?;
+    let (info, _) = jobs.results(ctx, &id)?;
+    Ok(ToolOutput::json(job_json(&info)))
 }
 
-/// Cancel a scheduled job.
-struct ScheduleCancel {
-    mgr: Arc<SchedulerManager>,
+fn show_results(ctx: &ToolContext, jobs: &Jobs, args: Value) -> Result<ToolOutput> {
+    let a = Args::new(&args)?;
+    let (info, runs) = jobs.results(ctx, a.str("jobId")?)?;
+    let mut text = String::new();
+    let first = info.runs.saturating_sub(runs.len() as u64) + 1;
+    for (i, run) in runs.iter().enumerate() {
+        text.push_str(&format!(
+            "--- run {} at {} ({:.1}s, {}) ---\n{}\n",
+            first + i as u64,
+            rfc3339(run.started).unwrap_or_else(|| "?".to_string()),
+            run.duration.as_secs_f64(),
+            if run.ok { "ran" } else { "refused or failed" },
+            run.output.trim_end()
+        ));
+    }
+    text.push_str(&format!(
+        "[scheduler_results: job {} is {}; {} runs so far, {} shown]",
+        info.id,
+        info.state,
+        info.runs,
+        runs.len()
+    ));
+    Ok(ToolOutput::text(text))
 }
 
-#[async_trait]
-impl Tool for ScheduleCancel {
-    fn name(&self) -> &str {
-        "scheduler.cancel"
-    }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "Cancel a scheduled job (aborts any in-progress run)."
-    }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new()
-            .string("jobId", "Job id to cancel.", true)
-            .build()
-    }
-    fn annotations(&self) -> Option<ToolAnnotations> {
-        Some(ToolAnnotations {
-            destructive_hint: Some(true),
-            ..Default::default()
-        })
-    }
-    async fn call(&self, _ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
-        let a = Args::new(&args)?;
-        let id = a.str("jobId")?;
-        let cancelled = self.mgr.cancel(id);
-        Ok(json_value_result(
-            json!({ "jobId": id, "cancelled": cancelled }),
-        ))
-    }
-}
+#[cfg(test)]
+#[path = "scheduler_tests.rs"]
+mod tests;

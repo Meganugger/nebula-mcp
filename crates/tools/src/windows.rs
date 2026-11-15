@@ -1,620 +1,646 @@
-//! Windows subsystem tools: services, registry, event log, performance
-//! counters, scheduled tasks, environment variables, firewall and network
-//! adapters. Implemented as typed wrappers over `sc.exe`, `reg.exe`,
-//! `schtasks.exe` and PowerShell/CIM. Windows-only.
+//! Windows administration tools: services, registry, event log, performance
+//! counters, scheduled tasks, persistent environment variables, firewall
+//! rules and network adapters.
+//!
+//! Each tool runs a constant PowerShell script (or `schtasks` with fixed
+//! options). What the caller sends reaches the script as environment
+//! variables and is used as data, never as script text. Operations that act
+//! on the whole machine need the elevated gate, removals the destructive
+//! one. Creating services is not offered: a service is a program run as
+//! SYSTEM.
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use nebula_mcp_core::{Result, Tool, ToolContext, ToolError};
-use nebula_mcp_protocol::mcp::ToolAnnotations;
-use nebula_mcp_protocol::CallToolResult;
+use nebula_mcp_core::args::Args;
+use nebula_mcp_core::process::{Command, Exec, Output};
+use nebula_mcp_core::schema::ObjectSchema;
+use nebula_mcp_core::{
+    Category, Effects, Gate, Platforms, Result, Tool, ToolContext, ToolError, ToolOutput,
+};
 use serde_json::Value;
 
-use crate::common::exec::{run_checked, CommandSpec};
-use crate::common::output::exec_result;
-use crate::common::platform::{ensure_windows, run_powershell, POWERSHELL};
-use crate::common::{Args, ObjectSchema};
+use crate::common::{clip, handler, spec, tool, SpecExt};
+use crate::powershell::{platform_shell, script, SHELLS, STOP_ON_ERROR};
 
-const CATEGORY: &str = "windows";
+const READ: Effects = Effects::read_only().exec(SHELLS);
 
-/// Build Windows subsystem tools.
-pub fn tools() -> Vec<Arc<dyn Tool>> {
+/// The `windows` tools.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn tools() -> Vec<Arc<dyn Tool>> {
+    let c = Category::Windows;
+    let win = |t: nebula_mcp_core::ToolSpec| t.on(Platforms::WINDOWS);
+    let changes = Effects::writes()
+        .overwrites()
+        .destructive(Gate::Sometimes)
+        .elevated(Gate::Sometimes)
+        .exec(SHELLS);
     vec![
-        Arc::new(WinService),
-        Arc::new(WinRegistry),
-        Arc::new(WinEventLog),
-        Arc::new(WinPerfCounters),
-        Arc::new(WinScheduledTasks),
-        Arc::new(WinEnv),
-        Arc::new(WinFirewall),
-        Arc::new(WinNetworkAdapters),
+        tool(
+            win(spec(
+                "windows_service",
+                c,
+                "Windows services",
+                "Query, start, stop or restart a Windows service; without `name`, list all \
+                 services. Starting, stopping and restarting are elevated; stopping and \
+                 restarting are destructive too. Services cannot be created or reconfigured.",
+                ObjectSchema::new()
+                    .string("name", "Service name (not the display name).", false)
+                    .string_enum(
+                        "action",
+                        "What to do (default query).",
+                        &["query", "start", "stop", "restart"],
+                        false,
+                    )
+                    .build(),
+                changes,
+            )),
+            handler!(service),
+        ),
+        tool(
+            win(spec(
+                "windows_registry",
+                c,
+                "Windows registry",
+                "Read a registry key or value, set a value, or delete a value or key. Setting \
+                 and deleting outside HKEY_CURRENT_USER are elevated; deleting is destructive.",
+                ObjectSchema::new()
+                    .string_enum("action", "What to do.", &["query", "set", "delete"], true)
+                    .string(
+                        "key",
+                        "Key path starting with a hive, for example HKCU\\Software\\App.",
+                        true,
+                    )
+                    .string(
+                        "value",
+                        "Value name. Omit to read the whole key, or to delete the key.",
+                        false,
+                    )
+                    .string_enum(
+                        "type",
+                        "Type for set (default REG_SZ).",
+                        &[
+                            "REG_SZ",
+                            "REG_EXPAND_SZ",
+                            "REG_DWORD",
+                            "REG_QWORD",
+                            "REG_MULTI_SZ",
+                            "REG_BINARY",
+                        ],
+                        false,
+                    )
+                    .string(
+                        "data",
+                        "Data for set: text, a number, lines for REG_MULTI_SZ, hex for REG_BINARY.",
+                        false,
+                    )
+                    .build(),
+                changes,
+            )),
+            handler!(registry),
+        ),
+        tool(
+            win(spec(
+                "windows_event_log",
+                c,
+                "Windows event log",
+                "The most recent entries of a Windows event log as JSON: time, id, level, \
+                 provider and message.",
+                ObjectSchema::new()
+                    .string(
+                        "logName",
+                        "Log to read, for example Application or System.",
+                        true,
+                    )
+                    .integer_range(
+                        "maxEvents",
+                        "Entries to return (default 20).",
+                        1,
+                        500,
+                        false,
+                    )
+                    .string_enum(
+                        "level",
+                        "Only this level.",
+                        &["Critical", "Error", "Warning", "Information"],
+                        false,
+                    )
+                    .build(),
+                READ,
+            )),
+            handler!(event_log),
+        ),
+        tool(
+            win(spec(
+                "windows_perf_counters",
+                c,
+                "Performance counters",
+                "Sample Windows performance counters and return the values as JSON.",
+                ObjectSchema::new()
+                    .string_array_max(
+                        "counters",
+                        "Counter paths, for example \\Processor(_Total)\\% Processor Time.",
+                        20,
+                        true,
+                    )
+                    .integer_range("samples", "Samples to take (default 1).", 1, 30, false)
+                    .integer_range(
+                        "intervalSecs",
+                        "Seconds between samples (default 1).",
+                        1,
+                        10,
+                        false,
+                    )
+                    .build(),
+                READ,
+            )),
+            handler!(perf_counters),
+        ),
+        tool(
+            win(spec(
+                "windows_scheduled_tasks",
+                c,
+                "Scheduled tasks",
+                "Show scheduled tasks, or run or end one that already exists. Running and \
+                 ending are elevated, because a task can run as SYSTEM; ending is destructive. \
+                 Tasks cannot be created here.",
+                ObjectSchema::new()
+                    .string_enum(
+                        "action",
+                        "What to do (default query).",
+                        &["query", "run", "end"],
+                        false,
+                    )
+                    .string(
+                        "taskName",
+                        "Task path, for example \\Microsoft\\Windows\\Defrag\\ScheduledDefrag.",
+                        false,
+                    )
+                    .build(),
+                Effects::writes()
+                    .destructive(Gate::Sometimes)
+                    .elevated(Gate::Sometimes)
+                    .exec(Exec::Programs(&["schtasks"])),
+            )),
+            handler!(scheduled_tasks),
+        ),
+        tool(
+            win(spec(
+                "windows_env",
+                c,
+                "Persistent environment",
+                "Read, set or delete a persistent environment variable of the user or the \
+                 machine. Machine scope is elevated; deleting is destructive. Running programs \
+                 do not see a change until they restart.",
+                ObjectSchema::new()
+                    .string_enum("action", "What to do.", &["get", "set", "delete"], true)
+                    .string("name", "Variable name.", true)
+                    .string_enum(
+                        "scope",
+                        "Whose variable (default User).",
+                        &["User", "Machine"],
+                        false,
+                    )
+                    .string("value", "New value, for set.", false)
+                    .build(),
+                changes,
+            )),
+            handler!(env),
+        ),
+        tool(
+            win(spec(
+                "windows_firewall",
+                c,
+                "Firewall rules",
+                "Windows Firewall rules as JSON: name, enabled, direction, action and profile.",
+                ObjectSchema::new()
+                    .string(
+                        "nameContains",
+                        "Only rules whose display name contains this text.",
+                        false,
+                    )
+                    .integer_range("limit", "Rules to return (default 50).", 1, 500, false)
+                    .build(),
+                READ,
+            )),
+            handler!(firewall),
+        ),
+        tool(
+            win(spec(
+                "windows_network_adapters",
+                c,
+                "Network adapters",
+                "Network adapters as JSON: name, description, status, MAC address and link speed.",
+                ObjectSchema::new().build(),
+                READ,
+            )),
+            handler!(network_adapters),
+        ),
     ]
 }
 
-fn ro() -> Option<ToolAnnotations> {
-    Some(ToolAnnotations {
-        read_only_hint: Some(true),
-        ..Default::default()
-    })
+// ---------------------------------------------------------------------------
+// Checks
+// ---------------------------------------------------------------------------
+
+/// Text used as a name: no wildcards, since the cmdlets would expand them.
+fn plain(value: &str, what: &str, max: usize) -> Result<String> {
+    if value.is_empty()
+        || value.len() > max
+        || value.chars().any(|c| c.is_control() || "*?[]`".contains(c))
+    {
+        return Err(ToolError::invalid(format!(
+            "`{what}` must be a plain name without wildcards (* ? [ ]) or control characters"
+        )));
+    }
+    Ok(value.to_string())
 }
 
-async fn run_cmd(
-    ctx: &ToolContext,
-    program: &str,
-    args: Vec<String>,
-    label: &str,
-    timeout: Option<u64>,
-) -> Result<CallToolResult> {
-    let spec = CommandSpec::new(program, ctx.working_dir.clone(), ctx).args(args);
-    let result = run_checked(ctx, spec, timeout).await?;
-    Ok(exec_result(label, &result))
-}
-
-/// Windows service control via sc.exe.
-struct WinService;
-
-#[async_trait]
-impl Tool for WinService {
-    fn name(&self) -> &str {
-        "windows.service"
-    }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "Query or control a Windows service (query/start/stop/restart/create/delete/config) via \
-         sc.exe. create/delete/config require elevation; stop/restart/delete are destructive. Windows only."
-    }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new()
-            .string("name", "Service name.", true)
-            .enumerated(
-                "action",
-                "Action.",
-                &[
-                    "query", "start", "stop", "restart", "create", "delete", "config",
-                ],
-                false,
-            )
-            .string(
-                "binPath",
-                "Executable/driver path (for create/config).",
-                false,
-            )
-            .enumerated(
-                "serviceType",
-                "Service type (for create/config).",
-                &["own", "share", "kernel", "filesys"],
-                false,
-            )
-            .enumerated(
-                "startType",
-                "Start type (for create/config).",
-                &["boot", "system", "auto", "demand", "disabled"],
-                false,
-            )
-            .build()
-    }
-    fn annotations(&self) -> Option<ToolAnnotations> {
-        ro()
-    }
-    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
-        ensure_windows(self.name())?;
-        let a = Args::new(&args)?;
-        let name = a.str("name")?.to_string();
-        let action = a.str_or("action", "query")?;
-        match action {
-            "query" => {
-                run_cmd(
-                    ctx,
-                    "sc",
-                    vec!["query".into(), name.clone()],
-                    "sc query",
-                    None,
-                )
-                .await
-            }
-            "start" => {
-                run_cmd(
-                    ctx,
-                    "sc",
-                    vec!["start".into(), name.clone()],
-                    "sc start",
-                    None,
-                )
-                .await
-            }
-            "stop" => {
-                ctx.policy
-                    .ensure_destructive_allowed("windows.service stop")?;
-                run_cmd(
-                    ctx,
-                    "sc",
-                    vec!["stop".into(), name.clone()],
-                    "sc stop",
-                    None,
-                )
-                .await
-            }
-            "restart" => {
-                ctx.policy
-                    .ensure_destructive_allowed("windows.service restart")?;
-                let script = format!(
-                    "Restart-Service -Name '{}' -Force -PassThru | ConvertTo-Json",
-                    name.replace('\'', "''")
-                );
-                let r = run_powershell(ctx, POWERSHELL, &script, None).await?;
-                Ok(exec_result("Restart-Service", &r))
-            }
-            "create" => {
-                ctx.policy.ensure_elevation_allowed()?;
-                let bin = a.opt_str("binPath")?.ok_or_else(|| {
-                    ToolError::InvalidArguments("create requires 'binPath'".into())
-                })?;
-                let mut v = vec![
-                    "create".to_string(),
-                    name.clone(),
-                    "binPath=".into(),
-                    bin.into(),
-                ];
-                if let Some(t) = a.opt_str("serviceType")? {
-                    v.push("type=".into());
-                    v.push(t.into());
-                }
-                if let Some(st) = a.opt_str("startType")? {
-                    v.push("start=".into());
-                    v.push(st.into());
-                }
-                run_cmd(ctx, "sc", v, "sc create", None).await
-            }
-            "config" => {
-                ctx.policy.ensure_elevation_allowed()?;
-                let mut v = vec!["config".to_string(), name.clone()];
-                if let Some(b) = a.opt_str("binPath")? {
-                    v.push("binPath=".into());
-                    v.push(b.into());
-                }
-                if let Some(t) = a.opt_str("serviceType")? {
-                    v.push("type=".into());
-                    v.push(t.into());
-                }
-                if let Some(st) = a.opt_str("startType")? {
-                    v.push("start=".into());
-                    v.push(st.into());
-                }
-                run_cmd(ctx, "sc", v, "sc config", None).await
-            }
-            "delete" => {
-                ctx.policy.ensure_elevation_allowed()?;
-                ctx.policy
-                    .ensure_destructive_allowed("windows.service delete")?;
-                run_cmd(
-                    ctx,
-                    "sc",
-                    vec!["delete".into(), name.clone()],
-                    "sc delete",
-                    None,
-                )
-                .await
-            }
-            other => Err(ToolError::InvalidArguments(format!(
-                "unknown action '{other}'"
-            ))),
+/// A registry key: (canonical path, whether it is in the user's own hive).
+fn registry_key(key: &str) -> Result<(String, bool)> {
+    let key = plain(key, "key", 1000)?;
+    let (hive, rest) = key.split_once('\\').unwrap_or((key.as_str(), ""));
+    let hive = match hive.to_ascii_uppercase().as_str() {
+        "HKCU" | "HKEY_CURRENT_USER" => "HKEY_CURRENT_USER",
+        "HKLM" | "HKEY_LOCAL_MACHINE" => "HKEY_LOCAL_MACHINE",
+        "HKCR" | "HKEY_CLASSES_ROOT" => "HKEY_CLASSES_ROOT",
+        "HKU" | "HKEY_USERS" => "HKEY_USERS",
+        "HKCC" | "HKEY_CURRENT_CONFIG" => "HKEY_CURRENT_CONFIG",
+        _ => {
+            return Err(ToolError::invalid(
+                "`key` must start with a hive: HKCU, HKLM, HKCR, HKU or HKCC",
+            ))
         }
+    };
+    if rest.split('\\').any(|part| part == ".." || part == ".") || rest.contains('/') {
+        return Err(ToolError::invalid(
+            "`key` must be a registry path with backslashes and no '..'",
+        ));
+    }
+    let path = if rest.is_empty() {
+        hive.to_string()
+    } else {
+        format!("{hive}\\{rest}")
+    };
+    Ok((path, hive == "HKEY_CURRENT_USER"))
+}
+
+fn registry_type(name: &str) -> &'static str {
+    match name {
+        "REG_EXPAND_SZ" => "ExpandString",
+        "REG_DWORD" => "DWord",
+        "REG_QWORD" => "QWord",
+        "REG_MULTI_SZ" => "MultiString",
+        "REG_BINARY" => "Binary",
+        _ => "String",
     }
 }
 
-/// Windows registry access via reg.exe.
-struct WinRegistry;
+fn variable_name(name: &str) -> Result<String> {
+    let mut chars = name.chars();
+    let ok = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.len() <= 255
+        && chars.all(|c| c.is_ascii_alphanumeric() || "_()".contains(c));
+    if ok {
+        Ok(name.to_string())
+    } else {
+        Err(ToolError::invalid(
+            "`name` must be an environment variable name: letters, digits and '_'",
+        ))
+    }
+}
 
-#[async_trait]
-impl Tool for WinRegistry {
-    fn name(&self) -> &str {
-        "windows.registry"
+/// A scheduled-task path. It may not start with '/', where schtasks reads
+/// options.
+fn task_name(name: &str) -> Result<String> {
+    let name = plain(name, "taskName", 500)?;
+    if name.starts_with('/') || name.starts_with('-') || name.contains('"') {
+        return Err(ToolError::invalid(
+            "`taskName` must be a task path such as \\Folder\\Task",
+        ));
     }
-    fn category(&self) -> &str {
-        CATEGORY
+    Ok(name)
+}
+
+/// A fixed script with its values in the environment.
+pub(crate) fn typed(body: &str, values: &[(&str, &str)]) -> Command {
+    let mut cmd = script(platform_shell(), &format!("{STOP_ON_ERROR}{body}"));
+    for (name, value) in values {
+        cmd = cmd.env(*name, *value);
     }
-    fn description(&self) -> &str {
-        "Query, set or delete registry keys/values via reg.exe. Delete is destructive. Windows only."
+    cmd
+}
+
+pub(crate) fn failure(what: &str, out: &Output) -> ToolError {
+    let detail = if out.stderr.text.trim().is_empty() {
+        out.stdout.text.trim()
+    } else {
+        out.stderr.text.trim()
+    };
+    ToolError::Execution(format!("{what} failed: {}", clip(detail, 2000)))
+}
+
+/// Run and return what the script printed.
+pub(crate) async fn answer(ctx: &ToolContext, what: &str, cmd: Command) -> Result<ToolOutput> {
+    let out = ctx.run(cmd.timeout(ctx.timeout(None))).await?;
+    if !out.success() {
+        return Err(failure(what, &out));
     }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new()
-            .enumerated("action", "Action.", &["query", "add", "delete"], true)
-            .string("key", "Registry key path, e.g. HKLM\\SOFTWARE\\Foo.", true)
-            .string("value", "Value name (optional).", false)
-            .string(
-                "type",
-                "Value type for add (REG_SZ, REG_DWORD, ...).",
-                false,
-            )
-            .string("data", "Value data for add.", false)
-            .build()
-    }
-    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
-        ensure_windows(self.name())?;
-        let a = Args::new(&args)?;
-        let action = a.str("action")?;
-        let key = a.str("key")?.to_string();
-        match action {
-            "query" => {
-                let mut args = vec!["query".to_string(), key];
-                if let Some(v) = a.opt_str("value")? {
-                    args.push("/v".into());
-                    args.push(v.into());
-                }
-                run_cmd(ctx, "reg", args, "reg query", None).await
-            }
-            "add" => {
-                let mut args = vec!["add".to_string(), key];
-                if let Some(v) = a.opt_str("value")? {
-                    args.push("/v".into());
-                    args.push(v.into());
-                }
-                args.push("/t".into());
-                args.push(a.str_or("type", "REG_SZ")?.into());
-                args.push("/d".into());
-                args.push(a.str_or("data", "")?.into());
-                args.push("/f".into());
-                run_cmd(ctx, "reg", args, "reg add", None).await
-            }
-            "delete" => {
-                ctx.policy
-                    .ensure_destructive_allowed("windows.registry delete")?;
-                let mut args = vec!["delete".to_string(), key];
-                if let Some(v) = a.opt_str("value")? {
-                    args.push("/v".into());
-                    args.push(v.into());
-                }
-                args.push("/f".into());
-                run_cmd(ctx, "reg", args, "reg delete", None).await
-            }
-            other => Err(ToolError::InvalidArguments(format!(
-                "unknown action '{other}'"
-            ))),
+    let text = out.stdout.text.trim();
+    Ok(ToolOutput::text(if text.is_empty() { "[]" } else { text }))
+}
+
+// ---------------------------------------------------------------------------
+// Tools
+// ---------------------------------------------------------------------------
+
+const SERVICE_FIELDS: &str = "Select-Object Name,DisplayName,\
+     @{n='Status';e={$_.Status.ToString()}},@{n='StartType';e={$_.StartType.ToString()}} | \
+     ConvertTo-Json -Depth 3";
+
+async fn service(ctx: &ToolContext, args: Value) -> Result<ToolOutput> {
+    let a = Args::new(&args)?;
+    let action = a
+        .opt_enum("action", &["query", "start", "stop", "restart"])?
+        .unwrap_or("query");
+    let Some(name) = a.opt_str("name")? else {
+        if action != "query" {
+            return Err(ToolError::invalid(format!(
+                "`name` is required to {action} a service"
+            )));
         }
+        return answer(
+            ctx,
+            "listing services",
+            typed(&format!("Get-Service | {SERVICE_FIELDS}"), &[]),
+        )
+        .await;
+    };
+    let name = plain(name, "name", 256)?;
+    let verb = match action {
+        "start" => "Start-Service -Name $env:NB_NAME;",
+        "stop" => "Stop-Service -Name $env:NB_NAME -Force;",
+        "restart" => "Restart-Service -Name $env:NB_NAME -Force;",
+        _ => "",
+    };
+    if !verb.is_empty() {
+        ctx.require_elevated("controlling a Windows service")?;
     }
+    if matches!(action, "stop" | "restart") {
+        ctx.require_destructive("stopping a Windows service")?;
+    }
+    let body = format!("{verb}Get-Service -Name $env:NB_NAME | {SERVICE_FIELDS}");
+    answer(
+        ctx,
+        "the service request",
+        typed(&body, &[("NB_NAME", &name)]),
+    )
+    .await
 }
 
-/// Windows event log query via Get-WinEvent.
-struct WinEventLog;
+const REGISTRY_QUERY: &str = "$p = 'Registry::' + $env:NB_KEY;\
+     function Read-Value($item, $n) {\
+       $v = $item.GetValue($n);\
+       switch ($item.GetValueKind($n).ToString()) {\
+         'DWord' { [BitConverter]::ToUInt32([BitConverter]::GetBytes([int32]$v), 0) }\
+         'QWord' { [BitConverter]::ToUInt64([BitConverter]::GetBytes([int64]$v), 0) }\
+         default { ,$v }\
+       }\
+     }\
+     $item = Get-Item -LiteralPath $p;\
+     if ($env:NB_VALUE) {\
+       if ($item.GetValueNames() -notcontains $env:NB_VALUE) { throw \"the key has no value named $($env:NB_VALUE)\" }\
+       [pscustomobject]@{ key=$env:NB_KEY; value=$env:NB_VALUE; type=$item.GetValueKind($env:NB_VALUE).ToString(); data=(Read-Value $item $env:NB_VALUE) } | ConvertTo-Json -Depth 4\
+     } else {\
+       $values = [ordered]@{};\
+       foreach ($n in $item.GetValueNames()) { $values[$n] = Read-Value $item $n }\
+       [pscustomobject]@{ key=$env:NB_KEY; subkeys=@($item.GetSubKeyNames()); values=$values } | ConvertTo-Json -Depth 4\
+     }";
 
-#[async_trait]
-impl Tool for WinEventLog {
-    fn name(&self) -> &str {
-        "windows.event_log"
-    }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "Query a Windows event log (e.g. System, Application) and return recent events as JSON. Windows only."
-    }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new()
-            .string("logName", "Log name, e.g. System or Application.", true)
-            .integer("maxEvents", "Maximum events (default 50).", false)
-            .string(
-                "level",
-                "Optional level filter: Critical, Error, Warning, Information.",
-                false,
-            )
-            .build()
-    }
-    fn annotations(&self) -> Option<ToolAnnotations> {
-        ro()
-    }
-    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
-        ensure_windows(self.name())?;
-        let a = Args::new(&args)?;
-        let log = a.str("logName")?.replace('\'', "''");
-        let max = a.u64_or("maxEvents", 50)?;
-        let level_map = match a.opt_str("level")? {
-            Some("Critical") => ";Level=1",
-            Some("Error") => ";Level=2",
-            Some("Warning") => ";Level=3",
-            Some("Information") => ";Level=4",
-            _ => "",
-        };
-        let script = format!(
-            "Get-WinEvent -FilterHashtable @{{LogName='{log}'{level_map}}} -MaxEvents {max} \
-             | Select-Object TimeCreated,Id,LevelDisplayName,ProviderName,Message \
-             | ConvertTo-Json -Depth 4"
-        );
-        let r = run_powershell(ctx, POWERSHELL, &script, None).await?;
-        Ok(exec_result("Get-WinEvent", &r))
-    }
+const REGISTRY_SET: &str = "$p = 'Registry::' + $env:NB_KEY;\
+     if (-not (Test-Path -LiteralPath $p)) { New-Item -Path $p -Force | Out-Null }\
+     $d = $env:NB_DATA; if ($null -eq $d) { $d = '' }\
+     switch ($env:NB_TYPE) {\
+       'DWord' { $d = [uint32]$d }\
+       'QWord' { $d = [uint64]$d }\
+       'MultiString' { $d = [string[]]@($d -split \"`n\") }\
+       'Binary' { $h = $d -replace '[^0-9A-Fa-f]',''; $d = [byte[]]@(for ($i = 0; $i + 1 -lt $h.Length; $i += 2) { [Convert]::ToByte($h.Substring($i, 2), 16) }) }\
+     }\
+     New-ItemProperty -LiteralPath $p -Name $env:NB_VALUE -Value $d -PropertyType $env:NB_TYPE -Force | Out-Null;\
+     'set'";
+
+const REGISTRY_DELETE: &str = "$p = 'Registry::' + $env:NB_KEY;\
+     if ($env:NB_VALUE) { Remove-ItemProperty -LiteralPath $p -Name $env:NB_VALUE } \
+     else { Remove-Item -LiteralPath $p -Recurse }\
+     'deleted'";
+
+async fn registry(ctx: &ToolContext, args: Value) -> Result<ToolOutput> {
+    let a = Args::new(&args)?;
+    let action = a.str("action")?;
+    let (key, own_hive) = registry_key(a.str("key")?)?;
+    let value = match a.opt_str("value")? {
+        Some(v) => plain(v, "value", 500)?,
+        None => String::new(),
+    };
+    let mut values = vec![("NB_KEY", key.as_str()), ("NB_VALUE", value.as_str())];
+    let body = match action {
+        "query" => REGISTRY_QUERY,
+        "set" => {
+            if value.is_empty() {
+                return Err(ToolError::invalid("`value` is required for set"));
+            }
+            if !own_hive {
+                ctx.require_elevated("writing the registry outside HKEY_CURRENT_USER")?;
+            }
+            values.push(("NB_TYPE", registry_type(a.str_or("type", "REG_SZ")?)));
+            values.push(("NB_DATA", a.str_or("data", "")?));
+            REGISTRY_SET
+        }
+        "delete" => {
+            ctx.require_destructive("deleting from the registry")?;
+            if !own_hive {
+                ctx.require_elevated("writing the registry outside HKEY_CURRENT_USER")?;
+            }
+            if key.split('\\').count() < 3 && value.is_empty() {
+                return Err(ToolError::invalid(
+                    "refusing to delete a hive or a top-level key; name a deeper key or a value",
+                ));
+            }
+            REGISTRY_DELETE
+        }
+        other => return Err(ToolError::invalid(format!("unknown action '{other}'"))),
+    };
+    answer(ctx, "the registry request", typed(body, &values)).await
 }
 
-/// Performance counters via Get-Counter.
-struct WinPerfCounters;
+async fn event_log(ctx: &ToolContext, args: Value) -> Result<ToolOutput> {
+    const BODY: &str = "$f = @{ LogName = $env:NB_LOG };\
+         if ($env:NB_LEVEL) { $f['Level'] = [int]$env:NB_LEVEL }\
+         try {\
+           @(Get-WinEvent -FilterHashtable $f -MaxEvents ([int]$env:NB_MAX) | Select-Object \
+             @{n='time';e={$_.TimeCreated.ToString('o')}}, @{n='id';e={$_.Id}}, \
+             @{n='level';e={$_.LevelDisplayName}}, @{n='provider';e={$_.ProviderName}}, \
+             @{n='message';e={$_.Message}}) | ConvertTo-Json -Depth 3\
+         } catch { if ($_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*') { '[]' } else { throw } }";
+    let a = Args::new(&args)?;
+    let log = plain(a.str("logName")?, "logName", 256)?;
+    let max = a.u64_or("maxEvents", 20)?.clamp(1, 500).to_string();
+    let level = match a.opt_enum("level", &["Critical", "Error", "Warning", "Information"])? {
+        Some("Critical") => "1",
+        Some("Error") => "2",
+        Some("Warning") => "3",
+        Some(_) => "4",
+        None => "",
+    };
+    let values = [
+        ("NB_LOG", log.as_str()),
+        ("NB_MAX", max.as_str()),
+        ("NB_LEVEL", level),
+    ];
+    answer(ctx, "reading the event log", typed(BODY, &values)).await
+}
 
-#[async_trait]
-impl Tool for WinPerfCounters {
-    fn name(&self) -> &str {
-        "windows.perf_counters"
-    }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "Sample Windows performance counters (e.g. '\\Processor(_Total)\\% Processor Time') via Get-Counter. Windows only."
-    }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new()
-            .string_array("counters", "Counter paths to sample.", true)
-            .integer("samples", "Number of samples (default 1).", false)
-            .integer(
-                "intervalSecs",
-                "Seconds between samples (default 1).",
-                false,
-            )
-            .build()
-    }
-    fn annotations(&self) -> Option<ToolAnnotations> {
-        ro()
-    }
-    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
-        ensure_windows(self.name())?;
-        let a = Args::new(&args)?;
-        let counters = a.str_array("counters")?;
-        let list = counters
+async fn perf_counters(ctx: &ToolContext, args: Value) -> Result<ToolOutput> {
+    const BODY: &str = "$c = $env:NB_COUNTERS -split \"`n\";\
+         @(Get-Counter -Counter $c -MaxSamples ([int]$env:NB_SAMPLES) -SampleInterval ([int]$env:NB_INTERVAL) | \
+           ForEach-Object { $t = $_.Timestamp.ToString('o'); $_.CounterSamples | \
+           ForEach-Object { [pscustomobject]@{ time=$t; path=$_.Path; value=$_.CookedValue } } }) | \
+         ConvertTo-Json -Depth 3";
+    let a = Args::new(&args)?;
+    let counters = a.str_array("counters")?;
+    if counters.is_empty()
+        || counters
             .iter()
-            .map(|c| format!("'{}'", c.replace('\'', "''")))
-            .collect::<Vec<_>>()
-            .join(",");
-        let samples = a.u64_or("samples", 1)?;
-        let interval = a.u64_or("intervalSecs", 1)?;
-        let script = format!(
-            "Get-Counter -Counter {list} -MaxSamples {samples} -SampleInterval {interval} \
-             | ForEach-Object {{ $_.CounterSamples }} \
-             | Select-Object Path,CookedValue,Timestamp | ConvertTo-Json -Depth 4"
-        );
-        let r = run_powershell(ctx, POWERSHELL, &script, Some(samples * interval + 30)).await?;
-        Ok(exec_result("Get-Counter", &r))
+            .any(|c| !c.starts_with('\\') || c.len() > 300 || c.chars().any(char::is_control))
+    {
+        return Err(ToolError::invalid(
+            "`counters` must be counter paths starting with '\\', for example \
+             \\Memory\\Available MBytes",
+        ));
     }
+    let samples = a.u64_or("samples", 1)?.clamp(1, 30);
+    let interval = a.u64_or("intervalSecs", 1)?.clamp(1, 10);
+    let (joined, samples_text, interval_text) = (
+        counters.join("\n"),
+        samples.to_string(),
+        interval.to_string(),
+    );
+    let cmd = typed(
+        BODY,
+        &[
+            ("NB_COUNTERS", joined.as_str()),
+            ("NB_SAMPLES", samples_text.as_str()),
+            ("NB_INTERVAL", interval_text.as_str()),
+        ],
+    )
+    .timeout(ctx.timeout(Some(samples * interval + 30)));
+    let out = ctx.run(cmd).await?;
+    if !out.success() {
+        return Err(failure("sampling the counters", &out));
+    }
+    Ok(ToolOutput::text(out.stdout.text.trim().to_string()))
 }
 
-/// Scheduled tasks via schtasks.exe.
-struct WinScheduledTasks;
-
-#[async_trait]
-impl Tool for WinScheduledTasks {
-    fn name(&self) -> &str {
-        "windows.scheduled_tasks"
-    }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "List or control scheduled tasks (query/run/end) via schtasks.exe. Windows only."
-    }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new()
-            .enumerated("action", "Action.", &["query", "run", "end"], false)
-            .string("taskName", "Task name (required for run/end).", false)
-            .build()
-    }
-    fn annotations(&self) -> Option<ToolAnnotations> {
-        ro()
-    }
-    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
-        ensure_windows(self.name())?;
-        let a = Args::new(&args)?;
-        match a.str_or("action", "query")? {
-            "query" => {
-                run_cmd(
-                    ctx,
-                    "schtasks",
-                    vec!["/query".into(), "/fo".into(), "CSV".into()],
-                    "schtasks /query",
-                    None,
-                )
-                .await
+async fn scheduled_tasks(ctx: &ToolContext, args: Value) -> Result<ToolOutput> {
+    let a = Args::new(&args)?;
+    let action = a
+        .opt_enum("action", &["query", "run", "end"])?
+        .unwrap_or("query");
+    let name = match a.opt_str("taskName")? {
+        Some(name) => Some(task_name(name)?),
+        None => None,
+    };
+    let mut cmd = Command::typed("schtasks");
+    match (action, &name) {
+        ("query", None) => cmd = cmd.args(["/query", "/fo", "CSV", "/nh"]),
+        ("query", Some(name)) => {
+            cmd = cmd.args(["/query", "/fo", "LIST", "/v", "/tn", name.as_str()])
+        }
+        (_, None) => {
+            return Err(ToolError::invalid(format!(
+                "`taskName` is required to {action} a task"
+            )))
+        }
+        (verb, Some(name)) => {
+            ctx.require_elevated("starting or ending a scheduled task")?;
+            if verb == "end" {
+                ctx.require_destructive("ending a running task")?;
             }
-            "run" => {
-                let name = a.str("taskName")?;
-                run_cmd(
-                    ctx,
-                    "schtasks",
-                    vec!["/run".into(), "/tn".into(), name.into()],
-                    "schtasks /run",
-                    None,
-                )
-                .await
-            }
-            "end" => {
-                let name = a.str("taskName")?;
-                run_cmd(
-                    ctx,
-                    "schtasks",
-                    vec!["/end".into(), "/tn".into(), name.into()],
-                    "schtasks /end",
-                    None,
-                )
-                .await
-            }
-            other => Err(ToolError::InvalidArguments(format!(
-                "unknown action '{other}'"
-            ))),
+            cmd = cmd.arg(format!("/{verb}")).args(["/tn", name.as_str()]);
         }
     }
+    let out = ctx.run(cmd.timeout(ctx.timeout(None))).await?;
+    if !out.success() {
+        return Err(failure("schtasks", &out));
+    }
+    Ok(ToolOutput::text(out.stdout.text.trim().to_string()))
 }
 
-/// Environment variable inspection/mutation.
-struct WinEnv;
-
-#[async_trait]
-impl Tool for WinEnv {
-    fn name(&self) -> &str {
-        "windows.env"
-    }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "Get or set a Windows environment variable at Process/User/Machine scope. Machine scope requires elevation. Windows only."
-    }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new()
-            .enumerated("action", "Action.", &["get", "set"], true)
-            .string("name", "Variable name.", true)
-            .string("value", "Value to set (for set).", false)
-            .enumerated("scope", "Scope.", &["Process", "User", "Machine"], false)
-            .build()
-    }
-    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
-        ensure_windows(self.name())?;
-        let a = Args::new(&args)?;
-        let name = a.str("name")?.replace('\'', "''");
-        let scope = a.str_or("scope", "Process")?;
-        match a.str("action")? {
-            "get" => {
-                let script = format!("[Environment]::GetEnvironmentVariable('{name}','{scope}')");
-                let r = run_powershell(ctx, POWERSHELL, &script, None).await?;
-                Ok(exec_result("GetEnvironmentVariable", &r))
+async fn env(ctx: &ToolContext, args: Value) -> Result<ToolOutput> {
+    const GET: &str = "$v = [Environment]::GetEnvironmentVariable($env:NB_NAME, $env:NB_SCOPE);\
+         [pscustomobject]@{ name=$env:NB_NAME; scope=$env:NB_SCOPE; value=$v } | ConvertTo-Json";
+    const SET: &str =
+        "[Environment]::SetEnvironmentVariable($env:NB_NAME, $env:NB_DATA, $env:NB_SCOPE); 'set'";
+    const DELETE: &str =
+        "[Environment]::SetEnvironmentVariable($env:NB_NAME, $null, $env:NB_SCOPE); 'deleted'";
+    let a = Args::new(&args)?;
+    let action = a.str("action")?;
+    let name = variable_name(a.str("name")?)?;
+    let scope = a.opt_enum("scope", &["User", "Machine"])?.unwrap_or("User");
+    let value = a.str_or("value", "")?;
+    let body = match action {
+        "get" => GET,
+        "set" => {
+            if value.is_empty() {
+                return Err(ToolError::invalid(
+                    "`value` must not be empty; use action delete to remove a variable",
+                ));
             }
-            "set" => {
-                if scope == "Machine" {
-                    ctx.policy.ensure_elevation_allowed()?;
-                }
-                let value = a.str_or("value", "")?.replace('\'', "''");
-                let script =
-                    format!("[Environment]::SetEnvironmentVariable('{name}','{value}','{scope}')");
-                let r = run_powershell(ctx, POWERSHELL, &script, None).await?;
-                Ok(exec_result("SetEnvironmentVariable", &r))
-            }
-            other => Err(ToolError::InvalidArguments(format!(
-                "unknown action '{other}'"
-            ))),
+            SET
         }
+        "delete" => {
+            ctx.require_destructive("deleting an environment variable")?;
+            DELETE
+        }
+        other => return Err(ToolError::invalid(format!("unknown action '{other}'"))),
+    };
+    if action != "get" && scope == "Machine" {
+        ctx.require_elevated("changing a machine-wide environment variable")?;
     }
+    let values = [
+        ("NB_NAME", name.as_str()),
+        ("NB_SCOPE", scope),
+        ("NB_DATA", value),
+    ];
+    answer(ctx, "the environment request", typed(body, &values)).await
 }
 
-/// Firewall rule inspection via Get-NetFirewallRule.
-struct WinFirewall;
-
-#[async_trait]
-impl Tool for WinFirewall {
-    fn name(&self) -> &str {
-        "windows.firewall"
+async fn firewall(ctx: &ToolContext, args: Value) -> Result<ToolOutput> {
+    const BODY: &str = "$r = Get-NetFirewallRule;\
+         if ($env:NB_FILTER) { $r = $r | Where-Object { $_.DisplayName -like ('*' + [WildcardPattern]::Escape($env:NB_FILTER) + '*') } }\
+         @($r | Select-Object -First ([int]$env:NB_MAX) @{n='name';e={$_.DisplayName}}, \
+           @{n='enabled';e={$_.Enabled.ToString()}}, @{n='direction';e={$_.Direction.ToString()}}, \
+           @{n='action';e={$_.Action.ToString()}}, @{n='profile';e={$_.Profile.ToString()}}) | \
+         ConvertTo-Json -Depth 3";
+    let a = Args::new(&args)?;
+    let filter = a.str_or("nameContains", "")?;
+    if filter.chars().any(char::is_control) || filter.len() > 200 {
+        return Err(ToolError::invalid(
+            "`nameContains` must be short plain text",
+        ));
     }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "List Windows firewall rules (optionally filtered by display-name substring) as JSON. Windows only."
-    }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new()
-            .string(
-                "nameContains",
-                "Optional display-name substring filter.",
-                false,
-            )
-            .integer("limit", "Maximum rules (default 100).", false)
-            .build()
-    }
-    fn annotations(&self) -> Option<ToolAnnotations> {
-        ro()
-    }
-    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
-        ensure_windows(self.name())?;
-        let a = Args::new(&args)?;
-        let limit = a.u64_or("limit", 100)?;
-        let filter = match a.opt_str("nameContains")? {
-            Some(f) => format!(
-                "| Where-Object {{ $_.DisplayName -like '*{}*' }} ",
-                f.replace('\'', "''")
-            ),
-            None => String::new(),
-        };
-        let script = format!(
-            "Get-NetFirewallRule {filter}| Select-Object -First {limit} \
-             DisplayName,Direction,Action,Enabled,Profile | ConvertTo-Json -Depth 4"
-        );
-        let r = run_powershell(ctx, POWERSHELL, &script, None).await?;
-        Ok(exec_result("Get-NetFirewallRule", &r))
-    }
+    let max = a.u64_or("limit", 50)?.clamp(1, 500).to_string();
+    let values = [("NB_FILTER", filter), ("NB_MAX", max.as_str())];
+    answer(ctx, "reading the firewall rules", typed(BODY, &values)).await
 }
 
-/// Network adapter inventory via Get-NetAdapter.
-struct WinNetworkAdapters;
-
-#[async_trait]
-impl Tool for WinNetworkAdapters {
-    fn name(&self) -> &str {
-        "windows.network_adapters"
-    }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "List network adapters (name, status, MAC, link speed) as JSON. Windows only."
-    }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new().build()
-    }
-    fn annotations(&self) -> Option<ToolAnnotations> {
-        ro()
-    }
-    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
-        ensure_windows(self.name())?;
-        let _ = Args::new(&args)?;
-        let script = "Get-NetAdapter | Select-Object Name,InterfaceDescription,Status,MacAddress,LinkSpeed | ConvertTo-Json -Depth 4";
-        let r = run_powershell(ctx, POWERSHELL, script, None).await?;
-        Ok(exec_result("Get-NetAdapter", &r))
-    }
+async fn network_adapters(ctx: &ToolContext, _: Value) -> Result<ToolOutput> {
+    const BODY: &str = "@(Get-NetAdapter | Select-Object Name,InterfaceDescription,\
+         @{n='Status';e={$_.Status.ToString()}},MacAddress,LinkSpeed) | ConvertTo-Json -Depth 3";
+    answer(ctx, "reading the network adapters", typed(BODY, &[])).await
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use nebula_mcp_core::config::SecurityConfig;
-    use nebula_mcp_core::security::EffectivePolicy;
-    use nebula_mcp_core::Metrics;
-    use serde_json::json;
-    use tokio_util::sync::CancellationToken;
-
-    fn ctx() -> ToolContext {
-        let base = SecurityConfig {
-            allowed_commands: vec![
-                "sc".into(),
-                "reg".into(),
-                "schtasks".into(),
-                "powershell".into(),
-            ],
-            ..Default::default()
-        };
-        let policy = EffectivePolicy::build("windows.service", &base, None).unwrap();
-        ToolContext {
-            policy: Arc::new(policy),
-            working_dir: std::env::temp_dir(),
-            cancel: CancellationToken::new(),
-            metrics: Metrics::new(),
-            config: Arc::new(Default::default()),
-            request_id: "r".into(),
-            progress: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn windows_tools_gate_off_windows() {
-        if cfg!(windows) {
-            return;
-        }
-        for res in [
-            WinService.call(&ctx(), json!({"name": "spooler"})).await,
-            WinRegistry
-                .call(&ctx(), json!({"action": "query", "key": "HKLM\\SOFTWARE"}))
-                .await,
-            WinNetworkAdapters.call(&ctx(), json!({})).await,
-        ] {
-            assert!(matches!(
-                res.unwrap_err(),
-                ToolError::PlatformUnsupported(_)
-            ));
-        }
-    }
-}
+#[path = "windows_tests.rs"]
+mod tests;

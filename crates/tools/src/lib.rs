@@ -1,97 +1,156 @@
 //! # nebula-mcp-tools
 //!
-//! Concrete MCP tool implementations for the Nebula MCP server, grouped by
-//! category. Cross-platform categories (filesystem, terminal, process, git,
-//! github, network, docker, scheduler, security, browser) work everywhere;
-//! Windows categories (powershell, windows, diagnostics) compile everywhere but
-//! return [`nebula_mcp_core::ToolError::PlatformUnsupported`] off Windows.
+//! The tools of the Nebula MCP server. A tool is a [`ToolSpec`] and an async
+//! function. It reaches files, processes and the network only through the
+//! capabilities of its [`ToolContext`]; `clippy.toml` in this crate bans the
+//! standard-library and tokio routes around them.
 //!
-//! All tools are constructed once and share a small set of stateful services
-//! via [`ToolServices`].
+//! [`ToolSpec`]: nebula_mcp_core::ToolSpec
+//! [`ToolContext`]: nebula_mcp_core::ToolContext
 
 #![warn(missing_docs)]
 
-pub mod browser;
-pub mod common;
-pub mod diagnostics;
-pub mod docker;
-pub mod filesystem;
-pub mod git;
-pub mod github;
-pub mod network;
-pub mod powershell;
-pub mod process;
-pub mod scheduler;
-pub mod security;
-pub mod terminal;
-pub mod windows;
-
 use std::sync::Arc;
+use std::time::Duration;
 
-use nebula_mcp_core::{Tool, ToolRegistry};
+use nebula_mcp_core::{ConfigStore, Dispatcher, OwnerId, ToolRegistry};
+use tokio_util::sync::CancellationToken;
 
-pub use common::scheduler::SchedulerManager;
-pub use common::session::SessionManager;
+mod browser;
+mod common;
+mod diagnostics;
+mod docker;
+mod fs;
+mod git;
+mod github;
+mod jobs;
+mod net;
+mod powershell;
+mod process;
+mod scheduler;
+mod security;
+mod sessions;
+mod terminal;
+#[cfg(test)]
+mod testkit;
+mod windows;
 
-/// Stateful services shared across tools for the process lifetime.
-#[derive(Clone)]
-pub struct ToolServices {
-    /// Interactive session manager (persistent shells/REPLs).
-    pub sessions: Arc<SessionManager>,
-    /// Deferred/recurring job scheduler.
-    pub scheduler: Arc<SchedulerManager>,
-    /// Shared HTTP client with connection reuse for network/github tools.
-    pub http: reqwest::Client,
+/// How often idle terminal sessions are looked for.
+const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// State that outlives a tool call: terminal sessions and scheduled jobs.
+/// Everything in it belongs to an [`OwnerId`] and is invisible to others.
+#[derive(Clone, Default)]
+pub struct ToolState {
+    sessions: Arc<sessions::Sessions>,
+    jobs: Arc<jobs::Jobs>,
+    link: Arc<security::Link>,
 }
 
-impl ToolServices {
-    /// Build the default services set.
-    #[must_use]
-    pub fn new() -> Self {
-        let http = reqwest::Client::builder()
-            .user_agent(concat!("nebula-mcp/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .unwrap_or_default();
-        Self {
-            sessions: Arc::new(SessionManager::new()),
-            scheduler: Arc::new(SchedulerManager::new()),
-            http,
+impl ToolState {
+    /// Connect the state to the running server: jobs run through
+    /// `dispatcher`, idle sessions are closed on a timer, and everything is
+    /// stopped when `shutdown` fires. Call once, inside the runtime.
+    pub fn start(&self, dispatcher: &Arc<Dispatcher>, shutdown: CancellationToken) {
+        self.jobs.attach(dispatcher);
+        self.link.attach(dispatcher);
+        let state = self.clone();
+        let store: ConfigStore = dispatcher.store().clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    () = tokio::time::sleep(MAINTENANCE_INTERVAL) => {}
+                }
+                let idle = store.snapshot().config.limits.terminal_session_idle_secs;
+                let closed = state
+                    .sessions
+                    .expire(Duration::from_secs(idle.max(1)))
+                    .await;
+                if closed > 0 {
+                    tracing::info!(closed, "closed idle terminal sessions");
+                }
+            }
+            state.stop_all().await;
+        });
+    }
+
+    /// Stop everything that belongs to an owner that has gone away.
+    pub async fn close_owner(&self, owner: &OwnerId) {
+        let jobs = self.jobs.cancel_owner(owner);
+        let sessions = self.sessions.close_owner(owner).await;
+        if jobs + sessions > 0 {
+            tracing::info!(
+                owner = owner.as_str(),
+                jobs,
+                sessions,
+                "released a client's state"
+            );
         }
     }
-}
 
-impl Default for ToolServices {
-    fn default() -> Self {
-        Self::new()
+    /// Stop every job and kill every session.
+    pub async fn stop_all(&self) {
+        self.jobs.cancel_all();
+        self.sessions.close_all().await;
+    }
+
+    /// Number of open terminal sessions, of all owners.
+    #[must_use]
+    pub fn open_sessions(&self) -> usize {
+        self.sessions.count()
     }
 }
 
-/// Build a registry containing every tool this crate provides.
-#[must_use]
-pub fn build_registry(services: &ToolServices) -> ToolRegistry {
-    let mut reg = ToolRegistry::new();
-    for t in all_tools(services) {
-        reg.register(t);
+/// Register every tool and return the state they share. An error names a
+/// malformed definition, which is a bug in this crate (the tests register
+/// everything).
+pub fn register_all(registry: &mut ToolRegistry) -> Result<ToolState, String> {
+    let state = ToolState::default();
+    let all = fs::tools()
+        .into_iter()
+        .chain(git::tools())
+        .chain(github::tools())
+        .chain(net::tools())
+        .chain(docker::tools())
+        .chain(browser::tools())
+        .chain(terminal::tools(&state.sessions))
+        .chain(scheduler::tools(&state.jobs))
+        .chain(process::tools(&state.sessions))
+        .chain(security::tools(&state.link))
+        .chain(powershell::tools())
+        .chain(windows::tools())
+        .chain(diagnostics::tools(&state.sessions));
+    for tool in all {
+        registry.register(tool)?;
     }
-    reg
+    Ok(state)
 }
 
-/// Collect every tool instance.
-#[must_use]
-pub fn all_tools(services: &ToolServices) -> Vec<Arc<dyn Tool>> {
-    let mut v: Vec<Arc<dyn Tool>> = Vec::new();
-    v.extend(filesystem::tools());
-    v.extend(terminal::tools(services));
-    v.extend(process::tools());
-    v.extend(git::tools());
-    v.extend(github::tools(services));
-    v.extend(network::tools(services));
-    v.extend(powershell::tools());
-    v.extend(windows::tools());
-    v.extend(diagnostics::tools());
-    v.extend(browser::tools());
-    v.extend(docker::tools());
-    v.extend(scheduler::tools(services));
-    v.extend(security::tools());
-    v
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_definition_is_accepted_by_the_registry() {
+        let mut registry = ToolRegistry::new();
+        register_all(&mut registry).unwrap();
+        assert!(!registry.is_empty());
+    }
+
+    #[test]
+    fn descriptions_and_titles_are_reasonably_sized() {
+        let mut registry = ToolRegistry::new();
+        register_all(&mut registry).unwrap();
+        for tool in registry.all() {
+            let spec = tool.spec();
+            assert!(spec.title.len() <= 40, "{}: title too long", spec.name);
+            assert!(
+                spec.description.len() <= 600,
+                "{}: description is {} bytes; keep tools/list small",
+                spec.name,
+                spec.description.len()
+            );
+        }
+    }
 }

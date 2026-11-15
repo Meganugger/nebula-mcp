@@ -1,417 +1,697 @@
-//! Remote HTTP transport implementing the MCP **Streamable HTTP** binding.
+//! The HTTP transport: MCP Streamable HTTP behind authentication.
 //!
-//! This lets the server be reached by a URL from an AI platform instead of a
-//! local stdio pipe. A single endpoint (default `/mcp`) accepts JSON-RPC:
+//! Every request passes [`guard`] before anything reads its body: the `Host`
+//! and `Origin` headers are checked, then the credential, all against the
+//! configuration in force at that moment (so tokens, origins and hosts can be
+//! rotated by editing the config file). Only then does the request reach the
+//! protocol layer, which serves stateless 2026-07-28 requests and legacy
+//! sessions on the same endpoint.
 //!
-//! * `POST` — the client sends one JSON-RPC message (or a JSON array of them).
-//!   Requests are dispatched through the shared [`Server`] engine and answered
-//!   with `Content-Type: application/json`. A body containing only
-//!   notifications/responses is acknowledged with `202 Accepted`.
-//! * `GET` — opens a `text/event-stream` (SSE) channel that carries
-//!   server-initiated notifications (progress, resource updates) plus periodic
-//!   keep-alive comments (interval set by `transport.http.sse_keep_alive_secs`)
-//!   so idle streams are not silently reaped by tunnels/proxies/NATs.
-//! * `DELETE` — ends the client session (best-effort; the engine is stateless
-//!   across requests, so this is a no-op acknowledgement).
-//!
-//! ## Security
-//!
-//! Exposing a machine's shell to the network is dangerous, so the transport is
-//! defense-in-depth:
-//!
-//! * **Bearer auth** — every request must carry `Authorization: Bearer <token>`
-//!   matching a configured token (constant-time compared). The server refuses
-//!   to start on a non-loopback bind without `require_auth`.
-//! * **Origin allow-list** — browser `Origin` headers must match
-//!   `allowed_origins` (DNS-rebinding guard).
-//! * **Body-size cap** — oversized bodies are rejected before parsing.
-//!
-//! Actual command/filesystem authority is still governed entirely by the
-//! per-tool permission policy; this layer only controls who may talk to the
-//! server at all.
+//! Isolation between clients rests on two things done here. A legacy session
+//! is bound to the credential that created it, and a request that names a
+//! session with another credential is answered as if the session did not
+//! exist. And every request carries its [`Principal`] to the handler, which
+//! scopes long-lived state by it.
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::future::Future;
+use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
-use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{header, HeaderMap, StatusCode};
-use axum::response::sse::{Event, Sse};
-use axum::response::{IntoResponse, Response as AxumResponse};
-use axum::routing::post;
-use axum::{Json, Router};
+use axum::body::{Body, Bytes};
+use axum::extract::{Request, State};
+use axum::http::header::{self, HeaderMap, HeaderValue};
+use axum::http::{Method, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use axum::Router;
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use nebula_mcp_core::config::HttpConfig;
-use nebula_mcp_protocol::{error_codes, ErrorObject, Request, Response};
-use tokio::sync::broadcast;
-use tokio_util::sync::CancellationToken;
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
+use sha2::{Digest, Sha256};
+use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
+use tower::ServiceExt;
 
-use crate::server::Server;
+use crate::app::App;
+use crate::handler::Handler;
 
-/// Shared state for the HTTP handlers.
+/// Time open connections get to finish once the server is stopping.
+const DRAIN: Duration = Duration::from_secs(5);
+/// Failed authentications from one address before it is told to slow down.
+const MAX_FAILURES: u32 = 10;
+/// Window over which failures are counted.
+const FAILURE_WINDOW: Duration = Duration::from_secs(60);
+
+const SESSION_HEADER: &str = "mcp-session-id";
+const METHOD_HEADER: &str = "mcp-method";
+
+/// Who a request is from, as far as authentication can tell. Carried in the
+/// request extensions to the handler.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Principal(Arc<str>);
+
+impl Principal {
+    fn anonymous() -> Self {
+        Self(Arc::from("anonymous"))
+    }
+
+    /// A principal named after a digest of its static token, so the token
+    /// itself appears nowhere.
+    fn of_token(digest: &[u8]) -> Self {
+        Self(Arc::from(format!("token:{}", hex::encode(&digest[..8]))))
+    }
+
+    /// A stable identifier, safe to log.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The peer address of the connection a request arrived on.
+#[derive(Debug, Clone, Copy)]
+struct Remote(SocketAddr);
+
+struct Failures {
+    count: u32,
+    since: Instant,
+}
+
 struct HttpState {
-    server: Arc<Server>,
-    config: HttpConfig,
-    /// Fan-out of server-initiated notifications to any open SSE streams.
-    notifications: broadcast::Sender<String>,
+    app: Arc<App>,
+    sessions: Arc<LocalSessionManager>,
+    /// Legacy session id to the principal that created it.
+    bindings: Mutex<HashMap<String, Principal>>,
+    failures: Mutex<HashMap<IpAddr, Failures>>,
+    mcp_path: String,
 }
 
-/// Bind and serve the HTTP transport until `cancel` fires.
-///
-/// Returns once the listener has shut down. The bound address is logged; when
-/// `config.bind` uses port 0 the OS-assigned address is logged too.
-pub async fn serve(
-    server: Arc<Server>,
-    config: HttpConfig,
-    cancel: CancellationToken,
-) -> anyhow::Result<()> {
-    let addr: SocketAddr = config
-        .bind
-        .parse()
-        .map_err(|e| anyhow::anyhow!("invalid transport.http.bind '{}': {e}", config.bind))?;
-
-    // Refuse the footgun: a network-facing bind with authentication disabled.
-    if !addr.ip().is_loopback() && !config.require_auth {
-        anyhow::bail!(
-            "refusing to start HTTP transport on non-loopback address {addr} with \
-             require_auth = false; set transport.http.require_auth = true and configure \
-             auth_tokens"
+/// Why the server refuses to serve HTTP with a configuration.
+pub fn check_exposure(http: &HttpConfig, bind: &SocketAddr) -> Result<(), String> {
+    let has_credentials = !http.auth_tokens.is_empty() || http.oauth.enabled;
+    if http.require_auth && !has_credentials {
+        return Err(
+            "[transport.http] require_auth is on but there is no auth_tokens entry and OAuth is \
+             off, so every request would be refused. Add a token (16 characters or more), or \
+             pass --auth-token."
+                .to_string(),
         );
     }
-    if config.require_auth && config.auth_tokens.is_empty() {
-        anyhow::bail!(
-            "transport.http.require_auth is true but no auth_tokens are configured; \
-             add at least one token (e.g. via the NEBULA_MCP_AUTH_TOKEN env var)"
-        );
+    if !bind.ip().is_loopback() && !http.require_auth {
+        return Err(format!(
+            "refusing to serve without authentication on {bind}, which is reachable from other \
+             machines. Keep require_auth on, or bind to 127.0.0.1."
+        ));
     }
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    serve_on(server, config, listener, cancel).await
-}
-
-/// Serve the HTTP transport on an already-bound listener (used by `serve` and
-/// by tests that need the OS-assigned port before the server starts).
-pub async fn serve_on(
-    server: Arc<Server>,
-    config: HttpConfig,
-    listener: tokio::net::TcpListener,
-    cancel: CancellationToken,
-) -> anyhow::Result<()> {
-    let (tx, _rx) = broadcast::channel::<String>(256);
-
-    // Bridge the engine's notifier channel into the SSE broadcast.
-    let mut notif_rx = server.install_notifier();
-    let notif_tx = tx.clone();
-    tokio::spawn(async move {
-        while let Some(value) = notif_rx.recv().await {
-            if let Ok(line) = serde_json::to_string(&value) {
-                // Ignore send errors: they only mean no SSE client is attached.
-                let _ = notif_tx.send(line);
-            }
-        }
-    });
-
-    let state = Arc::new(HttpState {
-        server,
-        config: config.clone(),
-        notifications: tx,
-    });
-
-    let app = Router::new()
-        .route(
-            &config.path,
-            post(handle_post).get(handle_get).delete(handle_delete),
-        )
-        .layer(DefaultBodyLimit::max(config.max_body_bytes))
-        .with_state(state);
-
-    let local = listener.local_addr()?;
-    tracing::info!(
-        addr = %local,
-        path = %config.path,
-        auth = config.require_auth,
-        "MCP Streamable HTTP transport listening on http://{local}{}",
-        config.path
-    );
-
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move { cancel.cancelled().await })
-        .await?;
     Ok(())
 }
 
-/// Constant-time-ish string equality (length-independent short-circuit avoided).
-fn tokens_match(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for i in 0..a.len() {
-        diff |= a[i] ^ b[i];
-    }
-    diff == 0
+/// Serve MCP over HTTP on `listener` until the app shuts down.
+pub async fn serve(app: Arc<App>, listener: TcpListener) -> Result<(), String> {
+    let loaded = app.store().snapshot();
+    let http = loaded.config.transport.http.clone();
+    drop(loaded);
+
+    let mut manager = LocalSessionManager::default();
+    manager.session_config.keep_alive = Some(Duration::from_secs(http.session_idle_secs.max(1)));
+    let sessions = Arc::new(manager);
+
+    let keep_alive =
+        (http.sse_keep_alive_secs > 0).then(|| Duration::from_secs(http.sse_keep_alive_secs));
+    let protocol = StreamableHttpServerConfig::default()
+        .with_sse_keep_alive(keep_alive)
+        .with_legacy_session_mode(true)
+        // Event streams keep a tunnelled connection alive during long calls.
+        .with_json_response(false)
+        .with_cancellation_token(app.shutdown().child_token())
+        // Host and Origin are validated in `guard`, against the live config.
+        .disable_allowed_hosts()
+        .with_max_request_body_bytes(http.max_body_bytes);
+    let factory_app = app.clone();
+    let mcp = StreamableHttpService::new(
+        move || Ok(Handler::for_http(factory_app.clone())),
+        sessions.clone(),
+        protocol,
+    );
+
+    let state = Arc::new(HttpState {
+        app: app.clone(),
+        sessions,
+        bindings: Mutex::new(HashMap::new()),
+        failures: Mutex::new(HashMap::new()),
+        mcp_path: http.path.clone(),
+    });
+    let router = Router::new()
+        .route("/healthz", get(|| async { "ok\n" }))
+        .route("/metrics", get(metrics))
+        .nest_service(&http.path, mcp)
+        .layer(middleware::from_fn_with_state(state.clone(), guard))
+        .with_state(state.clone());
+
+    accept_loop(
+        &app,
+        listener,
+        router,
+        http.max_connections.max(1),
+        Duration::from_secs(http.read_timeout_secs.max(1)),
+    )
+    .await;
+    Ok(())
 }
 
-/// Returns `Some(error_response)` if the request must be rejected, else `None`.
-fn authorize(state: &HttpState, headers: &HeaderMap) -> Option<AxumResponse> {
-    // Origin allow-list (DNS-rebinding guard for browser clients).
-    if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
-        if !state.config.allowed_origins.is_empty()
-            && !state.config.allowed_origins.iter().any(|o| o == origin)
-        {
-            return Some((StatusCode::FORBIDDEN, "origin not allowed").into_response());
-        }
-        if state.config.allowed_origins.is_empty() {
-            // No configured origins: deny any browser cross-origin attempt.
-            return Some((StatusCode::FORBIDDEN, "origin not allowed").into_response());
-        }
+/// Serve only `/metrics`, without authentication. Refused off loopback.
+pub async fn serve_metrics(app: Arc<App>, listener: TcpListener) -> Result<(), String> {
+    let addr = listener
+        .local_addr()
+        .map_err(|e| format!("metrics listener: {e}"))?;
+    if !addr.ip().is_loopback() {
+        return Err(format!(
+            "the metrics listener has no authentication and only binds loopback addresses, not \
+             {addr}. To scrape remotely use /metrics on the HTTP transport, which is \
+             authenticated."
+        ));
     }
-
-    if !state.config.require_auth {
-        return None;
-    }
-    let presented = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| {
-            v.strip_prefix("Bearer ")
-                .or_else(|| v.strip_prefix("bearer "))
-        })
-        .unwrap_or("");
-    let ok = !presented.is_empty()
-        && state
-            .config
-            .auth_tokens
-            .iter()
-            .any(|t| tokens_match(t, presented));
-    if ok {
-        None
-    } else {
-        Some(
-            (
-                StatusCode::UNAUTHORIZED,
-                [(header::WWW_AUTHENTICATE, "Bearer")],
-                "missing or invalid bearer token",
-            )
-                .into_response(),
-        )
-    }
+    let metrics_app = app.clone();
+    let router = Router::new().route(
+        "/metrics",
+        get(move || {
+            let app = metrics_app.clone();
+            async move { prometheus(&app) }
+        }),
+    );
+    accept_loop(&app, listener, router, 16, Duration::from_secs(10)).await;
+    Ok(())
 }
 
-/// The Streamable HTTP protocol-version header (header names are lowercase in
-/// axum's `HeaderMap`).
-const PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
+/// Accept connections, at most `max_connections` at a time, until shutdown;
+/// then give open connections a bounded time to finish.
+async fn accept_loop(
+    app: &Arc<App>,
+    listener: TcpListener,
+    router: Router,
+    max_connections: usize,
+    read_timeout: Duration,
+) {
+    let shutdown = app.shutdown().clone();
+    let permits = Arc::new(Semaphore::new(max_connections));
+    let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(read_timeout);
+    let graceful = hyper_util::server::graceful::GracefulShutdown::new();
 
-/// Validate the `MCP-Protocol-Version` header on non-`initialize` requests.
-///
-/// Per the Streamable HTTP transport spec (2025-06-18 onward) the client MUST
-/// send the version negotiated during `initialize` on every subsequent HTTP
-/// request, and the server MUST answer `400 Bad Request` when the header names
-/// an invalid or unsupported revision. A missing header is accepted for
-/// backwards compatibility (the spec tells servers to assume `2025-03-26`,
-/// which this server supports). When a handshake has already negotiated a
-/// version on this engine, the header must match it — not whatever the client
-/// assumes.
-fn check_protocol_version(state: &HttpState, headers: &HeaderMap) -> Option<AxumResponse> {
-    let presented = match headers
-        .get(PROTOCOL_VERSION_HEADER)
-        .map(|v| v.to_str().map(str::to_owned))
-    {
-        None => return None, // Absent: pre-2025-06-18 client; accepted.
-        Some(Ok(v)) => v,
-        Some(Err(_)) => {
-            return Some(
-                (
-                    StatusCode::BAD_REQUEST,
-                    "invalid MCP-Protocol-Version header: not valid UTF-8",
-                )
-                    .into_response(),
-            )
-        }
-    };
-    match state.server.negotiated_protocol_version() {
-        Some(negotiated) if presented == negotiated => None,
-        Some(negotiated) => Some(
-            (
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "MCP-Protocol-Version '{presented}' does not match the version \
-                     negotiated during initialize ('{negotiated}')"
-                ),
-            )
-                .into_response(),
-        ),
-        None if nebula_mcp_protocol::is_supported_protocol_version(&presented) => None,
-        None => Some(
-            (
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "unsupported MCP-Protocol-Version '{presented}'; supported versions: {}",
-                    nebula_mcp_protocol::SUPPORTED_PROTOCOL_VERSIONS.join(", ")
-                ),
-            )
-                .into_response(),
-        ),
-    }
-}
-
-/// Handle a `POST` carrying one JSON-RPC message or an array of them.
-async fn handle_post(
-    State(state): State<Arc<HttpState>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> AxumResponse {
-    if let Some(rejected) = authorize(&state, &headers) {
-        return rejected;
-    }
-
-    // Parse the body as a single message or a batch.
-    let value: serde_json::Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(e) => {
-            let resp = Response::error(
-                None,
-                ErrorObject::new(error_codes::PARSE_ERROR, e.to_string(), None),
-            );
-            return (StatusCode::BAD_REQUEST, Json(resp)).into_response();
-        }
-    };
-
-    let messages: Vec<serde_json::Value> = match value {
-        serde_json::Value::Array(items) => items,
-        other => vec![other],
-    };
-
-    // The protocol-version header only applies to requests *after* the
-    // handshake — an `initialize` request is what establishes the version, so
-    // a body carrying one is exempt from the check.
-    let contains_initialize = messages
-        .iter()
-        .any(|m| m.get("method").and_then(|v| v.as_str()) == Some("initialize"));
-    if !contains_initialize {
-        if let Some(rejected) = check_protocol_version(&state, &headers) {
-            return rejected;
-        }
-    }
-
-    let mut responses: Vec<Response> = Vec::new();
-    for msg in messages {
-        let req: Request = match serde_json::from_value(msg) {
-            Ok(r) => r,
-            Err(e) => {
-                responses.push(Response::error(
-                    None,
-                    ErrorObject::new(error_codes::INVALID_REQUEST, e.to_string(), None),
-                ));
-                continue;
-            }
+    loop {
+        // No slot, no accept: further clients wait in the listen backlog.
+        let permit = tokio::select! {
+            () = shutdown.cancelled() => break,
+            permit = permits.clone().acquire_owned() => match permit {
+                Ok(p) => p,
+                Err(_) => break,
+            },
         };
-        if let Some(resp) = state.server.clone().dispatch(req).await {
-            responses.push(resp);
+        let (stream, remote) = tokio::select! {
+            () = shutdown.cancelled() => break,
+            accepted = listener.accept() => match accepted {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::warn!("accepting a connection failed: {e}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            },
+        };
+        let _ = stream.set_nodelay(true);
+        let router = router.clone();
+        let service = hyper::service::service_fn(move |mut req: hyper::Request<_>| {
+            req.extensions_mut().insert(Remote(remote));
+            router.clone().oneshot(req)
+        });
+        let conn = builder
+            .serve_connection_with_upgrades(TokioIo::new(stream), service)
+            .into_owned();
+        let conn = graceful.watch(conn);
+        tokio::spawn(async move {
+            let _ = conn.await;
+            drop(permit);
+        });
+    }
+
+    tokio::select! {
+        () = graceful.shutdown() => {}
+        () = tokio::time::sleep(DRAIN) => {
+            tracing::info!("closing connections that did not finish in time");
         }
-    }
-
-    // A body of only notifications yields no responses: acknowledge with 202.
-    if responses.is_empty() {
-        return StatusCode::ACCEPTED.into_response();
-    }
-
-    let session = new_session_id();
-    let headers = [(header::HeaderName::from_static("mcp-session-id"), session)];
-    if responses.len() == 1 {
-        (StatusCode::OK, headers, Json(responses.pop().unwrap())).into_response()
-    } else {
-        (StatusCode::OK, headers, Json(responses)).into_response()
     }
 }
 
-/// Handle a `GET`: open an SSE stream of server-initiated notifications.
-///
-/// The stream interleaves two kinds of writes:
-///
-/// * real JSON-RPC notifications fanned out from the engine, and
-/// * periodic keep-alive comment lines (`: keep-alive`), sent whenever the
-///   stream has been idle for `transport.http.sse_keep_alive_secs` seconds.
-///
-/// The heartbeat exists because an idle SSE response produces zero bytes of
-/// traffic, and intermediaries on the path (ngrok / Cloudflare tunnels,
-/// reverse proxies, NAT tables) reap connections that carry no data once
-/// their idle timeout fires — silently, with no error surfaced to either
-/// end. SSE comments are ignored by conforming clients, so the heartbeat is
-/// invisible to the MCP layer while keeping bytes flowing on the wire.
-///
-/// The heartbeat timer lives inside the stream itself (no spawned task), so
-/// it is dropped — and thereby cancelled — as soon as the client disconnects
-/// and hyper drops the response body. Nothing leaks per connection.
-async fn handle_get(State(state): State<Arc<HttpState>>, headers: HeaderMap) -> AxumResponse {
-    if let Some(rejected) = authorize(&state, &headers) {
-        return rejected;
+fn prometheus(app: &App) -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        app.dispatcher().metrics().to_prometheus(),
+    )
+        .into_response()
+}
+
+async fn metrics(State(state): State<Arc<HttpState>>) -> Response {
+    prometheus(&state.app)
+}
+
+fn refuse(status: StatusCode, message: impl Into<String>) -> Response {
+    let mut text: String = message.into();
+    text.push('\n');
+    (
+        status,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        text,
+    )
+        .into_response()
+}
+
+/// The host a request is addressed to, lower-case, as written (with port).
+fn requested_host(req: &Request) -> Option<String> {
+    req.headers()
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| req.uri().authority().map(|a| a.as_str().to_string()))
+        .map(|h| h.to_ascii_lowercase())
+}
+
+fn without_port(authority: &str) -> &str {
+    if authority.starts_with('[') {
+        return match authority.find(']') {
+            Some(end) => &authority[..=end],
+            None => authority,
+        };
     }
-    if let Some(rejected) = check_protocol_version(&state, &headers) {
-        return rejected;
+    authority
+        .rsplit_once(':')
+        .map_or(authority, |(host, _)| host)
+}
+
+/// `host[:port]` of the public URL, with the port only when it is not the
+/// scheme's default.
+fn public_authority(http: &HttpConfig) -> Option<String> {
+    let url = url::Url::parse(http.public_url.as_deref()?).ok()?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    Some(match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    })
+}
+
+/// Whether the request names a host this server answers to. Rejecting other
+/// names stops a web page from reaching the server through a DNS name it
+/// controls.
+fn host_allowed(http: &HttpConfig, host: &str) -> bool {
+    let name = without_port(host);
+    if matches!(name, "localhost" | "127.0.0.1" | "[::1]") {
+        return true;
     }
-    let rx = state.notifications.subscribe();
-    let keep_alive_secs = state.config.sse_keep_alive_secs;
-    let stream = async_stream::stream! {
-        let mut rx = rx;
-        let heartbeat_enabled = keep_alive_secs > 0;
-        // `tokio::time::interval` panics on a zero period; when the heartbeat
-        // is disabled its select branch is never polled, so the clamped
-        // placeholder period is irrelevant.
-        let mut heartbeat =
-            tokio::time::interval(Duration::from_secs(keep_alive_secs.max(1)));
-        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            // Both `broadcast::Receiver::recv` and `Interval::tick` are
-            // cancel-safe, so losing the select race never drops a message.
-            tokio::select! {
-                msg = rx.recv() => match msg {
-                    Ok(line) => {
-                        // Real traffic proves liveness: push the next
-                        // heartbeat a full period out.
-                        heartbeat.reset();
-                        yield Ok::<Event, std::convert::Infallible>(Event::default().data(line));
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => break,
-                },
-                // Note: the first tick completes immediately, so a comment is
-                // written as soon as the stream opens — a cheap "stream
-                // established" signal through every intermediary.
-                _ = heartbeat.tick(), if heartbeat_enabled => {
-                    yield Ok::<Event, std::convert::Infallible>(Event::default().comment("keep-alive"));
+    if public_authority(http).is_some_and(|public| public == host || public == name) {
+        return true;
+    }
+    http.allowed_hosts.iter().any(|entry| {
+        let entry = entry.to_ascii_lowercase();
+        entry == host || entry == name
+    })
+}
+
+/// The request's `Origin` when it is on the allowlist; an error for an
+/// origin that is not. Requests without an origin are not from a browser.
+fn checked_origin(http: &HttpConfig, headers: &HeaderMap) -> Result<Option<HeaderValue>, ()> {
+    let Some(value) = headers.get(header::ORIGIN) else {
+        return Ok(None);
+    };
+    let origin = value.to_str().map_err(|_| ())?;
+    let known = http
+        .allowed_origins
+        .iter()
+        .any(|allowed| allowed.trim_end_matches('/').eq_ignore_ascii_case(origin));
+    if known {
+        Ok(Some(value.clone()))
+    } else {
+        Err(())
+    }
+}
+
+fn add_cors(response: &mut Response, origin: Option<&HeaderValue>) {
+    let Some(origin) = origin else { return };
+    let headers = response.headers_mut();
+    headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin.clone());
+    headers.append(header::VARY, HeaderValue::from_static("Origin"));
+    headers.insert(
+        header::ACCESS_CONTROL_EXPOSE_HEADERS,
+        HeaderValue::from_static("Mcp-Session-Id, MCP-Protocol-Version, WWW-Authenticate"),
+    );
+}
+
+fn preflight(origin: Option<&HeaderValue>) -> Response {
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    add_cors(&mut response, origin);
+    let headers = response.headers_mut();
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("GET, POST, DELETE, OPTIONS"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static(
+            "Authorization, Content-Type, Accept, Mcp-Session-Id, MCP-Protocol-Version, \
+             Mcp-Method, Mcp-Name, Last-Event-ID",
+        ),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_MAX_AGE,
+        HeaderValue::from_static("600"),
+    );
+    response
+}
+
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, token) = value.split_once(' ')?;
+    scheme
+        .eq_ignore_ascii_case("bearer")
+        .then(|| token.trim())
+        .filter(|t| !t.is_empty())
+}
+
+/// Compare two digests without stopping at the first difference.
+fn same_digest(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+impl HttpState {
+    /// Identify the caller from its credential.
+    fn authenticate(
+        &self,
+        http: &HttpConfig,
+        headers: &HeaderMap,
+    ) -> Result<Principal, &'static str> {
+        let Some(token) = bearer(headers) else {
+            return if http.require_auth {
+                Err("no bearer token was sent")
+            } else {
+                Ok(Principal::anonymous())
+            };
+        };
+        // Digests are compared, every configured token is looked at, and the
+        // comparison does not stop early: timing says nothing about a token.
+        let presented = Sha256::digest(token.as_bytes());
+        let mut matched = false;
+        for configured in &http.auth_tokens {
+            matched |= same_digest(&Sha256::digest(configured.as_bytes()), &presented);
+        }
+        if matched {
+            Ok(Principal::of_token(&presented))
+        } else {
+            Err("the bearer token is not valid")
+        }
+    }
+
+    /// Count a failed authentication; `true` when the address has had too
+    /// many recently.
+    fn note_failure(&self, remote: Option<IpAddr>) -> bool {
+        let Some(ip) = remote else { return false };
+        let mut failures = self.failures.lock().unwrap_or_else(|e| e.into_inner());
+        failures.retain(|_, f| f.since.elapsed() < FAILURE_WINDOW);
+        let entry = failures.entry(ip).or_insert(Failures {
+            count: 0,
+            since: Instant::now(),
+        });
+        entry.count += 1;
+        entry.count > MAX_FAILURES
+    }
+
+    fn binding(&self, session: &str) -> Option<Principal> {
+        self.bindings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session)
+            .cloned()
+    }
+
+    /// Remember who created a session, and forget sessions that are gone.
+    async fn bind(&self, session: String, principal: Principal) {
+        let live = self.sessions.sessions.read().await;
+        let mut bindings = self.bindings.lock().unwrap_or_else(|e| e.into_inner());
+        bindings.retain(|id, _| live.keys().any(|k| k.as_ref() == id.as_str()));
+        bindings.insert(session, principal);
+    }
+}
+
+/// Host, Origin and credential checks for every request, before its body is
+/// read. See the module documentation.
+async fn guard(State(state): State<Arc<HttpState>>, mut req: Request, next: Next) -> Response {
+    let path = req.uri().path().to_string();
+    if path == "/healthz" {
+        return next.run(req).await;
+    }
+    let loaded = state.app.store().snapshot();
+    let http = &loaded.config.transport.http;
+    let remote = req.extensions().get::<Remote>().map(|r| r.0.ip());
+
+    let host = requested_host(&req).unwrap_or_default();
+    if !host_allowed(http, &host) {
+        tracing::warn!(host = %host, remote = ?remote, "refused a request for an unknown host");
+        return refuse(
+            StatusCode::FORBIDDEN,
+            "This server does not answer to that host name. The operator can add it to \
+             [transport.http] allowed_hosts, or set public_url.",
+        );
+    }
+    let Ok(origin) = checked_origin(http, req.headers()) else {
+        tracing::warn!(remote = ?remote, "refused a request from an origin that is not allowed");
+        return refuse(
+            StatusCode::FORBIDDEN,
+            "This origin is not allowed. The operator can add it to [transport.http] \
+             allowed_origins.",
+        );
+    };
+    let is_preflight = req.method() == Method::OPTIONS
+        && req
+            .headers()
+            .contains_key(header::ACCESS_CONTROL_REQUEST_METHOD);
+    if is_preflight {
+        return preflight(origin.as_ref());
+    }
+
+    let principal = match state.authenticate(http, req.headers()) {
+        Ok(principal) => principal,
+        Err(reason) => {
+            let limited = state.note_failure(remote);
+            if !limited {
+                tracing::warn!(remote = ?remote, reason, "authentication failed");
+            }
+            let mut response = if limited {
+                let mut r = refuse(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "Too many failed authentication attempts; wait a minute.",
+                );
+                r.headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
+                r
+            } else {
+                let mut r = refuse(StatusCode::UNAUTHORIZED, format!("Unauthorized: {reason}."));
+                r.headers_mut().insert(
+                    header::WWW_AUTHENTICATE,
+                    HeaderValue::from_static("Bearer realm=\"nebula-mcp\""),
+                );
+                r
+            };
+            add_cors(&mut response, origin.as_ref());
+            return response;
+        }
+    };
+
+    // A session belongs to the credential that created it.
+    let in_mcp = path == state.mcp_path || path.starts_with(&format!("{}/", state.mcp_path));
+    let session = req
+        .headers()
+        .get(SESSION_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let mut creating = false;
+    if in_mcp {
+        match &session {
+            Some(id) => {
+                if state.binding(id).is_some_and(|owner| owner != principal) {
+                    tracing::warn!(
+                        principal = principal.id(),
+                        "refused a request for another client's session"
+                    );
+                    return refuse(StatusCode::NOT_FOUND, "Session not found.");
                 }
             }
+            // A POST with neither a session nor the per-request method header
+            // of the stateless protocol can only be opening a legacy session.
+            None if req.method() == Method::POST && !req.headers().contains_key(METHOD_HEADER) => {
+                if state.sessions.sessions.read().await.len() >= http.max_sessions {
+                    return refuse(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Too many sessions are open on this server; try again later.",
+                    );
+                }
+                creating = true;
+            }
+            None => {}
         }
-    };
-    Sse::new(stream).into_response()
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(http.read_timeout_secs.max(1));
+    drop(loaded);
+    req.extensions_mut().insert(principal.clone());
+    let req = req.map(|body| Body::new(DeadlineBody::new(body, deadline)));
+
+    let mut response = next.run(req).await;
+    if creating {
+        let created = response
+            .headers()
+            .get(SESSION_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        if let Some(id) = created {
+            state.bind(id, principal).await;
+        }
+    }
+    add_cors(&mut response, origin.as_ref());
+    response
 }
 
-/// Handle a `DELETE`: acknowledge session teardown.
-async fn handle_delete(State(state): State<Arc<HttpState>>, headers: HeaderMap) -> AxumResponse {
-    if let Some(rejected) = authorize(&state, &headers) {
-        return rejected;
-    }
-    if let Some(rejected) = check_protocol_version(&state, &headers) {
-        return rejected;
-    }
-    StatusCode::OK.into_response()
+/// A request body that fails once its deadline passes, so a client cannot
+/// hold a request open by sending its body slowly.
+struct DeadlineBody {
+    inner: Body,
+    deadline: Pin<Box<tokio::time::Sleep>>,
 }
 
-fn new_session_id() -> String {
-    uuid::Uuid::new_v4().to_string()
+impl DeadlineBody {
+    fn new(inner: Body, deadline: Instant) -> Self {
+        Self {
+            inner,
+            deadline: Box::pin(tokio::time::sleep_until(deadline.into())),
+        }
+    }
+}
+
+impl http_body::Body for DeadlineBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+        if self.deadline.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Some(Err(axum::Error::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the request body was not received in time",
+            )))));
+        }
+        Pin::new(&mut self.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn http(public_url: Option<&str>, hosts: &[&str], origins: &[&str]) -> HttpConfig {
+        HttpConfig {
+            public_url: public_url.map(str::to_string),
+            allowed_hosts: hosts.iter().map(|s| (*s).to_string()).collect(),
+            allowed_origins: origins.iter().map(|s| (*s).to_string()).collect(),
+            ..HttpConfig::default()
+        }
+    }
+
     #[test]
-    fn constant_time_compare() {
-        assert!(tokens_match("secret", "secret"));
-        assert!(!tokens_match("secret", "secreu"));
-        assert!(!tokens_match("secret", "secre"));
-        assert!(!tokens_match("", "x"));
+    fn hosts_are_loopback_the_public_url_or_listed() {
+        let cfg = http(
+            Some("https://mcp.example.com/mcp"),
+            &["internal.lan:8765"],
+            &[],
+        );
+        for ok in [
+            "localhost",
+            "localhost:8765",
+            "127.0.0.1:1",
+            "[::1]:8765",
+            "mcp.example.com",
+            "internal.lan:8765",
+        ] {
+            assert!(host_allowed(&cfg, ok), "{ok}");
+        }
+        for bad in [
+            "evil.example",
+            "mcp.example.com.evil.example",
+            "internal.lan:1",
+            "",
+        ] {
+            assert!(!host_allowed(&cfg, bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn origins_must_be_listed_and_absent_origins_pass() {
+        let cfg = http(None, &[], &["https://app.example.com"]);
+        let mut headers = HeaderMap::new();
+        assert_eq!(checked_origin(&cfg, &headers), Ok(None));
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://app.example.com"),
+        );
+        assert!(checked_origin(&cfg, &headers).unwrap().is_some());
+        for bad in [
+            "https://evil.example",
+            "null",
+            "https://app.example.com.evil.example",
+        ] {
+            headers.insert(header::ORIGIN, HeaderValue::from_static(bad));
+            assert!(checked_origin(&cfg, &headers).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn exposure_rules() {
+        let loopback: SocketAddr = "127.0.0.1:8765".parse().unwrap();
+        let public: SocketAddr = "0.0.0.0:8765".parse().unwrap();
+        let mut cfg = HttpConfig::default();
+        assert!(
+            check_exposure(&cfg, &loopback).is_err(),
+            "auth required, no credential"
+        );
+        cfg.auth_tokens = vec!["0123456789abcdef".into()];
+        assert!(check_exposure(&cfg, &public).is_ok());
+        cfg.require_auth = false;
+        assert!(check_exposure(&cfg, &loopback).is_ok());
+        assert!(
+            check_exposure(&cfg, &public).is_err(),
+            "no auth off loopback"
+        );
+    }
+
+    #[test]
+    fn digests_compare_fully() {
+        assert!(same_digest(&[1, 2, 3], &[1, 2, 3]));
+        assert!(!same_digest(&[1, 2, 3], &[1, 2, 4]));
+        assert!(!same_digest(&[1, 2], &[1, 2, 3]));
+        assert_eq!(bearer(&HeaderMap::new()), None);
     }
 }

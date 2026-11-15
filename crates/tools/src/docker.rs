@@ -1,485 +1,504 @@
-//! Docker tools: typed wrappers over the `docker` CLI (and `docker compose`).
+//! Docker tools.
 //!
-//! Cross-platform. The `docker` executable must be on the command allowlist.
-//! Build/compose file paths and bind sources are policy-checked.
+//! Enabling this category hands the agent the Docker daemon, which is
+//! root-equivalent on most hosts: a container can mount the host's
+//! filesystem, and a compose file or a Dockerfile is a program. The file and
+//! network policy of this server does not reach inside the daemon.
+//!
+//! What these tools do guarantee is narrower: every argument vector is built
+//! here, caller strings never sit where docker would read an option,
+//! `docker_run` and `docker_build` isolate containers from the network unless
+//! network access is on, published ports bind to loopback unless an address
+//! is given, paths the tools take are policy-checked, and stopping or
+//! removing things needs the destructive gate.
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use nebula_mcp_core::{Result, Tool, ToolContext, ToolError};
-use nebula_mcp_protocol::mcp::ToolAnnotations;
-use nebula_mcp_protocol::CallToolResult;
+use nebula_mcp_core::args::Args;
+use nebula_mcp_core::fs::{CheckedPath, Kind};
+use nebula_mcp_core::policy::Access;
+use nebula_mcp_core::process::{Command, Exec};
+use nebula_mcp_core::schema::ObjectSchema;
+use nebula_mcp_core::{Category, Effects, Gate, Result, Tool, ToolContext, ToolError, ToolOutput};
 use serde_json::Value;
 
-use crate::common::exec::{run_checked, CommandSpec};
-use crate::common::output::exec_result;
-use crate::common::{Args, ObjectSchema};
+use crate::common::{handler, spec, tool};
+use crate::terminal::render_run;
 
-const CATEGORY: &str = "docker";
 const DOCKER: &str = "docker";
+const PROGRAMS: Exec = Exec::Programs(&[DOCKER]);
+const READ: Effects = Effects::read_only().open_world().exec(PROGRAMS);
+const WRITE: Effects = Effects::writes().overwrites().open_world().exec(PROGRAMS);
+const TIMEOUT_HELP: &str =
+    "Seconds before docker is stopped (default and ceiling set by the operator).";
+const CONTAINER_HELP: &str = "Container name or id.";
 
-/// Build docker tools.
-pub fn tools() -> Vec<Arc<dyn Tool>> {
+/// The `docker` tools.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn tools() -> Vec<Arc<dyn Tool>> {
+    let c = Category::Docker;
+    let container = || ObjectSchema::new().string("container", CONTAINER_HELP, true);
     vec![
-        Arc::new(DockerPs),
-        Arc::new(DockerImages),
-        Arc::new(DockerBuild),
-        Arc::new(DockerRun),
-        Arc::new(DockerStop),
-        Arc::new(DockerRm),
-        Arc::new(DockerLogs),
-        Arc::new(DockerExec),
-        Arc::new(DockerCompose),
+        tool(
+            spec(
+                "docker_ps",
+                c,
+                "List containers",
+                "Containers on this Docker host: id, image, status, names and ports.",
+                ObjectSchema::new()
+                    .boolean("all", "Include stopped containers.", false)
+                    .build(),
+                READ,
+            ),
+            handler!(ps),
+        ),
+        tool(
+            spec(
+                "docker_images",
+                c,
+                "List images",
+                "Images stored on this Docker host: repository, tag, id and size.",
+                ObjectSchema::new().build(),
+                READ,
+            ),
+            handler!(images),
+        ),
+        tool(
+            spec(
+                "docker_logs",
+                c,
+                "Container logs",
+                "The last lines a container wrote to its standard output and error.",
+                container()
+                    .integer_range(
+                        "tail",
+                        "Lines from the end (default 200).",
+                        1,
+                        10_000,
+                        false,
+                    )
+                    .build(),
+                READ,
+            ),
+            handler!(logs),
+        ),
+        tool(
+            spec(
+                "docker_run",
+                c,
+                "Run container",
+                "Start a container from an image and return its output, or with `detach` leave \
+                 it running. The container has no network unless `network` is set and the \
+                 operator allows network access; then a missing image is pulled. Host \
+                 directories are not mounted.",
+                ObjectSchema::new()
+                    .string("image", "Image reference, for example alpine:3.20.", true)
+                    .string_array_max(
+                        "command",
+                        "Command and arguments to run in the container.",
+                        200,
+                        false,
+                    )
+                    .string_array_max("env", "Environment variables as NAME=value.", 100, false)
+                    .string_array_max(
+                        "publish",
+                        "Ports as hostPort:containerPort, bound to 127.0.0.1 unless an address \
+                         is given (address:hostPort:containerPort).",
+                        20,
+                        false,
+                    )
+                    .string("name", "Name for the container.", false)
+                    .boolean("detach", "Leave it running and return its id.", false)
+                    .boolean(
+                        "rm",
+                        "Remove the container when it exits (default true).",
+                        false,
+                    )
+                    .boolean("network", "Give the container network access.", false)
+                    .integer_min("timeoutSecs", TIMEOUT_HELP, 1, false)
+                    .build(),
+                WRITE,
+            ),
+            handler!(run),
+        ),
+        tool(
+            spec(
+                "docker_exec",
+                c,
+                "Run in container",
+                "Run a command inside a running container and return its output.",
+                container()
+                    .string_array_max("command", "Command and arguments.", 200, true)
+                    .integer_min("timeoutSecs", TIMEOUT_HELP, 1, false)
+                    .build(),
+                WRITE,
+            ),
+            handler!(exec),
+        ),
+        tool(
+            spec(
+                "docker_build",
+                c,
+                "Build image",
+                "Build an image from a directory inside the allowed directories. Build steps \
+                 have no network unless the operator allows network access.",
+                ObjectSchema::new()
+                    .string("context", "Directory to build from.", true)
+                    .string("tag", "Name for the image, for example myapp:dev.", true)
+                    .string(
+                        "dockerfile",
+                        "Dockerfile to use (default: Dockerfile in the context).",
+                        false,
+                    )
+                    .string_array_max("buildArgs", "Build arguments as NAME=value.", 100, false)
+                    .integer_min("timeoutSecs", TIMEOUT_HELP, 1, false)
+                    .build(),
+                WRITE,
+            ),
+            handler!(build),
+        ),
+        tool(
+            spec(
+                "docker_stop",
+                c,
+                "Stop container",
+                "Stop a running container. Destructive: whatever it was doing ends.",
+                container().build(),
+                WRITE.destructive(Gate::Always),
+            ),
+            handler!(stop),
+        ),
+        tool(
+            spec(
+                "docker_rm",
+                c,
+                "Remove container",
+                "Remove a container and its writable layer. `force` removes a running one.",
+                container()
+                    .boolean("force", "Stop it first if it is running.", false)
+                    .build(),
+                WRITE.destructive(Gate::Always),
+            ),
+            handler!(rm),
+        ),
+        tool(
+            spec(
+                "docker_compose",
+                c,
+                "Docker Compose",
+                "Run a Docker Compose action for a compose file inside the allowed directories. \
+                 A compose file can mount host directories and start privileged containers: it \
+                 is a program run as the Docker daemon. `down` and `stop` are destructive.",
+                ObjectSchema::new()
+                    .string("file", "The compose file.", true)
+                    .string_enum(
+                        "action",
+                        "What to do.",
+                        &[
+                            "up", "down", "stop", "restart", "ps", "logs", "build", "pull",
+                            "config",
+                        ],
+                        true,
+                    )
+                    .integer_min("timeoutSecs", TIMEOUT_HELP, 1, false)
+                    .build(),
+                WRITE.destructive(Gate::Sometimes),
+            ),
+            handler!(compose),
+        ),
     ]
 }
 
-async fn docker(
-    ctx: &ToolContext,
-    args: Vec<String>,
-    label: &str,
-    timeout: Option<u64>,
-) -> Result<CallToolResult> {
-    let spec = CommandSpec::new(DOCKER, ctx.working_dir.clone(), ctx).args(args);
-    let result = run_checked(ctx, spec, timeout).await?;
-    Ok(exec_result(label, &result))
+// ---------------------------------------------------------------------------
+// Argument checks: nothing a caller sends may be read as an option
+// ---------------------------------------------------------------------------
+
+fn name_like(value: &str, what: &str, extra: &[char], max: usize) -> Result<String> {
+    let mut chars = value.chars();
+    let ok = chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && value.len() <= max
+        && chars.all(|c| c.is_ascii_alphanumeric() || extra.contains(&c));
+    if ok {
+        Ok(value.to_string())
+    } else {
+        Err(ToolError::invalid(format!(
+            "`{what}` is not valid: it must start with a letter or digit and contain only \
+             letters, digits and {}",
+            extra
+                .iter()
+                .map(|c| format!("'{c}'"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )))
+    }
 }
 
-fn ro() -> Option<ToolAnnotations> {
-    Some(ToolAnnotations {
-        read_only_hint: Some(true),
-        ..Default::default()
+fn container_name(value: &str) -> Result<String> {
+    name_like(value, "container", &['_', '.', '-'], 128)
+}
+
+fn image_ref(value: &str, what: &str) -> Result<String> {
+    name_like(value, what, &['_', '.', '-', '/', ':', '@'], 255)
+}
+
+/// `NAME=value` with a variable-shaped name.
+fn assignment(value: &str, what: &str) -> Result<String> {
+    let valid = value.split_once('=').is_some_and(|(name, rest)| {
+        let mut chars = name.chars();
+        chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && !rest.contains(['\0', '\n', '\r'])
+    });
+    if valid {
+        Ok(value.to_string())
+    } else {
+        Err(ToolError::invalid(format!(
+            "`{what}` entries must look like NAME=value"
+        )))
+    }
+}
+
+/// A published port, bound to loopback unless the caller names an address.
+fn publish(value: &str) -> Result<String> {
+    let bad = || {
+        ToolError::invalid(
+            "`publish` entries must be hostPort:containerPort or address:hostPort:containerPort, \
+             optionally followed by /tcp or /udp",
+        )
+    };
+    let (ports, proto) = match value.rsplit_once('/') {
+        Some((ports, proto @ ("tcp" | "udp"))) => (ports, Some(proto)),
+        Some(_) => return Err(bad()),
+        None => (value, None),
+    };
+    let parts: Vec<&str> = ports.split(':').collect();
+    let port = |p: &str| p.parse::<u16>().ok().filter(|p| *p != 0);
+    let (address, host, inner) = match parts.as_slice() {
+        [host, inner] => ("127.0.0.1", *host, *inner),
+        [address, host, inner] if address.parse::<std::net::Ipv4Addr>().is_ok() => {
+            (*address, *host, *inner)
+        }
+        _ => return Err(bad()),
+    };
+    let (Some(host), Some(inner)) = (port(host), port(inner)) else {
+        return Err(bad());
+    };
+    Ok(match proto {
+        Some(proto) => format!("{address}:{host}:{inner}/{proto}"),
+        None => format!("{address}:{host}:{inner}"),
     })
 }
 
-/// List containers.
-struct DockerPs;
-
-#[async_trait]
-impl Tool for DockerPs {
-    fn name(&self) -> &str {
-        "docker.ps"
+/// The options of `docker run`, before the image.
+fn run_options(a: &Args<'_>, network: bool) -> Result<Vec<String>> {
+    let detach = a.bool_or("detach", false)?;
+    let mut options = Vec::new();
+    if detach {
+        options.push("--detach".to_string());
     }
-    fn category(&self) -> &str {
-        CATEGORY
+    if a.bool_or("rm", !detach)? {
+        options.push("--rm".to_string());
     }
-    fn description(&self) -> &str {
-        "List Docker containers (JSON lines). Set all=true to include stopped containers."
+    if let Some(name) = a.opt_str("name")? {
+        options.push(format!("--name={}", container_name(name)?));
     }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new()
-            .boolean("all", "Include stopped containers.", false)
-            .build()
+    for entry in a.opt_str_array("env")? {
+        options.push(format!("--env={}", assignment(&entry, "env")?));
     }
-    fn annotations(&self) -> Option<ToolAnnotations> {
-        ro()
+    for entry in a.opt_str_array("publish")? {
+        options.push(format!("--publish={}", publish(&entry)?));
     }
-    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
-        let a = Args::new(&args)?;
-        let mut v = vec!["ps".to_string(), "--format".into(), "{{json .}}".into()];
-        if a.bool_or("all", false)? {
-            v.push("--all".into());
-        }
-        docker(ctx, v, "docker ps", None).await
+    if !network {
+        // No route out, and no reaching for a registry either.
+        options.push("--network=none".to_string());
+        options.push("--pull=never".to_string());
     }
+    Ok(options)
 }
 
-/// List images.
-struct DockerImages;
-
-#[async_trait]
-impl Tool for DockerImages {
-    fn name(&self) -> &str {
-        "docker.images"
+/// Whether the call asks for network access, which policy must then allow.
+fn wants_network(ctx: &ToolContext, a: &Args<'_>) -> Result<bool> {
+    let wanted = a.bool_or("network", false)?;
+    if wanted {
+        ctx.policy().require_network()?;
     }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "List Docker images (JSON lines)."
-    }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new().build()
-    }
-    fn annotations(&self) -> Option<ToolAnnotations> {
-        ro()
-    }
-    async fn call(&self, ctx: &ToolContext, _args: Value) -> Result<CallToolResult> {
-        docker(
-            ctx,
-            vec!["images".into(), "--format".into(), "{{json .}}".into()],
-            "docker images",
-            None,
-        )
-        .await
-    }
+    Ok(wanted)
 }
 
-/// Build an image.
-struct DockerBuild;
-
-#[async_trait]
-impl Tool for DockerBuild {
-    fn name(&self) -> &str {
-        "docker.build"
-    }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "Build a Docker image from a build context directory (within an allowed root)."
-    }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new()
-            .string("context", "Build context directory.", true)
-            .string("tag", "Image tag (name:version).", true)
-            .string(
-                "dockerfile",
-                "Dockerfile path relative to context (optional).",
-                false,
-            )
-            .string_array("buildArgs", "Extra --build-arg values (KEY=VALUE).", false)
-            .integer("timeoutSecs", "Timeout override.", false)
-            .build()
-    }
-    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
-        let a = Args::new(&args)?;
-        let context = ctx.resolve_path(a.str("context")?)?;
-        let tag = a.str("tag")?;
-        let mut v = vec!["build".to_string(), "-t".into(), tag.into()];
-        if let Some(df) = a.opt_str("dockerfile")? {
-            v.push("-f".into());
-            v.push(df.into());
-        }
-        for ba in a.opt_str_array("buildArgs")? {
-            v.push("--build-arg".into());
-            v.push(ba);
-        }
-        v.push(context.display().to_string());
-        docker(ctx, v, "docker build", a.opt_u64("timeoutSecs")?).await
-    }
-}
-
-/// Run a container.
-struct DockerRun;
-
-#[async_trait]
-impl Tool for DockerRun {
-    fn name(&self) -> &str {
-        "docker.run"
-    }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "Run a container from an image. Supports detach, name, env, published ports and a command."
-    }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new()
-            .string("image", "Image to run.", true)
-            .boolean("detach", "Run detached (-d).", false)
-            .boolean("rm", "Remove the container on exit (--rm).", false)
-            .string("name", "Container name.", false)
-            .string_array("env", "Environment variables (KEY=VALUE).", false)
-            .string_array("publish", "Port mappings (host:container).", false)
-            .string_array("command", "Command + args to run in the container.", false)
-            .integer("timeoutSecs", "Timeout override.", false)
-            .build()
-    }
-    fn annotations(&self) -> Option<ToolAnnotations> {
-        Some(ToolAnnotations {
-            open_world_hint: Some(true),
-            ..Default::default()
-        })
-    }
-    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
-        let a = Args::new(&args)?;
-        let mut v = vec!["run".to_string()];
-        if a.bool_or("detach", false)? {
-            v.push("-d".into());
-        }
-        if a.bool_or("rm", false)? {
-            v.push("--rm".into());
-        }
-        if let Some(name) = a.opt_str("name")? {
-            v.push("--name".into());
-            v.push(name.into());
-        }
-        for e in a.opt_str_array("env")? {
-            v.push("-e".into());
-            v.push(e);
-        }
-        for p in a.opt_str_array("publish")? {
-            v.push("-p".into());
-            v.push(p);
-        }
-        v.push(a.str("image")?.into());
-        v.extend(a.opt_str_array("command")?);
-        docker(ctx, v, "docker run", a.opt_u64("timeoutSecs")?).await
-    }
-}
-
-/// Stop a container.
-struct DockerStop;
-
-#[async_trait]
-impl Tool for DockerStop {
-    fn name(&self) -> &str {
-        "docker.stop"
-    }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "Stop a running container by name or id."
-    }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new()
-            .string("container", "Container name or id.", true)
-            .build()
-    }
-    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
-        let a = Args::new(&args)?;
-        docker(
-            ctx,
-            vec!["stop".into(), a.str("container")?.into()],
-            "docker stop",
-            None,
-        )
-        .await
-    }
-}
-
-/// Remove a container.
-struct DockerRm;
-
-#[async_trait]
-impl Tool for DockerRm {
-    fn name(&self) -> &str {
-        "docker.rm"
-    }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "Remove a container (optionally forcing). Destructive."
-    }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new()
-            .string("container", "Container name or id.", true)
-            .boolean("force", "Force removal (-f).", false)
-            .build()
-    }
-    fn annotations(&self) -> Option<ToolAnnotations> {
-        Some(ToolAnnotations {
-            destructive_hint: Some(true),
-            ..Default::default()
-        })
-    }
-    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
-        let a = Args::new(&args)?;
-        ctx.policy.ensure_destructive_allowed("docker.rm")?;
-        let mut v = vec!["rm".to_string()];
-        if a.bool_or("force", false)? {
-            v.push("-f".into());
-        }
-        v.push(a.str("container")?.into());
-        docker(ctx, v, "docker rm", None).await
-    }
-}
-
-/// Fetch container logs.
-struct DockerLogs;
-
-#[async_trait]
-impl Tool for DockerLogs {
-    fn name(&self) -> &str {
-        "docker.logs"
-    }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "Fetch a container's logs (last N lines)."
-    }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new()
-            .string("container", "Container name or id.", true)
-            .integer("tail", "Number of trailing lines (default 200).", false)
-            .build()
-    }
-    fn annotations(&self) -> Option<ToolAnnotations> {
-        ro()
-    }
-    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
-        let a = Args::new(&args)?;
-        let tail = a.u64_or("tail", 200)?;
-        docker(
-            ctx,
-            vec![
-                "logs".into(),
-                "--tail".into(),
-                tail.to_string(),
-                a.str("container")?.into(),
-            ],
-            "docker logs",
-            None,
-        )
-        .await
-    }
-}
-
-/// Execute a command in a running container.
-struct DockerExec;
-
-#[async_trait]
-impl Tool for DockerExec {
-    fn name(&self) -> &str {
-        "docker.exec"
-    }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "Execute a command inside a running container and capture its output."
-    }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new()
-            .string("container", "Container name or id.", true)
-            .string_array("command", "Command + args to execute.", true)
-            .integer("timeoutSecs", "Timeout override.", false)
-            .build()
-    }
-    fn annotations(&self) -> Option<ToolAnnotations> {
-        Some(ToolAnnotations {
-            open_world_hint: Some(true),
-            ..Default::default()
-        })
-    }
-    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
-        let a = Args::new(&args)?;
-        let command = a.str_array("command")?;
-        if command.is_empty() {
-            return Err(ToolError::InvalidArguments(
-                "command must not be empty".into(),
-            ));
-        }
-        let mut v = vec!["exec".to_string(), a.str("container")?.into()];
-        v.extend(command);
-        docker(ctx, v, "docker exec", a.opt_u64("timeoutSecs")?).await
-    }
-}
-
-/// Docker Compose control.
-struct DockerCompose;
-
-#[async_trait]
-impl Tool for DockerCompose {
-    fn name(&self) -> &str {
-        "docker.compose"
-    }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "Run docker compose actions (up/down/ps/logs/build) against a compose file (within an allowed root)."
-    }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new()
-            .string("file", "Path to the compose file.", true)
-            .enumerated(
-                "action",
-                "Compose action.",
-                &["up", "down", "ps", "logs", "build"],
-                true,
-            )
-            .boolean("detach", "For 'up', run detached (-d).", false)
-            .integer("timeoutSecs", "Timeout override.", false)
-            .build()
-    }
-    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
-        let a = Args::new(&args)?;
-        let file = ctx.resolve_path(a.str("file")?)?;
-        let action = a.str("action")?;
-        let mut v = vec![
-            "compose".to_string(),
-            "-f".into(),
-            file.display().to_string(),
-        ];
-        match action {
-            "up" => {
-                v.push("up".into());
-                if a.bool_or("detach", true)? {
-                    v.push("-d".into());
-                }
-            }
-            "down" => {
-                ctx.policy
-                    .ensure_destructive_allowed("docker.compose down")?;
-                v.push("down".into());
-            }
-            "ps" => v.push("ps".into()),
-            "logs" => {
-                v.push("logs".into());
-                v.push("--tail".into());
-                v.push("200".into());
-            }
-            "build" => v.push("build".into()),
-            other => {
-                return Err(ToolError::InvalidArguments(format!(
-                    "unknown compose action '{other}'"
+async fn checked(ctx: &ToolContext, input: &str, kind: Kind) -> Result<CheckedPath> {
+    let input = input.to_string();
+    ctx.fs()
+        .blocking(move |fs| {
+            let path = fs.resolve(&input, Access::Read)?;
+            if fs.metadata(&path)?.kind == kind {
+                Ok(path)
+            } else {
+                Err(ToolError::invalid(format!(
+                    "'{}' is not a {}",
+                    path.display(),
+                    if kind == Kind::Dir {
+                        "directory"
+                    } else {
+                        "file"
+                    }
                 )))
             }
-        }
-        docker(ctx, v, "docker compose", a.opt_u64("timeoutSecs")?).await
+        })
+        .await
+}
+
+fn docker() -> Command {
+    Command::typed(DOCKER).pass_env("DOCKER_HOST")
+}
+
+async fn finish(ctx: &ToolContext, tool: &str, a: &Args<'_>, cmd: Command) -> Result<ToolOutput> {
+    let out = ctx
+        .run(
+            cmd.timeout(ctx.timeout(a.opt_u64("timeoutSecs")?))
+                .timeout_is_result(),
+        )
+        .await?;
+    Ok(render_run(tool, &out))
+}
+
+// ---------------------------------------------------------------------------
+// Tools
+// ---------------------------------------------------------------------------
+
+async fn ps(ctx: &ToolContext, args: Value) -> Result<ToolOutput> {
+    let a = Args::new(&args)?;
+    let mut cmd = docker().args([
+        "ps",
+        "--format",
+        "table {{.ID}}\t{{.Image}}\t{{.Status}}\t{{.Names}}\t{{.Ports}}",
+    ]);
+    if a.bool_or("all", false)? {
+        cmd = cmd.arg("--all");
     }
+    finish(ctx, "docker_ps", &a, cmd).await
+}
+
+async fn images(ctx: &ToolContext, args: Value) -> Result<ToolOutput> {
+    let a = Args::new(&args)?;
+    let cmd = docker().args([
+        "images",
+        "--format",
+        "table {{.Repository}}\t{{.Tag}}\t{{.ID}}\t{{.Size}}",
+    ]);
+    finish(ctx, "docker_images", &a, cmd).await
+}
+
+async fn logs(ctx: &ToolContext, args: Value) -> Result<ToolOutput> {
+    let a = Args::new(&args)?;
+    let cmd = docker()
+        .arg("logs")
+        .arg(format!(
+            "--tail={}",
+            a.u64_or("tail", 200)?.clamp(1, 10_000)
+        ))
+        .arg(container_name(a.str("container")?)?);
+    finish(ctx, "docker_logs", &a, cmd).await
+}
+
+async fn run(ctx: &ToolContext, args: Value) -> Result<ToolOutput> {
+    let a = Args::new(&args)?;
+    let network = wants_network(ctx, &a)?;
+    let cmd = docker()
+        .arg("run")
+        .args(run_options(&a, network)?)
+        .arg(image_ref(a.str("image")?, "image")?)
+        // Everything after the image belongs to the container.
+        .args(a.opt_str_array("command")?);
+    finish(ctx, "docker_run", &a, cmd).await
+}
+
+async fn exec(ctx: &ToolContext, args: Value) -> Result<ToolOutput> {
+    let a = Args::new(&args)?;
+    let command = a.str_array("command")?;
+    if command.is_empty() {
+        return Err(ToolError::invalid("`command` must not be empty"));
+    }
+    let cmd = docker()
+        .arg("exec")
+        .arg(container_name(a.str("container")?)?)
+        .args(command);
+    finish(ctx, "docker_exec", &a, cmd).await
+}
+
+async fn build(ctx: &ToolContext, args: Value) -> Result<ToolOutput> {
+    let a = Args::new(&args)?;
+    let context = checked(ctx, a.str("context")?, Kind::Dir).await?;
+    let mut cmd = docker()
+        .arg("build")
+        .arg(format!("--tag={}", image_ref(a.str("tag")?, "tag")?));
+    if let Some(dockerfile) = a.opt_str("dockerfile")? {
+        cmd = cmd.arg_prefixed_path("--file=", &checked(ctx, dockerfile, Kind::File).await?);
+    }
+    for entry in a.opt_str_array("buildArgs")? {
+        cmd = cmd.arg(format!("--build-arg={}", assignment(&entry, "buildArgs")?));
+    }
+    if !ctx.policy().net().enabled() {
+        cmd = cmd.args(["--network=none", "--pull=false"]);
+    }
+    finish(ctx, "docker_build", &a, cmd.arg_path(&context)).await
+}
+
+async fn stop(ctx: &ToolContext, args: Value) -> Result<ToolOutput> {
+    let a = Args::new(&args)?;
+    let cmd = docker()
+        .arg("stop")
+        .arg(container_name(a.str("container")?)?);
+    finish(ctx, "docker_stop", &a, cmd).await
+}
+
+async fn rm(ctx: &ToolContext, args: Value) -> Result<ToolOutput> {
+    let a = Args::new(&args)?;
+    let mut cmd = docker().arg("rm");
+    if a.bool_or("force", false)? {
+        cmd = cmd.arg("--force");
+    }
+    let cmd = cmd.arg(container_name(a.str("container")?)?);
+    finish(ctx, "docker_rm", &a, cmd).await
+}
+
+async fn compose(ctx: &ToolContext, args: Value) -> Result<ToolOutput> {
+    let a = Args::new(&args)?;
+    let action = a.str("action")?;
+    let file = checked(ctx, a.str("file")?, Kind::File).await?;
+    let tail: &[&str] = match action {
+        "up" => &["up", "--detach"],
+        "down" | "stop" => {
+            ctx.require_destructive("stopping a compose project")?;
+            if action == "down" {
+                &["down"]
+            } else {
+                &["stop"]
+            }
+        }
+        "restart" => &["restart"],
+        "ps" => &["ps"],
+        "logs" => &["logs", "--tail=200", "--no-color"],
+        "build" => &["build"],
+        "pull" => {
+            ctx.policy().require_network()?;
+            &["pull"]
+        }
+        "config" => &["config"],
+        other => {
+            return Err(ToolError::invalid(format!(
+                "unknown compose action '{other}'"
+            )))
+        }
+    };
+    let cmd = docker()
+        .arg("compose")
+        .arg_prefixed_path("--file=", &file)
+        .args(tail.iter().copied());
+    finish(ctx, "docker_compose", &a, cmd).await
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use nebula_mcp_core::config::SecurityConfig;
-    use nebula_mcp_core::security::EffectivePolicy;
-    use nebula_mcp_core::Metrics;
-    use serde_json::json;
-    use tokio_util::sync::CancellationToken;
-
-    fn ctx(destructive: bool) -> ToolContext {
-        let base = SecurityConfig {
-            allowed_paths: vec!["/**".into()],
-            allowed_commands: vec!["docker".into()],
-            allow_destructive: destructive,
-            default_timeout_secs: 10,
-            max_runtime_secs: 30,
-            max_output_bytes: 1 << 20,
-            ..Default::default()
-        };
-        let policy = EffectivePolicy::build("docker.ps", &base, None).unwrap();
-        ToolContext {
-            policy: Arc::new(policy),
-            working_dir: std::env::temp_dir(),
-            cancel: CancellationToken::new(),
-            metrics: Metrics::new(),
-            config: Arc::new(Default::default()),
-            request_id: "r".into(),
-            progress: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn rm_requires_destructive_policy() {
-        let err = DockerRm
-            .call(&ctx(false), json!({"container": "x"}))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, ToolError::PermissionDenied(_)));
-    }
-
-    #[tokio::test]
-    async fn exec_rejects_empty_command() {
-        let err = DockerExec
-            .call(&ctx(true), json!({"container": "x", "command": []}))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, ToolError::InvalidArguments(_)));
-    }
-}
+#[path = "docker_tests.rs"]
+mod tests;

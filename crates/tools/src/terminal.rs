@@ -1,287 +1,377 @@
-//! Terminal tools: one-shot command execution and persistent interactive
-//! sessions. All executed programs must be on the command allowlist.
+//! Terminal tools: run a program the operator allowed, once or as an
+//! interactive session.
+//!
+//! These run caller-chosen programs. The program must be in
+//! `allowed_commands` and is matched on the file that will run; no shell is
+//! involved and arguments are passed verbatim. What the program then does is
+//! up to the program: it has the server user's privileges.
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use async_trait::async_trait;
-use nebula_mcp_core::{Result, Tool, ToolContext};
-use nebula_mcp_protocol::mcp::ToolAnnotations;
-use nebula_mcp_protocol::CallToolResult;
+use nebula_mcp_core::args::Args;
+use nebula_mcp_core::fs::{CheckedPath, Kind};
+use nebula_mcp_core::policy::Access;
+use nebula_mcp_core::process::{Command, Exec, Output};
+use nebula_mcp_core::schema::ObjectSchema;
+use nebula_mcp_core::tool::Content;
+use nebula_mcp_core::{Category, Effects, Result, Tool, ToolContext, ToolError, ToolOutput};
 use serde_json::{json, Value};
 
-use crate::common::exec::{run_checked, CommandSpec};
-use crate::common::output::{exec_result, json_value_result};
-use crate::common::session::SessionManager;
-use crate::common::{Args, ObjectSchema};
-use crate::ToolServices;
+use crate::common::{spec, tool, SpecExt};
+use crate::sessions::{describe_exit, Chunk, Sessions};
 
-const CATEGORY: &str = "terminal";
+const PROGRAM_HELP: &str =
+    "Program to run: a name found on the server's PATH, or a path. It must be allowed by the \
+     operator (allowed_commands).";
+const ARGS_HELP: &str = "Arguments, passed verbatim as separate strings. There is no shell: \
+                         quoting, pipes, globs and redirection are not interpreted.";
+const CWD_HELP: &str =
+    "Directory to run in, inside an allowed directory (default: the server's working directory).";
+const ENV_HELP: &str = "Environment variables to set. The operator decides which names may be \
+                        set (caller_env); the child otherwise gets a minimal environment without \
+                        the server's secrets.";
 
-/// Build terminal tools, sharing the session manager.
-pub fn tools(services: &ToolServices) -> Vec<Arc<dyn Tool>> {
+fn effects() -> Effects {
+    // Arbitrary execution: anything can happen, so clients are told the
+    // worst. No gate fits; allowed_commands is the control.
+    Effects::writes()
+        .overwrites()
+        .open_world()
+        .exec(Exec::CallerChosen(&[]))
+}
+
+/// The `terminal` tools.
+pub(crate) fn tools(sessions: &Arc<Sessions>) -> Vec<Arc<dyn Tool>> {
+    let c = Category::Terminal;
+    let command_schema = |with_stdin: bool| {
+        let mut s = ObjectSchema::new()
+            .string("program", PROGRAM_HELP, true)
+            .string_array_max("args", ARGS_HELP, 1000, false)
+            .string("cwd", CWD_HELP, false)
+            .string_map("env", ENV_HELP, false);
+        if with_stdin {
+            s = s
+                .string(
+                    "stdin",
+                    "Text written to the program's standard input, which is then closed.",
+                    false,
+                )
+                .integer_min(
+                    "timeoutSecs",
+                    "Seconds before the program and everything it started are stopped (default \
+                     and ceiling set by the operator).",
+                    1,
+                    false,
+                );
+        }
+        s.build()
+    };
+    let id_schema =
+        || ObjectSchema::new().string("sessionId", "Session id from terminal_session_open.", true);
+    let (open, write, read, list, close) = (
+        sessions.clone(),
+        sessions.clone(),
+        sessions.clone(),
+        sessions.clone(),
+        sessions.clone(),
+    );
     vec![
-        Arc::new(RunCommand),
-        Arc::new(SessionOpen {
-            sessions: services.sessions.clone(),
-        }),
-        Arc::new(SessionWrite {
-            sessions: services.sessions.clone(),
-        }),
-        Arc::new(SessionRead {
-            sessions: services.sessions.clone(),
-        }),
-        Arc::new(SessionList {
-            sessions: services.sessions.clone(),
-        }),
-        Arc::new(SessionClose {
-            sessions: services.sessions.clone(),
-        }),
+        tool(
+            spec(
+                "terminal_run",
+                c,
+                "Run program",
+                "Run an allowed program to completion and return its output and exit code. No \
+                 shell is involved. The program and everything it starts are stopped at the \
+                 timeout, on cancellation and when it exits.",
+                command_schema(true),
+                effects(),
+            ),
+            |ctx, args| Box::pin(run(ctx, args)),
+        ),
+        tool(
+            spec(
+                "terminal_session_open",
+                c,
+                "Open session",
+                "Start an allowed program that stays running (a REPL, a server, a watcher) and \
+                 return a session id. Write to it with terminal_session_write, read its output \
+                 with terminal_session_read and stop it with terminal_session_close. Idle \
+                 sessions are closed by the server.",
+                command_schema(false),
+                effects(),
+            )
+            .returns(
+                ObjectSchema::open()
+                    .string("sessionId", "Id for the other session tools.", true)
+                    .nullable_integer("pid", "Process id of the program.", true)
+                    .build(),
+            ),
+            move |ctx, args| {
+                let sessions = open.clone();
+                Box::pin(async move { session_open(ctx, &sessions, args).await })
+            },
+        ),
+        tool(
+            spec(
+                "terminal_session_write",
+                c,
+                "Write to session",
+                "Write text to a session's standard input. Include a trailing newline to submit \
+                 a line.",
+                id_schema()
+                    .string("data", "Text to write, exactly as given.", true)
+                    .build(),
+                effects(),
+            ),
+            move |ctx, args| {
+                let sessions = write.clone();
+                Box::pin(async move { session_write(ctx, &sessions, args).await })
+            },
+        ),
+        tool(
+            spec(
+                "terminal_session_read",
+                c,
+                "Read from session",
+                "Return what a session has printed (standard output and error, in arrival \
+                 order) since the last read, and whether it is still running. Output nobody \
+                 reads is dropped oldest-first once the buffer is full.",
+                id_schema()
+                    .integer_range(
+                        "waitMs",
+                        "Wait up to this long for output when none is buffered (default 1000).",
+                        0,
+                        60_000,
+                        false,
+                    )
+                    .integer_min(
+                        "maxBytes",
+                        "Most bytes to return (default and ceiling: the server's output limit).",
+                        1,
+                        false,
+                    )
+                    .build(),
+                effects(),
+            ),
+            move |ctx, args| {
+                let sessions = read.clone();
+                Box::pin(async move { session_read(ctx, &sessions, args).await })
+            },
+        ),
+        tool(
+            spec(
+                "terminal_session_list",
+                c,
+                "List sessions",
+                "List the terminal sessions this client has open.",
+                ObjectSchema::new().build(),
+                Effects::read_only(),
+            )
+            .returns(
+                ObjectSchema::open()
+                    .object_array(
+                        "sessions",
+                        "Open sessions, oldest first.",
+                        ObjectSchema::open()
+                            .string("sessionId", "Session id.", true)
+                            .string("program", "Program as it was requested.", true)
+                            .nullable_integer("pid", "Process id while running.", true)
+                            .boolean("running", "Whether the program is still running.", true)
+                            .nullable_integer("exitCode", "Exit code once exited.", true)
+                            .integer("ageSecs", "Seconds since it was opened.", true)
+                            .integer("idleSecs", "Seconds since it was last used.", true)
+                            .integer("bufferedBytes", "Unread output.", true),
+                        true,
+                    )
+                    .build(),
+            ),
+            move |ctx, args| {
+                let sessions = list.clone();
+                Box::pin(async move { session_list(ctx, &sessions, args).await })
+            },
+        ),
+        tool(
+            spec(
+                "terminal_session_close",
+                c,
+                "Close session",
+                "Stop a session's program and everything it started, and return any output \
+                 that was not read yet.",
+                id_schema().build(),
+                effects(),
+            ),
+            move |ctx, args| {
+                let sessions = close.clone();
+                Box::pin(async move { session_close(ctx, &sessions, args).await })
+            },
+        ),
     ]
 }
 
-/// Run a single command to completion.
-struct RunCommand;
-
-#[async_trait]
-impl Tool for RunCommand {
-    fn name(&self) -> &str {
-        "terminal.run"
-    }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "Run an allowlisted command to completion, capturing stdout/stderr with a timeout. \
-         The program (args[0]) must be permitted by policy; arguments are passed verbatim (no shell)."
-    }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new()
-            .string("program", "Executable name or path (must be allowlisted).", true)
-            .string_array("args", "Arguments passed verbatim (not shell-parsed).", false)
-            .string("cwd", "Working directory (default: workspace root).", false)
-            .prop(
-                "env",
-                json!({"type": "object", "description": "Environment variables to set.", "additionalProperties": {"type": "string"}}),
-                false,
-            )
-            .boolean("clearEnv", "Start from an empty environment.", false)
-            .string("stdin", "Optional stdin text.", false)
-            .integer("timeoutSecs", "Timeout in seconds (clamped to policy max).", false)
-            .build()
-    }
-    fn annotations(&self) -> Option<ToolAnnotations> {
-        Some(ToolAnnotations {
-            open_world_hint: Some(true),
-            ..Default::default()
+/// Check `input` as a directory to run in.
+async fn working_dir(ctx: &ToolContext, input: &str) -> Result<CheckedPath> {
+    let input = input.to_string();
+    ctx.fs()
+        .blocking(move |fs| {
+            let dir = fs.resolve(&input, Access::Read)?;
+            match fs.metadata(&dir)?.kind {
+                Kind::Dir => Ok(dir),
+                _ => Err(ToolError::invalid(format!(
+                    "cwd '{}' is not a directory",
+                    dir.display()
+                ))),
+            }
         })
-    }
-    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
-        let a = Args::new(&args)?;
-        let program = a.str("program")?.to_string();
-        let cmd_args = a.opt_str_array("args")?;
-        let cwd = match a.opt_str("cwd")? {
-            Some(c) => ctx.resolve_path(c)?,
-            None => ctx.working_dir.clone(),
-        };
-        let env = a.opt_string_map("env")?;
-        let clear_env = a.bool_or("clearEnv", false)?;
-        let timeout = a.opt_u64("timeoutSecs")?;
+        .await
+}
 
-        let mut spec = CommandSpec::new(&program, cwd, ctx)
-            .args(cmd_args)
-            .envs(env);
-        spec.clear_env = clear_env;
-        if let Some(s) = a.opt_str("stdin")? {
-            spec = spec.stdin_bytes(s.as_bytes().to_vec());
+/// Build the command from `program`, `args`, `cwd` and `env`.
+async fn command(ctx: &ToolContext, a: &Args<'_>) -> Result<Command> {
+    let mut cmd = Command::caller(a.str("program")?)
+        .args(a.opt_str_array("args")?)
+        .caller_env(a.opt_string_map("env")?);
+    if let Some(cwd) = a.opt_str("cwd")? {
+        cmd = cmd.cwd(&working_dir(ctx, cwd).await?);
+    }
+    Ok(cmd)
+}
+
+async fn run(ctx: &ToolContext, args: Value) -> Result<ToolOutput> {
+    let a = Args::new(&args)?;
+    let mut cmd = command(ctx, &a)
+        .await?
+        .timeout(ctx.timeout(a.opt_u64("timeoutSecs")?))
+        .timeout_is_result();
+    if let Some(stdin) = a.opt_str("stdin")? {
+        cmd = cmd.stdin(stdin);
+    }
+    let output = ctx.run(cmd).await?;
+    Ok(render_run("terminal_run", &output))
+}
+
+/// A finished command as text: stdout, then stderr, then a status line.
+pub(crate) fn render_run(tool: &str, out: &Output) -> ToolOutput {
+    let mut content = Vec::new();
+    if !out.stdout.text.is_empty() {
+        content.push(Content::Text(out.stdout.text.clone()));
+    }
+    if !out.stderr.text.is_empty() {
+        content.push(Content::Text(format!("[stderr]\n{}", out.stderr.text)));
+    }
+    let secs = out.duration.as_secs_f64();
+    let mut status = if out.timed_out {
+        format!(
+            "[{tool}: timed out after {secs:.1}s; the program and everything it started were \
+             stopped. Output up to that point is above"
+        )
+    } else {
+        format!("[{tool}: {} after {secs:.1}s", describe_exit(out.code))
+    };
+    for (name, stream) in [("stdout", &out.stdout), ("stderr", &out.stderr)] {
+        if stream.truncated {
+            status.push_str(&format!(
+                "; {name} was {} bytes and its middle was omitted",
+                stream.total_bytes
+            ));
         }
-        let display = format!("{program} {}", spec.args.join(" "));
-        let result = run_checked(ctx, spec, timeout).await?;
-        Ok(exec_result(&display, &result))
+    }
+    status.push(']');
+    content.push(Content::Text(status));
+    ToolOutput {
+        content,
+        structured: None,
     }
 }
 
-/// Open an interactive session.
-struct SessionOpen {
-    sessions: Arc<SessionManager>,
+async fn session_open(ctx: &ToolContext, sessions: &Sessions, args: Value) -> Result<ToolOutput> {
+    let a = Args::new(&args)?;
+    let cmd = command(ctx, &a).await?;
+    let (id, pid) = sessions.open(ctx, cmd)?;
+    Ok(ToolOutput::json(json!({"sessionId": id, "pid": pid})))
 }
 
-#[async_trait]
-impl Tool for SessionOpen {
-    fn name(&self) -> &str {
-        "terminal.session_open"
-    }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "Open a persistent interactive process (e.g. a shell). Returns a session id to write to and read from across calls."
-    }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new()
-            .string(
-                "program",
-                "Executable to launch (must be allowlisted).",
-                true,
-            )
-            .string_array("args", "Arguments.", false)
-            .string("cwd", "Working directory.", false)
-            .prop(
-                "env",
-                json!({"type": "object", "additionalProperties": {"type": "string"}}),
-                false,
-            )
-            .build()
-    }
-    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
-        let a = Args::new(&args)?;
-        let program = a.str("program")?;
-        ctx.policy.check_command(program)?;
-        let cmd_args = a.opt_str_array("args")?;
-        let cwd = match a.opt_str("cwd")? {
-            Some(c) => ctx.resolve_path(c)?,
-            None => ctx.working_dir.clone(),
-        };
-        let env = a.opt_string_map("env")?;
-        let id =
-            self.sessions
-                .open(program, &cmd_args, cwd, &env, ctx.policy.max_output_bytes())?;
-        Ok(json_value_result(json!({ "sessionId": id })))
-    }
+async fn session_write(ctx: &ToolContext, sessions: &Sessions, args: Value) -> Result<ToolOutput> {
+    let a = Args::new(&args)?;
+    let data = a.str("data")?;
+    sessions
+        .write(ctx, a.str("sessionId")?, data.as_bytes())
+        .await?;
+    Ok(ToolOutput::text(format!(
+        "[terminal_session_write: {} bytes written]",
+        data.len()
+    )))
 }
 
-/// Write to a session's stdin.
-struct SessionWrite {
-    sessions: Arc<SessionManager>,
-}
-
-#[async_trait]
-impl Tool for SessionWrite {
-    fn name(&self) -> &str {
-        "terminal.session_write"
+fn render_chunk(tool: &str, chunk: Chunk) -> ToolOutput {
+    let mut content = Vec::new();
+    if !chunk.text.is_empty() {
+        content.push(Content::Text(chunk.text));
     }
-    fn category(&self) -> &str {
-        CATEGORY
+    let mut status = match chunk.exit {
+        None => format!("[{tool}: the program is running"),
+        Some(code) => format!("[{tool}: the program has exited ({})", describe_exit(code)),
+    };
+    if chunk.dropped > 0 {
+        status.push_str(&format!(
+            "; {} bytes of older output were dropped because the buffer was full",
+            chunk.dropped
+        ));
     }
-    fn description(&self) -> &str {
-        "Write text to an interactive session's stdin. Include a trailing newline to submit a command."
+    if chunk.remaining > 0 {
+        status.push_str(&format!(
+            "; {} more bytes are buffered, read again",
+            chunk.remaining
+        ));
     }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new()
-            .string("sessionId", "Session id from session_open.", true)
-            .string("data", "Text to write to stdin.", true)
-            .build()
-    }
-    async fn call(&self, _ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
-        let a = Args::new(&args)?;
-        let id = a.str("sessionId")?;
-        let data = a.str("data")?;
-        self.sessions.write(id, data.as_bytes()).await?;
-        Ok(json_value_result(json!({ "written": data.len() })))
+    status.push(']');
+    content.push(Content::Text(status));
+    ToolOutput {
+        content,
+        structured: None,
     }
 }
 
-/// Read buffered output from a session.
-struct SessionRead {
-    sessions: Arc<SessionManager>,
+async fn session_read(ctx: &ToolContext, sessions: &Sessions, args: Value) -> Result<ToolOutput> {
+    let a = Args::new(&args)?;
+    let wait = Duration::from_millis(a.u64_or("waitMs", 1000)?);
+    let max = a
+        .usize_or("maxBytes", ctx.max_output_bytes())?
+        .min(ctx.max_output_bytes());
+    let chunk = sessions.read(ctx, a.str("sessionId")?, wait, max).await?;
+    Ok(render_chunk("terminal_session_read", chunk))
 }
 
-#[async_trait]
-impl Tool for SessionRead {
-    fn name(&self) -> &str {
-        "terminal.session_read"
-    }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "Read and clear buffered output from an interactive session, optionally waiting up to waitMs for new output."
-    }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new()
-            .string("sessionId", "Session id.", true)
-            .integer(
-                "waitMs",
-                "Milliseconds to wait for new output (default 0).",
-                false,
-            )
-            .build()
-    }
-    async fn call(&self, _ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
-        let a = Args::new(&args)?;
-        let id = a.str("sessionId")?;
-        let wait = a.u64_or("waitMs", 0)?;
-        let (out, dropped) = self.sessions.read(id, wait).await?;
-        Ok(json_value_result(json!({
-            "sessionId": id,
-            "output": out,
-            "droppedBytes": dropped,
-        })))
-    }
-}
-
-/// List active sessions.
-struct SessionList {
-    sessions: Arc<SessionManager>,
-}
-
-#[async_trait]
-impl Tool for SessionList {
-    fn name(&self) -> &str {
-        "terminal.session_list"
-    }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "List active interactive sessions."
-    }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new().build()
-    }
-    fn annotations(&self) -> Option<ToolAnnotations> {
-        Some(ToolAnnotations {
-            read_only_hint: Some(true),
-            ..Default::default()
+async fn session_list(ctx: &ToolContext, sessions: &Sessions, _args: Value) -> Result<ToolOutput> {
+    let list: Vec<Value> = sessions
+        .list(ctx)
+        .await
+        .into_iter()
+        .map(|s| {
+            json!({
+                "sessionId": s.id,
+                "program": s.program,
+                "pid": s.pid,
+                "running": s.exit.is_none(),
+                "exitCode": s.exit.flatten(),
+                "ageSecs": s.age.as_secs(),
+                "idleSecs": s.idle.as_secs(),
+                "bufferedBytes": s.buffered,
+            })
         })
-    }
-    async fn call(&self, _ctx: &ToolContext, _args: Value) -> Result<CallToolResult> {
-        Ok(json_value_result(
-            json!({ "sessions": self.sessions.list() }),
-        ))
-    }
+        .collect();
+    Ok(ToolOutput::json(json!({"sessions": list})))
 }
 
-/// Close a session.
-struct SessionClose {
-    sessions: Arc<SessionManager>,
+async fn session_close(ctx: &ToolContext, sessions: &Sessions, args: Value) -> Result<ToolOutput> {
+    let a = Args::new(&args)?;
+    let chunk = sessions
+        .close(ctx, a.str("sessionId")?, ctx.max_output_bytes())
+        .await?;
+    Ok(render_chunk("terminal_session_close", chunk))
 }
 
-#[async_trait]
-impl Tool for SessionClose {
-    fn name(&self) -> &str {
-        "terminal.session_close"
-    }
-    fn category(&self) -> &str {
-        CATEGORY
-    }
-    fn description(&self) -> &str {
-        "Terminate an interactive session and free its resources."
-    }
-    fn input_schema(&self) -> Value {
-        ObjectSchema::new()
-            .string("sessionId", "Session id.", true)
-            .build()
-    }
-    fn annotations(&self) -> Option<ToolAnnotations> {
-        Some(ToolAnnotations {
-            destructive_hint: Some(true),
-            ..Default::default()
-        })
-    }
-    async fn call(&self, _ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
-        let a = Args::new(&args)?;
-        let id = a.str("sessionId")?;
-        self.sessions.close(id).await?;
-        Ok(json_value_result(json!({ "closed": id })))
-    }
-}
+#[cfg(test)]
+#[path = "terminal_tests.rs"]
+mod tests;
