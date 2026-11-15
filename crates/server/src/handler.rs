@@ -233,7 +233,11 @@ impl ServerHandler for Handler {
                 progress,
             })
             .await;
-        drop(forwarder);
+        // The call is over and its sink is gone: let what it already
+        // reported reach the client ahead of the result, then stop.
+        if let Some(mut forwarder) = forwarder {
+            let _ = tokio::time::timeout(PROGRESS_DRAIN, &mut forwarder.0).await;
+        }
 
         let result = match outcome {
             // An unknown or unavailable tool is a protocol error.
@@ -251,6 +255,9 @@ impl ServerHandler for Handler {
         Ok(CallToolResponse::Complete(result))
     }
 }
+
+/// How long a finished call waits for its queued progress to be sent.
+const PROGRESS_DRAIN: std::time::Duration = std::time::Duration::from_millis(500);
 
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
