@@ -17,17 +17,20 @@ use nebula_mcp_core::{ConfigStore, Dispatcher, OwnerId, ToolRegistry};
 use tokio_util::sync::CancellationToken;
 
 mod common;
+mod diagnostics;
 mod docker;
 mod fs;
 mod git;
 mod github;
 mod jobs;
 mod net;
+mod powershell;
 mod process;
 mod scheduler;
 mod security;
 mod sessions;
 mod terminal;
+mod windows;
 #[cfg(test)]
 mod testkit;
 
@@ -112,7 +115,10 @@ pub fn register_all(registry: &mut ToolRegistry) -> Result<ToolState, String> {
         .chain(terminal::tools(&state.sessions))
         .chain(scheduler::tools(&state.jobs))
         .chain(process::tools(&state.sessions))
-        .chain(security::tools(&state.link));
+        .chain(security::tools(&state.link))
+        .chain(powershell::tools())
+        .chain(windows::tools())
+        .chain(diagnostics::tools(&state.sessions));
     for tool in all {
         registry.register(tool)?;
     }

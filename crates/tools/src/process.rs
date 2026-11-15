@@ -191,6 +191,14 @@ async fn mine(ctx: &ToolContext, sessions: &Sessions, system: &System) -> HashSe
     found
 }
 
+/// Whether `pid` runs inside one of the caller's terminal sessions.
+pub(crate) async fn in_my_sessions(ctx: &ToolContext, sessions: &Sessions, pid: u32) -> Result<bool> {
+    let system = snapshot(ctx).await?;
+    Ok(mine(ctx, sessions, &system)
+        .await
+        .contains(&Pid::from_u32(pid)))
+}
+
 fn describe(pid: Pid, process: &sysinfo::Process, mine: &HashSet<Pid>) -> Value {
     json!({
         "pid": pid.as_u32(),
