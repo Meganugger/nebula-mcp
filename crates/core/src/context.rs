@@ -268,6 +268,33 @@ impl ToolContext {
         self.policy.require_elevated(what)
     }
 
+    /// The operator's GitHub token, read from the environment variable named
+    /// by `[github] token_env` (with `GH_TOKEN` as a second place to look
+    /// when that is the default). Only tools of the `github` category get
+    /// it; they send it to `[github] api_url` and nowhere else.
+    pub fn github_token(&self) -> Result<Option<String>> {
+        if !self.policy.tool().starts_with("github_") {
+            return Err(ToolError::Internal(format!(
+                "tool '{}' asked for the GitHub token",
+                self.policy.tool()
+            )));
+        }
+        let name = self.config.github.token_env.as_str();
+        let read = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        Ok(read(name).or_else(|| {
+            if name == "GITHUB_TOKEN" {
+                read("GH_TOKEN")
+            } else {
+                None
+            }
+        }))
+    }
+
     /// Report progress if the client asked for it.
     pub fn report_progress(&self, progress: f64, total: Option<f64>, message: Option<&str>) {
         if let Some(sink) = &self.progress {

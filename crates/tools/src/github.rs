@@ -445,23 +445,6 @@ pub(crate) fn tools() -> Vec<Arc<dyn Tool>> {
 // The API client
 // ---------------------------------------------------------------------------
 
-fn token(ctx: &ToolContext) -> Option<String> {
-    let name = ctx.config().github.token_env.as_str();
-    let read = |n: &str| {
-        std::env::var(n)
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-    };
-    read(name).or_else(|| {
-        if name == "GITHUB_TOKEN" {
-            read("GH_TOKEN")
-        } else {
-            None
-        }
-    })
-}
-
 fn encode(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for b in text.bytes() {
@@ -514,7 +497,7 @@ async fn send(
     query: &[(String, String)],
     body: Option<&Value>,
 ) -> Result<Response> {
-    let token = token(ctx);
+    let token = ctx.github_token()?;
     if method != "GET" && token.is_none() {
         return Err(ToolError::denied(format!(
             "this needs a GitHub token. The operator provides it in the server's environment \
