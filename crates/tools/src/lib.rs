@@ -21,7 +21,9 @@ mod fs;
 mod git;
 mod github;
 mod jobs;
+mod process;
 mod scheduler;
+mod security;
 mod sessions;
 mod terminal;
 #[cfg(test)]
@@ -36,6 +38,7 @@ const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(15);
 pub struct ToolState {
     sessions: Arc<sessions::Sessions>,
     jobs: Arc<jobs::Jobs>,
+    link: Arc<security::Link>,
 }
 
 impl ToolState {
@@ -44,6 +47,7 @@ impl ToolState {
     /// stopped when `shutdown` fires. Call once, inside the runtime.
     pub fn start(&self, dispatcher: &Arc<Dispatcher>, shutdown: CancellationToken) {
         self.jobs.attach(dispatcher);
+        self.link.attach(dispatcher);
         let state = self.clone();
         let store: ConfigStore = dispatcher.store().clone();
         tokio::spawn(async move {
@@ -102,7 +106,9 @@ pub fn register_all(registry: &mut ToolRegistry) -> Result<ToolState, String> {
         .chain(git::tools())
         .chain(github::tools())
         .chain(terminal::tools(&state.sessions))
-        .chain(scheduler::tools(&state.jobs));
+        .chain(scheduler::tools(&state.jobs))
+        .chain(process::tools(&state.sessions))
+        .chain(security::tools(&state.link));
     for tool in all {
         registry.register(tool)?;
     }
