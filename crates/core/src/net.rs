@@ -869,6 +869,22 @@ impl Net {
             .await
     }
 
+    /// Like [`Net::connect_tls`], offering only `http/1.1`: for protocols
+    /// that begin as an HTTP/1.1 exchange on the connection, such as
+    /// WebSocket, where a server choosing `h2` would break the upgrade.
+    pub async fn connect_tls_http1(
+        &self,
+        host: &str,
+        port: u16,
+        timeout: Duration,
+    ) -> Result<TlsConnection> {
+        static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
+        let config = CONFIG
+            .get_or_init(|| build_tls_config(&[b"http/1.1"]))
+            .clone();
+        self.connect_tls_with(config, host, port, timeout).await
+    }
+
     async fn connect_tls_with(
         &self,
         config: Arc<ClientConfig>,
