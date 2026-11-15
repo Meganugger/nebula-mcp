@@ -249,3 +249,119 @@ pub(crate) async fn gone(pid: &str) -> bool {
     }
     false
 }
+
+/// One request received by [`HttpMock`].
+#[derive(Debug, Clone)]
+pub(crate) struct Seen {
+    pub method: String,
+    /// Path and query, as sent.
+    pub target: String,
+    /// Header names in lower case.
+    pub headers: Vec<(String, String)>,
+    pub body: String,
+}
+
+impl Seen {
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// What [`HttpMock`] answers: status, extra headers, body.
+pub(crate) type Reply = (u16, Vec<(String, String)>, String);
+
+/// A loopback HTTP/1.1 server answering from a closure and recording what
+/// it was sent. One request per connection.
+pub(crate) struct HttpMock {
+    pub port: u16,
+    seen: Arc<std::sync::Mutex<Vec<Seen>>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl HttpMock {
+    pub(crate) fn start<F>(respond: F) -> Self
+    where
+        F: Fn(&Seen) -> Reply + Send + Sync + 'static,
+    {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (log, stopped) = (seen.clone(), stop.clone());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if stopped.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                let Ok(stream) = stream else { continue };
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let mut parts = line.split_whitespace();
+                let method = parts.next().unwrap_or_default().to_string();
+                let target = parts.next().unwrap_or_default().to_string();
+                let mut headers = Vec::new();
+                let mut length = 0usize;
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                        break;
+                    }
+                    if let Some((k, v)) = line.trim_end().split_once(':') {
+                        let (k, v) = (k.trim().to_ascii_lowercase(), v.trim().to_string());
+                        if k == "content-length" {
+                            length = v.parse().unwrap_or(0);
+                        }
+                        headers.push((k, v));
+                    }
+                }
+                let mut body = vec![0u8; length];
+                let _ = reader.read_exact(&mut body);
+                let request = Seen {
+                    method,
+                    target,
+                    headers,
+                    body: String::from_utf8_lossy(&body).into_owned(),
+                };
+                let (status, extra, text) = respond(&request);
+                log.lock().unwrap().push(request);
+                let mut head = format!(
+                    "HTTP/1.1 {status} Mock\r\nContent-Length: {}\r\nConnection: close\r\n",
+                    text.len()
+                );
+                for (k, v) in extra {
+                    head.push_str(&format!("{k}: {v}\r\n"));
+                }
+                head.push_str("\r\n");
+                let mut stream = reader.into_inner();
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(text.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        Self { port, seen, stop }
+    }
+
+    pub(crate) fn url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    /// Requests received so far.
+    pub(crate) fn seen(&self) -> Vec<Seen> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+impl Drop for HttpMock {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Wake the accept loop so the thread ends.
+        let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
+    }
+}
