@@ -7,6 +7,7 @@
 //! * `[security]`  – the permission baseline every tool call is checked against.
 //! * `[limits]`    – resource ceilings for long-lived state.
 //! * `[transport]` – the HTTP transport and its authentication.
+//! * `[github]`    – the GitHub API endpoint and where its token comes from.
 //! * `[tools.<name>]` – per-tool overrides layered on the baseline.
 //!
 //! Unknown keys are errors: a typo in a switch that is meant to restrict
@@ -42,6 +43,8 @@ pub struct Config {
     pub limits: LimitsConfig,
     /// Transports.
     pub transport: TransportConfig,
+    /// The GitHub API used by the `github` tools.
+    pub github: GithubConfig,
     /// Per-tool overrides keyed by tool name (for example `fs_delete`).
     pub tools: BTreeMap<String, ToolOverride>,
 }
@@ -233,6 +236,54 @@ pub enum SandboxMode {
     Auto,
     /// Confine, and refuse to spawn where confinement is unavailable.
     Require,
+}
+
+/// Where the `github` tools find the GitHub API and its token.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GithubConfig {
+    /// Base URL of the REST API. Change it for GitHub Enterprise Server.
+    pub api_url: String,
+    /// Name of the server's environment variable that holds the token. The
+    /// token itself never belongs in this file.
+    pub token_env: String,
+}
+
+impl Default for GithubConfig {
+    fn default() -> Self {
+        Self {
+            api_url: "https://api.github.com".to_string(),
+            token_env: "GITHUB_TOKEN".to_string(),
+        }
+    }
+}
+
+impl GithubConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let url = &self.api_url;
+        let loopback = ["http://127.0.0.1", "http://localhost", "http://[::1]"]
+            .iter()
+            .any(|p| url.starts_with(p));
+        let rest = url.split_once("://").map_or("", |(_, r)| r);
+        if !(url.starts_with("https://") || loopback)
+            || rest.is_empty()
+            || rest.contains(['@', '?', '#', ' '])
+            || url.ends_with('/')
+        {
+            return Err(ConfigError::new(
+                "[github] api_url must be an https:// URL without credentials, query or \
+                 trailing slash, for example https://api.github.com or \
+                 https://github.example.com/api/v3",
+            ));
+        }
+        let name = &self.token_env;
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(ConfigError::new(
+                "[github] token_env must be the name of an environment variable",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Resource ceilings for state that outlives a single call.
@@ -474,6 +525,7 @@ impl Config {
                 )))
             }
         }
+        self.github.validate()?;
         let http = &self.transport.http;
         if !http.path.starts_with('/') {
             return Err(ConfigError::new(
