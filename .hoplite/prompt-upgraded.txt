@@ -1,0 +1,195 @@
+# Continue and finish the Nebula MCP overhaul
+
+## The task
+
+This overhaul is already under way and was left partway: a new enforcement core is written, and nothing that runs on top of it has been ported. Pick it up where it stands and take the whole repository to the best version of itself, in this one task, end to end: every crate, every tool, the protocol layer, both transports, the tests, CI and the documents. Check what exists, rebuild what still needs rebuilding, and ship it with evidence that it works.
+
+The owner asked for it to be reworked and upgraded "as good as possible fully and correctly", and was explicit about not wanting a partial result followed by an offer of a better one. So there is no approval step between phases and no closing question about further improvements. Make the decisions yourself, write down the ones the owner might reasonably want to reverse, and keep going until the finish line described at the end. Stop early only for a blocker you cannot clear, and then say exactly what it is and what you tried. This is a large job; a thorough result is wanted over a fast one.
+
+Your usual preference for the smallest change that satisfies a request does not limit the scope here, because the overhaul is the request. It still governs each individual change: everything should trace to a defect, a promise the documentation makes, a requirement of the protocol, or a concrete benefit to someone running the server. Rebuild a component when its design is the defect and refactor when the design is sound. Change nothing for style alone and add no speculative features.
+
+## Three things the owner wants done differently
+
+The owner watched the earlier sessions and has asked for three changes in how the work is done. They carry the same weight as the technical content below.
+
+**Finish the whole project.** The earlier work stopped mid-port, and as it stands the branch cannot build a server at all. The finish line is the entire project rebuilt, working and verified, as set out under "What the result should be". A hardened core under an unported server is not a result, and neither is a security pass that leaves the protocol, the tools or the documents at 0.1. Do not end a turn to report progress, to ask whether to continue, or to ask which option the owner prefers. Decide, record the decision in the log when the owner might want to reverse it, and carry on. While a build or a CI run is in progress, work on the next piece.
+
+**Do the work yourself.** The earlier sessions handed nearly everything to subagents: the audits, the reading, much of the writing. The owner has asked more than once for that to stop, because it was slow and expensive. So do not start subagents in this task: not for reading or auditing code, not for research, not for porting tool categories, not for tests, documents or review. Read, design, write, run and check everything in this thread.
+
+There is a reason beyond cost. This is one tightly coupled system resting on one security core, and what makes it coherent (the threat model, the decisions in the log, what you learn from reading the code) lives in your context. A subagent starts without any of it, so whatever it returns has to be read and verified again before it can be trusted. The tool categories look like independent, parallel work, and an earlier version of this brief suggested fanning them out. Port them yourself, one after another, so that each benefits from what the last one taught you and the tools end up consistent with each other.
+
+**Deliver the best version outright.** If you can see a way to make the result better, and it meets the bar above (it traces to a defect, a documented promise, a protocol requirement or a concrete benefit to an operator), it is part of this task: build it before you report. The owner does not want to read "do you want a better version?", "I could also…" or "let me know if you'd like…", at the end or at any point on the way. A sentence like that means the work is not finished. The final report contains no questions and no offers. Whatever is not done appears once, as a fact, with the reason it could not be done in this task.
+
+## What the project is, and why correctness comes first
+
+Nebula MCP is a Rust (tokio) Model Context Protocol server that gives AI agents control of a real machine: 110 tools for files, shell, processes, git, GitHub, network, Docker, browser automation, PowerShell and Windows internals. It serves stdio, and an HTTP endpoint meant to sit behind a tunnel so that its URL can be pasted into an AI platform. The repository is public (Meganugger/nebula-mcp) and describes itself as production-grade and security-gated. Its documentation says nothing is allowed by default and that "the server must never let a tool escape its configured sandbox regardless of arguments".
+
+That promise is the product. Someone who believes the README will point a remote agent at their machine with a GitHub token in the environment. Today the promise fails in ways that are easy to trigger, so the permission model comes first and everything else is built on it.
+
+## Where it stands
+
+Two things are described here: the 0.1 code on main, which an earlier session of you audited, and the unfinished overhaul branch built on top of it. Both descriptions are other sessions' findings, so check anything again before relying on it.
+
+### Main at 66dcb54: the 0.1 baseline
+
+The audit ran on 2026-11-12. "Reproduced" means it was run against the built debug binary. "Read" means that session confirmed it in the source. "Reported" means a delegated code audit found it and the session did not confirm it independently. The overhaul's working log says a later pass confirmed every reported finding, but you have not seen that evidence, so treat those items as likely and not as proven.
+
+Four crates, about 14,300 lines of Rust:
+
+- `crates/protocol`: JSON-RPC and MCP types, stdio framing (about 900 lines).
+- `crates/core`: config and hot reload, the permission engine (`EffectivePolicy`), telemetry, the `Tool` trait (about 1,900).
+- `crates/tools`: 110 tools in 13 category modules, plus `common/` for process execution, sessions, the scheduler and argument parsing (about 8,500).
+- `crates/server`: dispatch engine, HTTP transport, resources, prompts, metrics endpoint, CLI (about 2,100), and two integration test files.
+
+Documentation is README, ARCHITECTURE, SECURITY, CONFIGURATION, TOOLS, API, RUNBOOK, ROADMAP and CHANGELOG, plus `config/default.toml`.
+
+Baseline: the workspace builds, 121 tests pass and clippy with `-D warnings` is clean. `cargo fmt --check` fails on one assert in `crates/core/src/security.rs`. Cargo warns about unused dependencies (`dirs`, `num_cpus`, `regex` and `uuid` in core, `tracing` in protocol, `shell-words` in tools), and the tools crate still declares the Windows-only `windows` (DXGI, Direct3D, DWM) and `image` crates that no source file uses. Those are leftovers from NebulaDisplay, the Windows display-driver project this server was extracted from, and there are more in the docs and comments.
+
+CI has been red on main since the first feature commit. The native Windows job fails two resource tests in `crates/server/tests/integration.rs` (`resources_list_and_read` and `resource_subscription_emits_update_on_change`), and because the run stops there, the tools crate's tests did not run on Windows. Since 66dcb54 the Linux job stops at the format step, so clippy and tests no longer run there either. There is no macOS job although the README claims macOS, and nothing checks the declared `rust-version = "1.82"`.
+
+Two pieces of history. The owner's latest commit (66dcb54) deliberately made a standalone `"*"` in `allowed_commands` mean "allow every command". And PR #1, a 3,800-line "implement the full roadmap" change, was closed unmerged with no comment; its branch is gone, though `refs/pull/1/head` may still be fetchable. Treat it as reference material, not as a baseline or as a statement of what the owner wants.
+
+### The overhaul branch, as of 2026-11-14
+
+The work is on branch `hoplite/amisos-peiraieus-405652a0`, eight commits on top of 66dcb54 with head 902fe2a, and on draft pull request #2 against main ("Overhaul Nebula MCP security and reliability", empty description). Continue on that branch and that pull request. Do not start again from main and do not open a second pull request. A new thread's workspace is a shallow checkout of main on a branch of its own, so if that is where you are, fetch the overhaul branch, work from its head, push to it with an explicit refspec (`git push origin HEAD:hoplite/amisos-peiraieus-405652a0`), and take over #2 as this thread's pull request. If the head is no longer 902fe2a, read what was added before going on.
+
+Two temporary files on the branch carry the earlier sessions' state. Read both in full first.
+
+- `OVERHAUL_LOG.md` holds the baseline, a threat model with numbered guarantees, decisions D1 to D11, the plan with its status, and a table of what was verified where.
+- `HANDOFF.md` is the earlier session's notes for its successor. It describes the new core file by file, lists the remaining work per crate and per tool category, and records facts that were expensive to find: the 2026-07-28 revision in one paragraph, which clients can send a static token and which need OAuth, and how cap-std treats symlinks.
+
+Where this brief and those files disagree, this brief wins.
+
+What exists on the branch:
+
+- CI that runs format and lint, tests on Linux, Windows and macOS without fail-fast, a release and feature-build job, and a Linux-to-Windows type-check.
+- A black-box harness that drives the real binary over stdio (`crates/server/tests/support`) and six regression tests for the reproduced defects (`crates/server/tests/security_regressions.rs`). All six failed against 0.1. They are `#[ignore]`d and written against 0.1 tool names and config syntax, so they need porting before they can be switched on.
+- A rewritten `crates/core` of about 11,000 lines: strict config v2, a policy engine, checked filesystem access built on cap-std directory handles, a process spawner that owns the environment and the process-tree lifecycle, an outbound network guard, schema validation and typed arguments, tool metadata and a registry, a capability-based tool context, per-owner state, and a dispatcher meant to be the single choke point. The handoff says its 156 tests pass on Linux.
+
+What does not exist yet:
+
+- Anything that runs. The root `Cargo.toml` lists only `crates/protocol` and `crates/core` as members and excludes `crates/tools` and `crates/server`, whose sources are still the 0.1 code and do not compile against the new core. No fix in the core has been exercised through the real dispatcher or the real binary, and CI's green jobs cover two crates out of four.
+- Any ported tool, any server code on the new core, anything for the 2026-07-28 revision, any OS confinement, and every document. The version is still 0.1.0 and `rust-version` is still 1.82.
+
+Known problems on the head:
+
+- The macOS test job fails 13 of the core's `fs::tests`, including the basic read, write and root-is-allowed cases. The checked-path layer is therefore unverified on macOS, and it is the foundation of everything else.
+- The "Release and feature builds" job fails in its OpenTelemetry feature-build step.
+- The handoff says `schema.rs`, `args.rs` and `net.rs` "were written quickly and deserve a read-through before tools depend on them", and that clippy over all targets and the Windows type-check had not yet been run on the finished core.
+- The log contradicts itself in two places. Decision D7 adopts the official Rust SDK and deletes the hand-written protocol crate, while plan step 3 still describes building that crate. Plan step 5 says the tool categories are ported "fs first, then parallel", and they are not to be parallelised. Correct both when you update the log.
+
+Treat the branch as a draft by a colleague you cannot question. Its decisions were made with care and you do not need to reargue them. But nobody has reviewed the core as a whole, parts of it were written fast, and none of it has been tested end to end, so its "done" marks are claims to check.
+
+## What is wrong
+
+This is what was wrong with 0.1 at 66dcb54, and for the running server all of it still is: the new core answers part of it as a library, but no tool or transport uses that library yet. Count an item as fixed only when a test drives it through the real dispatcher and passes. The list is a floor from one day of auditing, not the full set, and the working log adds findings from a later pass. You are about to port every tool and the whole server, and that code is small enough to read completely, so read all of it yourself before you continue.
+
+**The permission model does not hold.**
+
+- The command allowlist matches the basename only (`command_key` in `crates/core/src/security.rs`; `crates/tools/src/common/exec.rs` discards the path it resolved). Reproduced: with only `echo` allowed, `terminal.run` given the path of a planted script named `echo` ran it.
+- Path checks are lexical and nothing in the repository resolves symlinks. Reproduced: `fs.read` through a symlink inside an allowed root returned a file outside it. Every path-taking tool and `resources/read` share the check.
+- The deny list applies only where a tool checks that exact path. Reproduced: `fs.search` returned the contents of a denied `.env`. Reported: `fs.glob` and `fs.tree` list denied names; recursive copy, move and delete never check entries; the default patterns miss `.env.local`, `id_ed25519` and case variants; setting `denied_paths` replaces the built-in list rather than extending it.
+- Reproduced: allowing `/work/**` does not allow `/work` itself, so the documented example configs refuse the root directory. Read: a comment claims literal-separator globbing, but the `Glob::new` defaults let `*` cross `/`.
+- Each tool is responsible for its own checks (the `Tool` trait documentation says so), and many skip them. Read: no git, Docker or PowerShell tool checks the network gate. `git.diff`, `git.log` and `git.show` push caller strings into the argument vector unvalidated, so a `from` of `--output=<path>` writes outside policy. `docker.run` places the caller's `image` positionally, so options such as a host bind mount can be injected. `terminal.run` passes a caller-supplied environment map to the child, and children inherit the server's own environment, including its auth token and any GitHub token. Reported: destructive gates are missing across git, Docker and the Windows tools; `windows.env` interpolates `scope` unescaped into PowerShell, and its elevation check is a case-sensitive string compare; `diagnostics.analyze_dump` hands caller text to `cdb -c`; `windows.service` can create a service that runs any binary as SYSTEM; `net.quic_probe` and `net.packet_capture` pass caller strings bare to curl and tcpdump.
+- Read: `github.request` sends the operator's GitHub token to any URL the caller supplies. `api()` in `crates/tools/src/github.rs` uses a `path` that begins with `http` verbatim and attaches the bearer token.
+- `allow_network` defaults to true (read) and cannot be scoped per tool. Reported: there is no destination policy, so loopback (including the server's own port and its unauthenticated metrics endpoint), private ranges and cloud metadata addresses are reachable, with redirects followed; `browser.*` will open `file://` URLs.
+- Read: the config file hot-reloads and nothing stops the file tools from writing it. The quick start creates it in the working directory, which is the first place an operator allows.
+- Read: tools advertise argument schemas, including enums and `additionalProperties: false`, but nothing validates arguments against them. Reported: several annotations are wrong, including mutating tools marked read-only.
+
+**Processes and lifecycle.**
+
+- Reproduced: call `terminal.run` with a shell command that backgrounds a `sleep`, pass a progress token, then cancel. The call returns `cancelled`, the grandchild keeps running, progress notifications for the dead token keep arriving every three seconds, and the server then exits on neither stdin EOF nor SIGTERM. The cause is that `ToolContext::guarded` in `crates/core/src/context.rs` drops the tool future on cancel or at the runtime ceiling before `run_raw`'s own cleanup runs, so the process-group kill and the heartbeat abort in `exec.rs` never execute. The existing cancellation test calls `run_checked` directly, which is why it passes.
+- Read: even when that cleanup runs, the group gets SIGTERM and only the leader gets SIGKILL; Windows has no tree kill at all; the timeout covers `child.wait()` but not the stdin write before it or the pipe drain after it; captured output keeps only the head, though failures are usually at the tail.
+- Reproduced: `net.tls_info` panics on every call, because rustls is built with both `aws-lc-rs` and `ring` and no provider is installed. The release profile sets `panic = "abort"`, so in a release build that one call would end the server for every client; in debug the request is never answered. Nothing isolates panics.
+- Reported: stdio lines have no length cap; the concurrency semaphore queues without bound and a queued call cannot be cancelled; several tools and `resources/read` load whole files or bodies before applying the output cap; sessions, scheduled jobs and subscriptions have no limits or expiry, are shared by all clients, and survive a policy change.
+
+**Protocol and transport.**
+
+- Read: over HTTP there is one engine and one set of connection state for every client: the negotiated protocol version, the in-flight map keyed by stringified request id (two clients using id 1 collide, and either can cancel the other's call), subscriptions, sessions and jobs. `Mcp-Session-Id` is a fresh UUID on every response and is never stored or checked. Every SSE stream receives every client's notifications through one broadcast channel. POST responses never stream, so a long call cannot deliver progress on its own connection or keep a tunnelled connection alive.
+- Read: HTTP auth tokens and allowed origins are a startup snapshot, so SECURITY.md's "rotate tokens by editing the config (hot-reloaded)" is untrue. Reported: the body is buffered before auth; there are no request timeouts, connection cap, failed-auth logging or rate limit; no Host check; no CORS handling, so an allow-listed browser origin still cannot connect; shutdown hangs while an SSE stream is open; the metrics endpoint has no auth and no bind guard.
+- Read: `logging/setLevel` passes an arbitrary directive to the global log filter, so any client can silence the audit log; the `logging` capability is advertised but nothing emits log notifications; `resources/*` skip the category switches, concurrency limit, timeout and metrics; there is no pagination, no resource templates or completions, and no structured tool output; a tracing span guard is held across `.await` in `handle_tool_call`. Reported: batch handling differs between the two transports.
+- The server tops out at MCP 2025-11-25, which is no longer the current revision (next section).
+
+**Platforms, documentation, hygiene.**
+
+- Resources are broken on Windows (the failing CI tests). Reported: `.cmd` shims such as `npm` cannot be spawned, and an upper-case `GIT.EXE` is denied. The 17 Windows-only tools are listed to clients on every platform and can only return `platform_unsupported` elsewhere.
+- The documents disagree with the code and with each other. ARCHITECTURE says 140 tools in 16 categories. The README table and the CHANGELOG's category counts sum to 108, because diagnostics has 9 tools, not 7. The CHANGELOG says 110 tests and "MCP 2024-11-05". `config/default.toml` says there is no allow-everything switch. RUNBOOK and the built-in prompts call `fs.mkdir`, `git.add` and `git.init`, which do not exist. Reported: `git.commit` stages only tracked files, so an agent cannot commit a new file without the shell. TOOLS.md says it is generated, but nothing checks it.
+- Read: unknown config keys are accepted silently, so a typo in a disable switch fails open; there are no workspace lints, dependency audit, dependabot or release workflow. Reported: the lockfile's real minimum Rust is above the declared 1.82; LICENSE-APACHE is a stub; SECURITY.md has no reporting policy.
+
+**Worth keeping.** Empty allowlists deny and deny patterns win. Each call resolves its policy from one atomic config snapshot, and a bad config edit keeps the last good one. Commands run without a shell, with verbatim arguments. Captured output is bounded while pipes are still drained. The cancel token is registered synchronously before the next frame is read. Stdout carries only protocol and logs go to stderr. The HTTP transport refuses to start on a non-loopback address without auth and denies unknown origins by default. TLS verification has no off switch. Also keep the typed `Args` accessors, the `ToolError` categories, `fs.edit`'s exactly-once semantics, `fs.read`'s chunk protocol, the browser driver as a constant script plus a JSON config, and the dry-run `security.*` tools.
+
+## The protocol has moved
+
+modelcontextprotocol.io listed 2026-07-28 as the current revision when checked on 2026-11-12. What follows was read through a summarizing fetch tool, so read the pages yourself before designing anything. Start at `/specification/versioning` and `/specification/2026-07-28/changelog`.
+
+The current revision makes the protocol stateless. The `initialize` handshake, protocol-level sessions and `Mcp-Session-Id` are gone. Each request carries its protocol version and client capabilities in `_meta`, and on HTTP also in the `MCP-Protocol-Version` header. `server/discover` is mandatory. `subscriptions/listen` replaces the GET stream and `resources/subscribe`. `ping` and `logging/setLevel` are removed. Results carry `resultType`, and list and read results carry `ttlMs` and `cacheScope`. POST requests need `Mcp-Method` and `Mcp-Name` headers. SSE resumability is removed. Several error codes changed. Roots, sampling and logging are deprecated, and tasks moved to an extension.
+
+Revisions up to 2025-11-25 are now "legacy". The versioning page describes a dual-era server: a client that opens with `initialize` gets legacy semantics for that stdio process or HTTP session, and a request carrying modern `_meta` is served statelessly, on the same endpoint.
+
+So 0.1 is a legacy-only implementation, and its ROADMAP plans features the current revision deletes (resumable SSE, persistent protocol sessions). Aim for a dual-era server: the current revision implemented properly, plus the legacy revisions real clients still use, with real per-session isolation on the legacy HTTP path. Nothing on the branch implements any of this yet.
+
+## What the result should be
+
+Judge the work by these outcomes rather than by the list above.
+
+- Security claims are true. There is a written threat model, every guarantee in it is enforced in a place a tool author cannot skip, and each has a test that tries to break it through the real dispatcher. Anything that cannot be guaranteed is not claimed. Every reproduced item above is pinned by a regression test that failed before the fix.
+- No input from a client can take the process down, and a failing tool affects only its own request.
+- Cancellation, timeout, client disconnect and shutdown each leave no processes, tasks or watchers behind on all three operating systems, and shutdown finishes in bounded time.
+- Two HTTP clients cannot observe or affect each other's requests, notifications, subscriptions, sessions or jobs.
+- The server speaks the current MCP revision and every legacy revision it advertises, advertises no revision or capability it does not implement, and behaves differently where the revisions differ.
+- Every tool validates its arguments against its schema before running. Its schema, description, annotations and structured output match what it does, its description is written for the model that will read it, and its errors tell that model how to correct the call. An agent can carry an ordinary change from an empty directory to a pushed commit with the typed tools alone.
+- Linux, Windows and macOS are green in CI with format, clippy, tests, a minimum-Rust check that matches what is declared, and a dependency audit. Platform behavior is claimed only where CI exercised it.
+- Every document agrees with the code, generated ones are checked for drift in CI, breaking changes have migration notes in the changelog, and the README shows how to connect real clients.
+- Nothing is left at 0.1. Every crate is back in the workspace and builds, every tool that ships runs on the new core, and no code path reaches the filesystem, a process or the network except through it.
+
+## Judgment calls
+
+The earlier session made most of these calls and recorded them as D1 to D11 in the log: snake-case tool names, opt-in categories, directory roots, network off by default, an environment allowlist for children, the official SDK for the protocol layer, embedded OAuth next to static bearer tokens, strict config keys, version 0.2.0. They stand. Build on them without rearguing them, and overturn one only when building on it shows it to be wrong, recording why. The reasoning below is what those decisions were meant to satisfy, and it is the bar to hold the existing core to.
+
+**Two tiers of security.** For typed tools, where the server performs the operation or builds the argument vector, the guarantee can be made real: paths confined after symlink resolution, deny patterns applied to every file a tool touches or reveals, gates enforced, destinations checked, no caller-controlled options. Arbitrary execution is different. Once `python`, `node`, `cargo`, `sh`, `git` or `docker` is allowed, or the owner's `"*"`, the child can do whatever the operating-system user can, and no argument filter changes that. The truthful statement for that tier is that it grants the agent the user's privileges, unless the operating system confines the child. Evaluate optional OS-level confinement for spawned processes (Landlock or bubblewrap on Linux, Seatbelt on macOS, Job Objects with restricted tokens or AppContainer on Windows), build what you can verify, and document exactly what is confined and what is not. Docker access is root-equivalent on most hosts and should be presented that way.
+
+**Make the safe path the only path.** Most of the holes exist because each tool is trusted to remember its own checks, so patching them one at a time would leave the next one latent. Move enforcement to where it cannot be skipped. Examples of the property, with the design left to you: a checked-path type that only the policy can produce; one spawn function that matches the allowlist against the executable that will actually run and owns the environment and the whole process-tree lifecycle; tool metadata that declares what a tool needs and is enforced by the dispatcher; schema validation before `call`. Resolving symlinks safely for paths that do not exist yet, without a check-then-use race, is the hard part. Look at directory-handle approaches such as `openat2` with `RESOLVE_BENEATH`, or the `cap-std` crate, before settling on `canonicalize`. There is prior art worth reading first: the reference filesystem server's symlink-aware path validation, and the process sandboxes in open-source coding agents.
+
+**Protocol layer.** The log's decision is to build on the official Rust SDK (`rmcp`) and delete the hand-written protocol crate. No server code has been written on either, so this is the one decision to confirm before you invest in it. Check that the SDK version you would use really implements the 2026-07-28 revision alongside the legacy ones, and that it leaves you enough control over transport security, per-request policy and connection state. If it does not, keeping a hand-written layer is a legitimate answer. Either way, separate connection state from the engine: per process on stdio, per real session on legacy HTTP, none for modern requests.
+
+**Remote access.** The handoff records which clients can send a static bearer token and which need OAuth. Confirm it against the clients' current documentation, because if a static token does not work with the platforms a user would paste this URL into, the headline use case does not work. Implement what the specification's authorization section requires of a server. The log commits to an embedded single-operator authorization server; that is security-critical code, so hold it to the same standard as the permission core, with tests that attack it, and state precisely which clients are supported.
+
+**What the owner chose.** Keep the name, the dual license, the general-purpose scope, both transports, and the `"*"` switch, which should stay but be documented and announced loudly at startup. Defaults may change where the docs already promise the safer behavior; `allow_network` defaulting to on contradicts "nothing is allowed by default".
+
+**Breaking changes.** At 0.1.0, breaking config keys, tool names, defaults and tool arguments is acceptable when it buys safety or correctness. Record each with migration notes. Tool names have already moved from dots to underscores (D1), because several major clients reject or rewrite dots.
+
+**Tools.** Port every category. A tool leaves the project only by a recorded decision, never because time ran out. Prefer making the existing tools correct over adding more. Add only what an agent cannot work without or what the docs already promise. Hide tools that cannot run on the current platform. Measure the size of `tools/list`, because 110 definitions is a heavy load on a client's context, and make it easy to expose only the categories in use. If a tool cannot be made safe or cannot be verified at all, say so in its description and docs or disable it by default, and record why.
+
+**The roadmap.** ROADMAP.md is not the plan. Rewrite it at the end to say what is true.
+
+## How to work
+
+**Start by knowing the whole thing.** Get onto the branch and read `OVERHAUL_LOG.md` and `HANDOFF.md`. Then read the code yourself: all of the new core, then the 0.1 tools and server you are about to port. Rerun what the handoff says passes. Reading it all is what lets you do the rest without handing any of it off.
+
+**Make the core trustworthy before building on it.** Review it against the threat model as you would someone else's pull request, since in effect it is one. Fix what you find, get clippy clean over all targets, type-check it for Windows, and get its tests green on all three operating systems in CI, starting with the macOS failures. Every later step inherits its mistakes.
+
+**Then get one path working end to end.** Bring the server up on the new core with the `fs` category, over stdio first, so that there is a real binary again. Port the six regression tests to the new names and config and switch each one on as its fix becomes reachable. The handoff proposes porting all the tools before the server. A thin working slice first is safer, because otherwise 110 tools get written against an API that has never served a request, and from that point every commit can be tested through the real dispatcher and the real binary.
+
+**After that, order still matters.** Do the rest of the protocol and session architecture (both eras, HTTP, client isolation, authorization), then the remaining tool categories one at a time, then platform work (process-tree kill on Windows, OS confinement where you can verify it), then dependency and CI hygiene, then the documents. Re-add each crate to the workspace as it is ported, so that every pushed commit builds and passes for what it contains. Nothing may remain excluded at the end.
+
+**CI is your only evidence for Windows and macOS.** Every push to any branch runs it. Push often and read the logs. Locally, `cargo check --target x86_64-pc-windows-gnu` type-checks Windows code for crates without C dependencies. Do not build further on top of a red job: a failure on one platform in the core usually means a wrong assumption that the tools will then copy.
+
+**Tests.** The 0.1 suite passed while everything above was broken, so a green suite is not evidence by itself. For each defect, write the test that fails first and drive it through the real dispatcher. Run the real binary over stdio and HTTP as well. Do not weaken, ignore or delete a test to get a pass. The six ignored regression tests are a debt, and none of them may still be ignored at the end.
+
+**Sources.** Read the specification instead of relying on memory or on the handoff's summary of it. Several dependencies are at least one breaking release behind (for example `thiserror` 1, `axum` 0.7, `notify` 6). The handoff lists the upgrades it intended; check current versions and advisories before choosing.
+
+**Keep the state on the branch.** Your context will turn over during this work, and the sandbox was restored from a snapshot once during the audit, so unpushed work can vanish. Commit in steps that each build and pass, push each one, and keep `OVERHAUL_LOG.md` current with the plan and status, the decisions and their reasons, and what was verified where. Keep `HANDOFF.md` accurate as well, or fold it into the log. When your context turns over, the next thing to do is in the log: read it again and continue, because a context turnover is not a stopping point. Before you finish, fold both files into the changelog, the architecture document and SECURITY.md, and delete them.
+
+**Public repository.** Keep working exploits for unfixed holes out of issues, the log and PR text. Describe what was hardened and let the tests carry the detail alongside the fix.
+
+**Sandbox facts.** Linux only, 2 vCPU and 8 GiB, Rust 1.100, Node present, no Docker, no Landlock, and a cold build takes about three minutes. PID 2 is `sleep infinity`, the sandbox's keepalive; a `pkill -x sleep` during the audit killed it and restarted the sandbox. When testing process cleanup, kill only PIDs or groups your test started, and give `timeout` a `-k`, because the server can ignore SIGTERM. The workspace's source-control policy rejected commands that fed command substitution into `gh` and commands that wrote and ran large heredoc scripts; literal arguments and plain pipelines went through.
+
+## Finishing
+
+Before you call it finished, go through "What the result should be" one outcome at a time and point to the evidence for each: the test, the CI run, the document. Where the evidence is missing, the work is missing, so go and do it. Do the same for every reproduced defect, for the six regression tests, and for the tool list, where each 0.1 tool should be ported, replaced, or removed by a recorded decision. Then search the diff for leftovers: ignored tests, placeholder code, excluded crates, and 0.1 tool names in documents and prompts.
+
+Deliver on the overhaul branch as pull request #2 against main, marked ready for review, with every check green on the final commit. Set the version to reflect the breaking changes. Do not merge it, and do not publish a release or a crate.
+
+The owner will not review tens of thousands of lines, so the PR description and your final report are how they will understand what changed. In the PR description, say what changed and why, list breaking changes with migration notes, and list the decisions the owner might want to reverse.
+
+End with a report that leads with what the server can now be trusted to do. Then give the evidence: what was tested, where, and on which platforms. Then state plainly what is not done or not verified and why, and what needs the owner because it lies outside the repository. That list should be short, and every entry on it should be something you could not do, not something you chose to leave. Report facts. Do not close with a question, an offer, or a suggestion of what could come next.
