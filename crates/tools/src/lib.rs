@@ -21,6 +21,7 @@ mod fs;
 mod git;
 mod github;
 mod jobs;
+mod net;
 mod process;
 mod scheduler;
 mod security;
@@ -105,6 +106,7 @@ pub fn register_all(registry: &mut ToolRegistry) -> Result<ToolState, String> {
         .into_iter()
         .chain(git::tools())
         .chain(github::tools())
+        .chain(net::tools())
         .chain(terminal::tools(&state.sessions))
         .chain(scheduler::tools(&state.jobs))
         .chain(process::tools(&state.sessions))
