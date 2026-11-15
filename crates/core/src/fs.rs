@@ -1054,6 +1054,25 @@ fn reject_special_syntax(input: &str) -> Result<()> {
     Ok(())
 }
 
+/// Dry run: would a tool whose paths are governed by `rules` be allowed to
+/// use `input` for `access`? Returns the resolved path as text, which is no
+/// capability: nothing can be opened with it.
+pub fn probe(
+    rules: &Arc<PathRules>,
+    working_dir: &Path,
+    input: &str,
+    access: Access,
+) -> Result<String> {
+    let fs = Fs::new(
+        rules.clone(),
+        working_dir.to_path_buf(),
+        true,
+        CancellationToken::new(),
+        0,
+    );
+    fs.resolve(input, access).map(|p| p.display())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
