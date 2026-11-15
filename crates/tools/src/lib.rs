@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 mod common;
 mod fs;
 mod git;
+mod github;
 mod jobs;
 mod scheduler;
 mod sessions;
@@ -99,6 +100,7 @@ pub fn register_all(registry: &mut ToolRegistry) -> Result<ToolState, String> {
     let all = fs::tools()
         .into_iter()
         .chain(git::tools())
+        .chain(github::tools())
         .chain(terminal::tools(&state.sessions))
         .chain(scheduler::tools(&state.jobs));
     for tool in all {
