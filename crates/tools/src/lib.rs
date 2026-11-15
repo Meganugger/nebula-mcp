@@ -16,6 +16,7 @@ use std::time::Duration;
 use nebula_mcp_core::{ConfigStore, Dispatcher, OwnerId, ToolRegistry};
 use tokio_util::sync::CancellationToken;
 
+mod browser;
 mod common;
 mod diagnostics;
 mod docker;
@@ -112,6 +113,7 @@ pub fn register_all(registry: &mut ToolRegistry) -> Result<ToolState, String> {
         .chain(github::tools())
         .chain(net::tools())
         .chain(docker::tools())
+        .chain(browser::tools())
         .chain(terminal::tools(&state.sessions))
         .chain(scheduler::tools(&state.jobs))
         .chain(process::tools(&state.sessions))
