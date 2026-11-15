@@ -17,6 +17,7 @@ use nebula_mcp_core::{ConfigStore, Dispatcher, OwnerId, ToolRegistry};
 use tokio_util::sync::CancellationToken;
 
 mod common;
+mod docker;
 mod fs;
 mod git;
 mod github;
@@ -107,6 +108,7 @@ pub fn register_all(registry: &mut ToolRegistry) -> Result<ToolState, String> {
         .chain(git::tools())
         .chain(github::tools())
         .chain(net::tools())
+        .chain(docker::tools())
         .chain(terminal::tools(&state.sessions))
         .chain(scheduler::tools(&state.jobs))
         .chain(process::tools(&state.sessions))
