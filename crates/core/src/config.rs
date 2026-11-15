@@ -467,6 +467,19 @@ impl Config {
             .map_err(|e| ConfigError::new(format!("serialising configuration: {e}")))
     }
 
+    /// This configuration as TOML with every secret replaced, fit to show to
+    /// an operator or a client.
+    pub fn to_redacted_toml(&self) -> Result<String, ConfigError> {
+        let mut copy = self.clone();
+        for token in &mut copy.transport.http.auth_tokens {
+            *token = "<redacted>".to_string();
+        }
+        if let Some(secret) = &mut copy.transport.http.oauth.approval_secret {
+            *secret = "<redacted>".to_string();
+        }
+        copy.to_toml_string()
+    }
+
     /// Check names against the registry and values against their ranges.
     /// Returns warnings; an `Err` means the config must not be used.
     pub fn validate(&self, catalog: &Catalog) -> Result<Vec<String>, ConfigError> {

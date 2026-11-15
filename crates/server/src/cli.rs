@@ -360,14 +360,7 @@ allow_elevated = false
 
 /// The configuration as TOML with every secret replaced.
 fn redacted(config: &Config) -> Result<String, String> {
-    let mut copy = config.clone();
-    for token in &mut copy.transport.http.auth_tokens {
-        *token = "<redacted>".to_string();
-    }
-    if let Some(secret) = &mut copy.transport.http.oauth.approval_secret {
-        *secret = "<redacted>".to_string();
-    }
-    copy.to_toml_string().map_err(|e| e.to_string())
+    config.to_redacted_toml().map_err(|e| e.to_string())
 }
 
 fn list_tools(app: &App, all: bool, json: bool) -> Result<(), String> {
