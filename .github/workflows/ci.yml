@@ -23,8 +23,12 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - name: Test core
-        run: cargo test -p nebula-mcp-core --all-targets
+      - name: Test core config and context
+        run: cargo test -p nebula-mcp-core config:: context::
+      - name: Test core security
+        run: cargo test -p nebula-mcp-core security::
+      - name: Test core primitives
+        run: cargo test -p nebula-mcp-core error:: metrics:: tool::
       - name: Test protocol
         run: cargo test -p nebula-mcp-protocol --all-targets
       - name: Test tools
@@ -65,8 +69,12 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Build
         run: cargo build --workspace
-      - name: Test core
-        run: cargo test -p nebula-mcp-core --all-targets
+      - name: Test core config and context
+        run: cargo test -p nebula-mcp-core config:: context::
+      - name: Test core security
+        run: cargo test -p nebula-mcp-core security::
+      - name: Test core primitives
+        run: cargo test -p nebula-mcp-core error:: metrics:: tool::
       - name: Test protocol
         run: cargo test -p nebula-mcp-protocol --all-targets
       - name: Test tools
@@ -89,8 +97,12 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - name: Test core
-        run: cargo test -p nebula-mcp-core --all-targets
+      - name: Test core config and context
+        run: cargo test -p nebula-mcp-core config:: context::
+      - name: Test core security
+        run: cargo test -p nebula-mcp-core security::
+      - name: Test core primitives
+        run: cargo test -p nebula-mcp-core error:: metrics:: tool::
       - name: Test protocol
         run: cargo test -p nebula-mcp-protocol --all-targets
       - name: Test tools
