@@ -51,3 +51,4 @@ tempfile = { workspace = true }
 tokio = { workspace = true }
 which = { workspace = true }
 reqwest = { workspace = true }
+url = { workspace = true }
