@@ -27,7 +27,7 @@
                     └──────────┬───────────┘
                                │
                     ┌──────────▼───────────┐
-                    │  nebula-mcp-tools    │  140 tools in 16 category modules
+                    │  nebula-mcp-tools    │  110 tools in 13 category modules
                     └──────────┬───────────┘
                                │
                     ┌──────────▼───────────┐
@@ -43,8 +43,9 @@ and tools have no knowledge of dispatch.
 Pure data + transport. Models JSON-RPC requests/responses/errors and the MCP
 subset needed for a tools server (`initialize`, `tools/list`, `tools/call`,
 `ping`, notifications). `FrameReader`/`FrameWriter` implement the
-newline-delimited JSON stdio framing; the writer is cloneable and serialises
-each frame atomically so concurrent tasks can respond safely. No `unsafe`.
+newline-delimited JSON stdio framing with an 8 MiB input-frame cap; the writer
+is cloneable and serialises each frame atomically so concurrent tasks can
+respond safely. No `unsafe`.
 
 ### `nebula-mcp-core`
 
@@ -58,9 +59,10 @@ The runtime foundation:
   and ignored, leaving the last good config live.
 - **security** — `EffectivePolicy`, computed per tool by layering the per-tool
   override on the `[security]` baseline. It is the only place that decides path
-  access (allow/deny globs + lexical `..` containment), command allowlisting,
+  access (allow/deny globs + symlink-aware `..` containment), command allowlisting,
   timeouts, the runtime ceiling, output caps, and the elevation/network/
-  destructive gates.
+  destructive gates. The dispatcher validates every call against the tool's
+  advertised JSON Schema before invoking it.
 - **telemetry** — a `tracing` subscriber writing JSON or pretty logs to
   **stderr** (never stdout) plus optional rotating files, and an optional
   OpenTelemetry OTLP layer behind the `otel` feature.
@@ -99,17 +101,20 @@ compiles on every host; on non-Windows they return `platform_unsupported`.
 
 The dispatch engine, transports and CLI. Alongside `tools/*` it implements MCP
 `resources/*` (workspace files exposed under the same path policy), `prompts/*`
-(curated engineering-workflow prompts), progress notifications, and
-`logging/setLevel` (backed by a reloadable tracing filter).
+(curated engineering-workflow prompts), progress notifications, and the
+legacy `logging/setLevel` method (backed by a reloadable tracing filter).
 
 Two transports share the same dispatch engine:
 
 - **stdio** (`FrameReader`/`FrameWriter`) — newline-delimited JSON-RPC, for
   local editors.
 - **HTTP** (`http` module) — the MCP **Streamable HTTP** binding built on
-  `axum`: `POST /mcp` for JSON-RPC request/response, `GET /mcp` for a
-  server-initiated SSE notification stream, bearer-token auth and an Origin
-  allow-list. This is what makes the server reachable by a URL.
+  `axum`: current clients use `POST /mcp` with per-request metadata and
+  request-scoped responses; legacy clients retain the older session-bound
+  compatibility path. Legacy session state, notification fan-out, and
+  subscriptions are isolated per session. Bearer-token auth and an Origin
+  allow-list protect the endpoint. This is what makes the server reachable by
+  a URL.
 
 ## Request lifecycle
 
