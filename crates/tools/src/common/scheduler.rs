@@ -276,8 +276,9 @@ mod tests {
     use nebula_mcp_core::security::EffectivePolicy;
 
     fn ctx() -> ToolContext {
+        let command = if cfg!(windows) { "cmd" } else { "echo" };
         let base = SecurityConfig {
-            allowed_commands: vec!["echo".into()],
+            allowed_commands: vec![command.into()],
             allowed_paths: vec!["/**".into()],
             default_timeout_secs: 10,
             max_runtime_secs: 30,
@@ -296,16 +297,33 @@ mod tests {
         }
     }
 
+    fn echo_program() -> &'static str {
+        if cfg!(windows) {
+            "cmd"
+        } else {
+            "echo"
+        }
+    }
+
+    fn echo_args(text: &str) -> Vec<String> {
+        if cfg!(windows) {
+            vec!["/C".into(), "echo".into(), text.into()]
+        } else {
+            vec![text.into()]
+        }
+    }
+
     #[tokio::test]
     async fn once_job_runs_and_captures_output() {
-        if which::which("echo").is_err() {
+        let program = echo_program();
+        if which::which(program).is_err() {
             return;
         }
         let mgr = SchedulerManager::new();
         let id = mgr.schedule(
             JobEnv::from_context(&ctx()),
-            "echo".into(),
-            vec!["scheduled".into()],
+            program.into(),
+            echo_args("scheduled"),
             0,
             None,
         );
@@ -326,10 +344,11 @@ mod tests {
     #[tokio::test]
     async fn cancel_stops_interval_job() {
         let mgr = SchedulerManager::new();
+        let program = echo_program();
         let id = mgr.schedule(
             JobEnv::from_context(&ctx()),
-            "echo".into(),
-            vec!["tick".into()],
+            program.into(),
+            echo_args("tick"),
             0,
             Some(1),
         );
