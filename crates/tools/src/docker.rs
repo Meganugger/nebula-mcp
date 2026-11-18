@@ -39,6 +39,10 @@ async fn docker(
     label: &str,
     timeout: Option<u64>,
 ) -> Result<CallToolResult> {
+    // Access to the Docker daemon is commonly equivalent to host root. Keep
+    // it behind the explicit elevation gate rather than treating it as an
+    // ordinary local executable.
+    ctx.policy.ensure_elevation_allowed()?;
     let spec = CommandSpec::new(DOCKER, ctx.working_dir.clone(), ctx).args(args);
     let result = run_checked(ctx, spec, timeout).await?;
     Ok(exec_result(label, &result))
@@ -212,7 +216,14 @@ impl Tool for DockerRun {
             v.push("-p".into());
             v.push(p);
         }
-        v.push(a.str("image")?.into());
+        let image = a.str("image")?;
+        if image.starts_with('-') {
+            return Err(ToolError::InvalidArguments(
+                "image must be an image reference, not a Docker option".into(),
+            ));
+        }
+        v.push("--".into());
+        v.push(image.into());
         v.extend(a.opt_str_array("command")?);
         docker(ctx, v, "docker run", a.opt_u64("timeoutSecs")?).await
     }
