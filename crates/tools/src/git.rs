@@ -61,6 +61,9 @@ impl Tool for GitTool {
         if self.destructive {
             ctx.policy.ensure_destructive_allowed(self.name)?;
         }
+        if matches!(self.name, "git.push" | "git.pull" | "git.fetch") {
+            ctx.policy.ensure_network_allowed()?;
+        }
         let timeout = a.opt_u64("timeoutSecs")?;
         let git_args = (self.build)(&a)?;
         let mut full = vec!["-C".to_string(), repo.display().to_string()];
@@ -110,7 +113,12 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
             schema_blame,
             |a| {
                 let file = a.str("path")?;
-                Ok(vec!["blame".into(), "--line-porcelain".into(), file.into()])
+                Ok(vec![
+                    "blame".into(),
+                    "--line-porcelain".into(),
+                    "--".into(),
+                    file.into(),
+                ])
             },
             ro = true,
             dstr = false
@@ -143,7 +151,7 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
             "git.merge",
             "Merge a ref into the current branch.",
             schema_ref_required,
-            |a| Ok(vec!["merge".into(), a.str("ref")?.into()]),
+            |a| Ok(vec!["merge".into(), positional(a.str("ref")?, "ref")?]),
             ro = false,
             dstr = false
         ),
@@ -247,7 +255,10 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
             "git.cherry_pick",
             "Apply the changes of an existing commit. Provide 'commit'.",
             schema_commit_ref,
-            |a| Ok(vec!["cherry-pick".into(), a.str("commit")?.into()]),
+            |a| Ok(vec![
+                "cherry-pick".into(),
+                positional(a.str("commit")?, "commit")?,
+            ]),
             ro = false,
             dstr = false
         ),
@@ -511,16 +522,20 @@ fn build_worktree(a: &Args) -> Result<Vec<String>> {
     match a.str_or("action", "list")? {
         "list" => Ok(vec!["worktree".into(), "list".into(), "--porcelain".into()]),
         "add" => {
-            let mut v = vec!["worktree".into(), "add".into(), a.str("path")?.into()];
+            let mut v = vec![
+                "worktree".into(),
+                "add".into(),
+                positional(a.str("path")?, "path")?,
+            ];
             if let Some(r) = a.opt_str("ref")? {
-                v.push(r.into());
+                v.push(positional(r, "ref")?);
             }
             Ok(v)
         }
         "remove" => Ok(vec![
             "worktree".into(),
             "remove".into(),
-            a.str("path")?.into(),
+            positional(a.str("path")?, "path")?,
         ]),
         other => Err(ToolError::InvalidArguments(format!(
             "unknown worktree action '{other}'"
@@ -533,12 +548,13 @@ fn build_revert(a: &Args) -> Result<Vec<String>> {
     if a.bool_or("noEdit", true)? {
         v.push("--no-edit".into());
     }
-    v.push(a.str("commit")?.into());
+    v.push(positional(a.str("commit")?, "commit")?);
     Ok(v)
 }
 
 fn build_show(a: &Args) -> Result<Vec<String>> {
-    let mut v = vec!["show".to_string(), a.str_or("object", "HEAD")?.into()];
+    let object = a.str_or("object", "HEAD")?;
+    let mut v = vec!["show".to_string(), revision(object, "object")?];
     if let Some(path) = a.opt_str("path")? {
         v.push("--".into());
         v.push(path.into());
@@ -551,7 +567,7 @@ fn build_apply(a: &Args) -> Result<Vec<String>> {
     if a.bool_or("check", false)? {
         v.push("--check".into());
     }
-    v.push(a.str("patch")?.into());
+    v.push(positional(a.str("patch")?, "patch")?);
     Ok(v)
 }
 
@@ -561,10 +577,10 @@ fn build_diff(a: &Args) -> Result<Vec<String>> {
         v.push("--staged".into());
     }
     if let Some(from) = a.opt_str("from")? {
-        v.push(from.into());
+        v.push(revision(from, "from")?);
     }
     if let Some(to) = a.opt_str("to")? {
-        v.push(to.into());
+        v.push(revision(to, "to")?);
     }
     if let Some(path) = a.opt_str("path")? {
         v.push("--".into());
@@ -582,7 +598,7 @@ fn build_log(a: &Args) -> Result<Vec<String>> {
         "--pretty=format:%H%x1f%an%x1f%ad%x1f%s".into(),
     ];
     if let Some(range) = a.opt_str("revRange")? {
-        v.push(range.into());
+        v.push(revision(range, "revRange")?);
     }
     if let Some(path) = a.opt_str("path")? {
         v.push("--".into());
@@ -619,7 +635,7 @@ fn build_checkout(a: &Args) -> Result<Vec<String>> {
     if a.bool_or("create", false)? {
         v.push("-b".into());
     }
-    v.push(a.str("ref")?.into());
+    v.push(positional(a.str("ref")?, "ref")?);
     Ok(v)
 }
 
@@ -630,7 +646,7 @@ fn build_rebase(a: &Args) -> Result<Vec<String>> {
     let target = a
         .opt_str("ref")?
         .ok_or_else(|| ToolError::InvalidArguments("rebase requires 'ref' or 'control'".into()))?;
-    Ok(vec!["rebase".into(), target.into()])
+    Ok(vec!["rebase".into(), positional(target, "ref")?])
 }
 
 fn build_stash(a: &Args) -> Result<Vec<String>> {
@@ -661,12 +677,12 @@ fn build_tag(a: &Args) -> Result<Vec<String>> {
                 Ok(vec![
                     "tag".into(),
                     "-a".into(),
-                    name.into(),
+                    positional(name, "name")?,
                     "-m".into(),
                     msg.into(),
                 ])
             } else {
-                Ok(vec!["tag".into(), name.into()])
+                Ok(vec!["tag".into(), positional(name, "name")?])
             }
         }
     }
@@ -676,7 +692,7 @@ fn build_bisect(a: &Args) -> Result<Vec<String>> {
     let action = a.str("action")?;
     let mut v = vec!["bisect".into(), action.into()];
     if let Some(rev) = a.opt_str("rev")? {
-        v.push(rev.into());
+        v.push(positional(rev, "rev")?);
     }
     Ok(v)
 }
@@ -702,9 +718,9 @@ fn build_push(a: &Args) -> Result<Vec<String>> {
     if a.bool_or("setUpstream", false)? {
         v.push("-u".into());
     }
-    v.push(a.str_or("remote", "origin")?.into());
+    v.push(positional(a.str_or("remote", "origin")?, "remote")?);
     if let Some(b) = a.opt_str("branch")? {
-        v.push(b.into());
+        v.push(positional(b, "branch")?);
     }
     Ok(v)
 }
@@ -715,9 +731,9 @@ fn build_pull(a: &Args) -> Result<Vec<String>> {
         v.push("--rebase".into());
     }
     if let Some(remote) = a.opt_str("remote")? {
-        v.push(remote.into());
+        v.push(positional(remote, "remote")?);
         if let Some(b) = a.opt_str("branch")? {
-            v.push(b.into());
+            v.push(positional(b, "branch")?);
         }
     }
     Ok(v)
@@ -731,7 +747,7 @@ fn build_fetch(a: &Args) -> Result<Vec<String>> {
     if a.bool_or("all", false)? {
         v.push("--all".into());
     } else {
-        v.push(a.str_or("remote", "origin")?.into());
+        v.push(positional(a.str_or("remote", "origin")?, "remote")?);
     }
     Ok(v)
 }
@@ -739,7 +755,7 @@ fn build_fetch(a: &Args) -> Result<Vec<String>> {
 fn build_reset(a: &Args) -> Result<Vec<String>> {
     let mode = a.str_or("mode", "mixed")?;
     let mut v = vec!["reset".to_string(), format!("--{mode}")];
-    v.push(a.str_or("ref", "HEAD")?.into());
+    v.push(positional(a.str_or("ref", "HEAD")?, "ref")?);
     Ok(v)
 }
 
@@ -779,7 +795,23 @@ fn build_submodule(a: &Args) -> Result<Vec<String>> {
 }
 
 fn require(a: &Args, key: &str) -> Result<String> {
-    Ok(a.str(key)?.to_string())
+    positional(a.str(key)?, key)
+}
+
+/// Git revisions are positional arguments in these builders. Reject option
+/// spellings instead of allowing a caller to inject a second command option.
+fn revision(value: &str, field: &str) -> Result<String> {
+    positional(value, field)
+}
+
+/// Reject option spellings for caller-controlled positional Git arguments.
+fn positional(value: &str, field: &str) -> Result<String> {
+    if value.starts_with('-') {
+        return Err(ToolError::InvalidArguments(format!(
+            "{field} must not start with '-'"
+        )));
+    }
+    Ok(value.to_string())
 }
 
 #[cfg(test)]
@@ -830,6 +862,21 @@ mod tests {
         let v = json!({"force": false});
         let a = Args::new(&v).unwrap();
         assert!(build_clean(&a).is_err());
+    }
+
+    #[test]
+    fn revision_arguments_cannot_be_options() {
+        let value = json!({"from": "--output=/tmp/out"});
+        let args = Args::new(&value).unwrap();
+        assert!(build_diff(&args).is_err());
+
+        let value = json!({"revRange": "--output=/tmp/out"});
+        let args = Args::new(&value).unwrap();
+        assert!(build_log(&args).is_err());
+
+        let value = json!({"object": "--output=/tmp/out"});
+        let args = Args::new(&value).unwrap();
+        assert!(build_show(&args).is_err());
     }
 
     #[tokio::test]
