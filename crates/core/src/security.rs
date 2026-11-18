@@ -419,6 +419,10 @@ mod tests {
         EffectivePolicy::build("test.tool", &base, None).unwrap()
     }
 
+    fn canonical_temp_dir() -> std::path::PathBuf {
+        std::fs::canonicalize(std::env::temp_dir()).unwrap()
+    }
+
     #[test]
     fn empty_allowlist_denies_everything() {
         let dir = tempfile::tempdir().unwrap();
@@ -432,7 +436,9 @@ mod tests {
     #[test]
     fn allowed_glob_permits_matching_path() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("work");
+        let root = canonical_temp_dir()
+            .join(dir.path().file_name().unwrap())
+            .join("work");
         std::fs::create_dir_all(&root).unwrap();
         let pattern = format!("{}/**", root.display());
         let p = policy_with(&[&pattern], &[]);
@@ -443,7 +449,9 @@ mod tests {
     #[test]
     fn denied_glob_overrides_allowed() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("work");
+        let root = canonical_temp_dir()
+            .join(dir.path().file_name().unwrap())
+            .join("work");
         std::fs::create_dir_all(&root).unwrap();
         let allowed = format!("{}/**", root.display());
         let base = SecurityConfig {
@@ -459,7 +467,9 @@ mod tests {
     #[test]
     fn parent_traversal_is_contained() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("work");
+        let root = canonical_temp_dir()
+            .join(dir.path().file_name().unwrap())
+            .join("work");
         std::fs::create_dir_all(&root).unwrap();
         let pattern = format!("{}/**", root.display());
         let p = policy_with(&[&pattern], &[]);
@@ -474,7 +484,9 @@ mod tests {
     #[test]
     fn relative_paths_resolve_against_base() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("work");
+        let root = canonical_temp_dir()
+            .join(dir.path().file_name().unwrap())
+            .join("work");
         std::fs::create_dir_all(&root).unwrap();
         let pattern = format!("{}/**", root.display());
         let p = policy_with(&[&pattern], &[]);
@@ -563,7 +575,9 @@ mod tests {
     #[test]
     fn allowed_root_matches_the_root_directory() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("work");
+        let root = canonical_temp_dir()
+            .join(dir.path().file_name().unwrap())
+            .join("work");
         std::fs::create_dir_all(&root).unwrap();
         let pattern = format!("{}/**", root.display());
         let p = policy_with(&[&pattern], &[]);

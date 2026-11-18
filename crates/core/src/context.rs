@@ -129,7 +129,8 @@ mod tests {
     use crate::config::SecurityConfig;
 
     fn ctx() -> ToolContext {
-        let temp_root = std::env::temp_dir()
+        let temp_root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
             .to_string_lossy()
             .replace('\\', "/")
             .trim_end_matches('/')
