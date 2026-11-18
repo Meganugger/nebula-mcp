@@ -22,11 +22,22 @@ use serde_json::Value;
 /// add beyond that (structured tool output, elicitation, tasks, icons,
 /// OAuth discovery, …) is opt-in via capabilities this server does not
 /// advertise.
-pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
-    &["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[
+    "2024-11-05",
+    "2025-03-26",
+    "2025-06-18",
+    "2025-11-25",
+    "2026-07-28",
+];
 
 /// The newest protocol revision this server supports.
-pub const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
+pub const LATEST_PROTOCOL_VERSION: &str = "2026-07-28";
+
+/// Whether a revision uses per-request metadata rather than initialization.
+#[must_use]
+pub fn is_modern_protocol_version(version: &str) -> bool {
+    version >= "2026-07-28"
+}
 
 /// Negotiate the protocol version per the MCP lifecycle specification.
 ///

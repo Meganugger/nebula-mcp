@@ -138,6 +138,10 @@ pub mod error_codes {
     pub const TOOL_EXECUTION_ERROR: i64 = -32001;
     /// The request was cancelled or timed out (application code).
     pub const REQUEST_CANCELLED: i64 = -32002;
+    /// The request's protocol metadata and transport headers disagree.
+    pub const HEADER_MISMATCH: i64 = -32020;
+    /// The server does not implement the requested protocol revision.
+    pub const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
 }
 
 #[cfg(test)]
