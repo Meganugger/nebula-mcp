@@ -24,11 +24,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Test core config and context
-        run: cargo test -p nebula-mcp-core config:: context::
+        run: "cargo test -p nebula-mcp-core config:: context::"
       - name: Test core security
-        run: cargo test -p nebula-mcp-core security::
+        run: "cargo test -p nebula-mcp-core security::"
       - name: Test core primitives
-        run: cargo test -p nebula-mcp-core error:: metrics:: tool::
+        run: "cargo test -p nebula-mcp-core error:: metrics:: tool::"
       - name: Test protocol
         run: cargo test -p nebula-mcp-protocol --all-targets
       - name: Test tools
@@ -70,11 +70,11 @@ jobs:
       - name: Build
         run: cargo build --workspace
       - name: Test core config and context
-        run: cargo test -p nebula-mcp-core config:: context::
+        run: "cargo test -p nebula-mcp-core config:: context::"
       - name: Test core security
-        run: cargo test -p nebula-mcp-core security::
+        run: "cargo test -p nebula-mcp-core security::"
       - name: Test core primitives
-        run: cargo test -p nebula-mcp-core error:: metrics:: tool::
+        run: "cargo test -p nebula-mcp-core error:: metrics:: tool::"
       - name: Test protocol
         run: cargo test -p nebula-mcp-protocol --all-targets
       - name: Test tools
@@ -98,11 +98,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Test core config and context
-        run: cargo test -p nebula-mcp-core config:: context::
+        run: "cargo test -p nebula-mcp-core config:: context::"
       - name: Test core security
-        run: cargo test -p nebula-mcp-core security::
+        run: "cargo test -p nebula-mcp-core security::"
       - name: Test core primitives
-        run: cargo test -p nebula-mcp-core error:: metrics:: tool::
+        run: "cargo test -p nebula-mcp-core error:: metrics:: tool::"
       - name: Test protocol
         run: cargo test -p nebula-mcp-protocol --all-targets
       - name: Test tools
