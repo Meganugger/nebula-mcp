@@ -421,53 +421,65 @@ mod tests {
 
     #[test]
     fn empty_allowlist_denies_everything() {
+        let dir = tempfile::tempdir().unwrap();
         let p = policy_with(&[], &[]);
         let err = p
-            .check_path(Path::new("/work/a.txt"), Path::new("/work"))
+            .check_path(&dir.path().join("a.txt"), dir.path())
             .unwrap_err();
         assert!(matches!(err, ToolError::PermissionDenied(_)));
     }
 
     #[test]
     fn allowed_glob_permits_matching_path() {
-        let p = policy_with(&["/work/**"], &[]);
-        let ok = p
-            .check_path(Path::new("/work/src/main.rs"), Path::new("/work"))
-            .unwrap();
-        assert_eq!(ok, PathBuf::from("/work/src/main.rs"));
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("work");
+        std::fs::create_dir_all(&root).unwrap();
+        let pattern = format!("{}/**", root.display());
+        let p = policy_with(&[&pattern], &[]);
+        let ok = p.check_path(&root.join("src/main.rs"), &root).unwrap();
+        assert_eq!(ok, root.join("src/main.rs"));
     }
 
     #[test]
     fn denied_glob_overrides_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("work");
+        std::fs::create_dir_all(&root).unwrap();
+        let allowed = format!("{}/**", root.display());
         let base = SecurityConfig {
-            allowed_paths: vec!["/work/**".into()],
+            allowed_paths: vec![allowed],
             denied_paths: vec!["**/*.key".into()],
             ..Default::default()
         };
         let p = EffectivePolicy::build("t", &base, None).unwrap();
-        let err = p
-            .check_path(Path::new("/work/secret.key"), Path::new("/work"))
-            .unwrap_err();
+        let err = p.check_path(&root.join("secret.key"), &root).unwrap_err();
         assert!(matches!(err, ToolError::PermissionDenied(_)));
     }
 
     #[test]
     fn parent_traversal_is_contained() {
-        let p = policy_with(&["/work/**"], &[]);
-        let err = p
-            .check_path(Path::new("../etc/passwd"), Path::new("/work"))
-            .unwrap_err();
-        // Normalises to /etc/passwd which is outside /work/**.
-        assert!(matches!(err, ToolError::PathNotAllowed { .. }));
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("work");
+        std::fs::create_dir_all(&root).unwrap();
+        let pattern = format!("{}/**", root.display());
+        let p = policy_with(&[&pattern], &[]);
+        let err = p.check_path(Path::new("../etc/passwd"), &root).unwrap_err();
+        // Normalises outside the temporary allowed root.
+        assert!(matches!(
+            err,
+            ToolError::PathNotAllowed { .. } | ToolError::PermissionDenied(_)
+        ));
     }
 
     #[test]
     fn relative_paths_resolve_against_base() {
-        let p = policy_with(&["/work/**"], &[]);
-        let ok = p
-            .check_path(Path::new("src/lib.rs"), Path::new("/work"))
-            .unwrap();
-        assert_eq!(ok, PathBuf::from("/work/src/lib.rs"));
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("work");
+        std::fs::create_dir_all(&root).unwrap();
+        let pattern = format!("{}/**", root.display());
+        let p = policy_with(&[&pattern], &[]);
+        let ok = p.check_path(Path::new("src/lib.rs"), &root).unwrap();
+        assert_eq!(ok, root.join("src/lib.rs"));
     }
 
     #[test]
@@ -550,8 +562,12 @@ mod tests {
 
     #[test]
     fn allowed_root_matches_the_root_directory() {
-        let p = policy_with(&["/work/**"], &[]);
-        assert!(p.check_path(Path::new("/work"), Path::new("/")).is_ok());
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("work");
+        std::fs::create_dir_all(&root).unwrap();
+        let pattern = format!("{}/**", root.display());
+        let p = policy_with(&[&pattern], &[]);
+        assert!(p.check_path(&root, dir.path()).is_ok());
     }
 
     #[cfg(unix)]

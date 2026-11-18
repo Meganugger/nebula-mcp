@@ -23,8 +23,14 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - name: Test
-        run: cargo test --workspace --all-targets
+      - name: Test core
+        run: cargo test -p nebula-mcp-core --all-targets
+      - name: Test protocol
+        run: cargo test -p nebula-mcp-protocol --all-targets
+      - name: Test tools
+        run: cargo test -p nebula-mcp-tools --all-targets
+      - name: Test server
+        run: cargo test -p nebula-mcp-server --all-targets
       - name: Generated tool documentation
         run: python3 scripts/check_tools_doc.py
       - name: Build release
@@ -59,8 +65,14 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Build
         run: cargo build --workspace
-      - name: Test
-        run: cargo test --workspace --all-targets
+      - name: Test core
+        run: cargo test -p nebula-mcp-core --all-targets
+      - name: Test protocol
+        run: cargo test -p nebula-mcp-protocol --all-targets
+      - name: Test tools
+        run: cargo test -p nebula-mcp-tools --all-targets
+      - name: Test server
+        run: cargo test -p nebula-mcp-server --all-targets
 
   macos:
     name: macOS — build, test, lint
@@ -77,8 +89,14 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - name: Test
-        run: cargo test --workspace --all-targets
+      - name: Test core
+        run: cargo test -p nebula-mcp-core --all-targets
+      - name: Test protocol
+        run: cargo test -p nebula-mcp-protocol --all-targets
+      - name: Test tools
+        run: cargo test -p nebula-mcp-tools --all-targets
+      - name: Test server
+        run: cargo test -p nebula-mcp-server --all-targets
       - name: Build release
         run: cargo build --release
 
@@ -87,7 +105,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.89.0
       - uses: Swatinem/rust-cache@v2
       - name: Check declared MSRV
         run: cargo check --workspace --all-targets
