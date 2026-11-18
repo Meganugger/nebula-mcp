@@ -48,7 +48,7 @@ notify = "6.1"
 notify-debouncer-mini = "0.4"
 which = "6.0"
 uuid = { version = "1.10", features = ["v4", "serde"] }
-time = { version = "0.3", features = ["formatting", "macros"] }
+time = { version = "0.3.47", features = ["formatting", "macros"] }
 parking_lot = "0.12"
 dashmap = "6.1"
 
