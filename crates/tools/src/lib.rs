@@ -50,6 +50,7 @@ impl ToolServices {
     pub fn new() -> Self {
         let http = reqwest::Client::builder()
             .user_agent(concat!("nebula-mcp/", env!("CARGO_PKG_VERSION")))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_default();
         Self {

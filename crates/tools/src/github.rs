@@ -22,6 +22,7 @@ use crate::ToolServices;
 
 const CATEGORY: &str = "github";
 const API_BASE: &str = "https://api.github.com";
+const API_HOST: &str = "api.github.com";
 
 /// Build GitHub tools.
 pub fn tools(services: &ToolServices) -> Vec<Arc<dyn Tool>> {
@@ -60,8 +61,15 @@ async fn api(
     body: Option<Value>,
 ) -> Result<Value> {
     ctx.policy.ensure_network_allowed()?;
-    let url = if path.starts_with("http") {
-        path.to_string()
+    let url = if path.starts_with("http://") || path.starts_with("https://") {
+        let parsed = url::Url::parse(path)
+            .map_err(|e| ToolError::InvalidArguments(format!("invalid GitHub URL: {e}")))?;
+        if parsed.scheme() != "https" || parsed.host_str() != Some(API_HOST) {
+            return Err(ToolError::PermissionDenied(
+                "github.request only permits https://api.github.com endpoints".into(),
+            ));
+        }
+        parsed.to_string()
     } else {
         format!("{API_BASE}/{}", path.trim_start_matches('/'))
     };
@@ -146,6 +154,15 @@ impl Tool for GitHubClone {
         let a = Args::new(&args)?;
         ctx.policy.ensure_network_allowed()?;
         let url = a.str("url")?.to_string();
+        let parsed = url::Url::parse(&url)
+            .map_err(|e| ToolError::InvalidArguments(format!("invalid clone URL: {e}")))?;
+        if parsed.scheme() != "https"
+            || !matches!(parsed.host_str(), Some("github.com" | "www.github.com"))
+        {
+            return Err(ToolError::PermissionDenied(
+                "github.clone only permits HTTPS GitHub repository URLs".into(),
+            ));
+        }
         let dir = ctx.resolve_path(a.str("dir")?)?;
         let mut git_args = vec!["clone".to_string()];
         if let Some(depth) = a.opt_u64("depth")? {
