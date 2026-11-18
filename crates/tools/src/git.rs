@@ -824,6 +824,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     fn ctx_in(dir: &std::path::Path) -> ToolContext {
+        let dir = std::fs::canonicalize(dir).unwrap();
         let base = SecurityConfig {
             allowed_paths: vec![format!("{}/**", dir.display()), dir.display().to_string()],
             allowed_commands: vec!["git".into()],
@@ -836,7 +837,7 @@ mod tests {
         let policy = EffectivePolicy::build("git", &base, None).unwrap();
         ToolContext {
             policy: Arc::new(policy),
-            working_dir: dir.to_path_buf(),
+            working_dir: dir,
             cancel: CancellationToken::new(),
             metrics: Metrics::new(),
             config: Arc::new(Default::default()),
@@ -906,12 +907,10 @@ mod tests {
     async fn reset_hard_denied_without_destructive() {
         let dir = tempfile::tempdir().unwrap();
         let mut ctx = ctx_in(dir.path());
+        let dir = std::fs::canonicalize(dir.path()).unwrap();
         // strip destructive
         let base = SecurityConfig {
-            allowed_paths: vec![
-                format!("{}/**", dir.path().display()),
-                dir.path().display().to_string(),
-            ],
+            allowed_paths: vec![format!("{}/**", dir.display()), dir.display().to_string()],
             allowed_commands: vec!["git".into()],
             allow_destructive: false,
             ..Default::default()
