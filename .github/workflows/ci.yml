@@ -23,58 +23,8 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - name: Test core config
-        run: "cargo test -p nebula-mcp-core config::"
-      - name: Test core context
-        run: "cargo test -p nebula-mcp-core context::"
-      - name: Test core security
-        run: "cargo test -p nebula-mcp-core security::"
-      - name: Test core error
-        run: "cargo test -p nebula-mcp-core error::"
-      - name: Test core metrics
-        run: "cargo test -p nebula-mcp-core metrics::"
-      - name: Test core tool
-        run: "cargo test -p nebula-mcp-core tool::"
-      - name: Test protocol
-        run: cargo test -p nebula-mcp-protocol --all-targets
-      - name: Test tools common
-        run: "cargo test -p nebula-mcp-tools common::"
-      - name: Test tools filesystem edit
-        run: "cargo test -p nebula-mcp-tools filesystem::tests::edit_replaces_exact_string"
-      - name: Test tools filesystem read/write
-        run: "cargo test -p nebula-mcp-tools filesystem::tests::write_read_roundtrip"
-      - name: Test tools filesystem delete
-        run: "cargo test -p nebula-mcp-tools filesystem::tests::delete_requires_destructive_policy"
-      - name: Test tools filesystem hash
-        run: "cargo test -p nebula-mcp-tools filesystem::tests::hash_matches_known_value"
-      - name: Test tools filesystem search
-        run: "cargo test -p nebula-mcp-tools filesystem::tests::search_finds_matches"
-      - name: Test tools filesystem glob
-        run: "cargo test -p nebula-mcp-tools filesystem::tests::glob_lists_files"
-      - name: Test tools filesystem escape
-        run: "cargo test -p nebula-mcp-tools filesystem::tests::path_escape_denied"
-      - name: Test tools git
-        run: "cargo test -p nebula-mcp-tools git::"
-      - name: Test tools network
-        run: "cargo test -p nebula-mcp-tools network::"
-      - name: Test tools security
-        run: "cargo test -p nebula-mcp-tools security::"
-      - name: Test tools process
-        run: "cargo test -p nebula-mcp-tools process::"
-      - name: Test tools browser
-        run: "cargo test -p nebula-mcp-tools browser::"
-      - name: Test tools docker
-        run: "cargo test -p nebula-mcp-tools docker::"
-      - name: Test tools diagnostics
-        run: "cargo test -p nebula-mcp-tools diagnostics::"
-      - name: Test tools powershell
-        run: "cargo test -p nebula-mcp-tools powershell::"
-      - name: Test tools windows
-        run: "cargo test -p nebula-mcp-tools windows::"
-      - name: Test tools github
-        run: "cargo test -p nebula-mcp-tools github::"
-      - name: Test server
-        run: cargo test -p nebula-mcp-server --all-targets
+      - name: Test
+        run: cargo test --workspace --all-targets
       - name: Generated tool documentation
         run: python3 scripts/check_tools_doc.py
       - name: Build release
@@ -109,58 +59,8 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Build
         run: cargo build --workspace
-      - name: Test core config
-        run: "cargo test -p nebula-mcp-core config::"
-      - name: Test core context
-        run: "cargo test -p nebula-mcp-core context::"
-      - name: Test core security
-        run: "cargo test -p nebula-mcp-core security::"
-      - name: Test core error
-        run: "cargo test -p nebula-mcp-core error::"
-      - name: Test core metrics
-        run: "cargo test -p nebula-mcp-core metrics::"
-      - name: Test core tool
-        run: "cargo test -p nebula-mcp-core tool::"
-      - name: Test protocol
-        run: cargo test -p nebula-mcp-protocol --all-targets
-      - name: Test tools common
-        run: "cargo test -p nebula-mcp-tools common::"
-      - name: Test tools filesystem edit
-        run: "cargo test -p nebula-mcp-tools filesystem::tests::edit_replaces_exact_string"
-      - name: Test tools filesystem read/write
-        run: "cargo test -p nebula-mcp-tools filesystem::tests::write_read_roundtrip"
-      - name: Test tools filesystem delete
-        run: "cargo test -p nebula-mcp-tools filesystem::tests::delete_requires_destructive_policy"
-      - name: Test tools filesystem hash
-        run: "cargo test -p nebula-mcp-tools filesystem::tests::hash_matches_known_value"
-      - name: Test tools filesystem search
-        run: "cargo test -p nebula-mcp-tools filesystem::tests::search_finds_matches"
-      - name: Test tools filesystem glob
-        run: "cargo test -p nebula-mcp-tools filesystem::tests::glob_lists_files"
-      - name: Test tools filesystem escape
-        run: "cargo test -p nebula-mcp-tools filesystem::tests::path_escape_denied"
-      - name: Test tools git
-        run: "cargo test -p nebula-mcp-tools git::"
-      - name: Test tools network
-        run: "cargo test -p nebula-mcp-tools network::"
-      - name: Test tools security
-        run: "cargo test -p nebula-mcp-tools security::"
-      - name: Test tools process
-        run: "cargo test -p nebula-mcp-tools process::"
-      - name: Test tools browser
-        run: "cargo test -p nebula-mcp-tools browser::"
-      - name: Test tools docker
-        run: "cargo test -p nebula-mcp-tools docker::"
-      - name: Test tools diagnostics
-        run: "cargo test -p nebula-mcp-tools diagnostics::"
-      - name: Test tools powershell
-        run: "cargo test -p nebula-mcp-tools powershell::"
-      - name: Test tools windows
-        run: "cargo test -p nebula-mcp-tools windows::"
-      - name: Test tools github
-        run: "cargo test -p nebula-mcp-tools github::"
-      - name: Test server
-        run: cargo test -p nebula-mcp-server --all-targets
+      - name: Test
+        run: cargo test --workspace --all-targets
 
   macos:
     name: macOS — build, test, lint
@@ -177,58 +77,8 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - name: Test core config
-        run: "cargo test -p nebula-mcp-core config::"
-      - name: Test core context
-        run: "cargo test -p nebula-mcp-core context::"
-      - name: Test core security
-        run: "cargo test -p nebula-mcp-core security::"
-      - name: Test core error
-        run: "cargo test -p nebula-mcp-core error::"
-      - name: Test core metrics
-        run: "cargo test -p nebula-mcp-core metrics::"
-      - name: Test core tool
-        run: "cargo test -p nebula-mcp-core tool::"
-      - name: Test protocol
-        run: cargo test -p nebula-mcp-protocol --all-targets
-      - name: Test tools common
-        run: "cargo test -p nebula-mcp-tools common::"
-      - name: Test tools filesystem edit
-        run: "cargo test -p nebula-mcp-tools filesystem::tests::edit_replaces_exact_string"
-      - name: Test tools filesystem read/write
-        run: "cargo test -p nebula-mcp-tools filesystem::tests::write_read_roundtrip"
-      - name: Test tools filesystem delete
-        run: "cargo test -p nebula-mcp-tools filesystem::tests::delete_requires_destructive_policy"
-      - name: Test tools filesystem hash
-        run: "cargo test -p nebula-mcp-tools filesystem::tests::hash_matches_known_value"
-      - name: Test tools filesystem search
-        run: "cargo test -p nebula-mcp-tools filesystem::tests::search_finds_matches"
-      - name: Test tools filesystem glob
-        run: "cargo test -p nebula-mcp-tools filesystem::tests::glob_lists_files"
-      - name: Test tools filesystem escape
-        run: "cargo test -p nebula-mcp-tools filesystem::tests::path_escape_denied"
-      - name: Test tools git
-        run: "cargo test -p nebula-mcp-tools git::"
-      - name: Test tools network
-        run: "cargo test -p nebula-mcp-tools network::"
-      - name: Test tools security
-        run: "cargo test -p nebula-mcp-tools security::"
-      - name: Test tools process
-        run: "cargo test -p nebula-mcp-tools process::"
-      - name: Test tools browser
-        run: "cargo test -p nebula-mcp-tools browser::"
-      - name: Test tools docker
-        run: "cargo test -p nebula-mcp-tools docker::"
-      - name: Test tools diagnostics
-        run: "cargo test -p nebula-mcp-tools diagnostics::"
-      - name: Test tools powershell
-        run: "cargo test -p nebula-mcp-tools powershell::"
-      - name: Test tools windows
-        run: "cargo test -p nebula-mcp-tools windows::"
-      - name: Test tools github
-        run: "cargo test -p nebula-mcp-tools github::"
-      - name: Test server
-        run: cargo test -p nebula-mcp-server --all-targets
+      - name: Test
+        run: cargo test --workspace --all-targets
       - name: Build release
         run: cargo build --release
 
