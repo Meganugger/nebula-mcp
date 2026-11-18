@@ -3,6 +3,7 @@
 //! plus subscriptions that emit `notifications/resources/updated` on change.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -67,7 +68,11 @@ pub fn read(config: &Config, root: &Path, uri: &str) -> Result<ReadResourceResul
     let policy = resource_policy(config)?;
     let path = uri_to_path(uri)?;
     let checked = policy.check_path(&path, root)?;
-    let bytes = std::fs::read(&checked)
+    let file = std::fs::File::open(&checked)
+        .map_err(|e| ToolError::Io(format!("reading {}: {e}", checked.display())))?;
+    let mut bytes = Vec::with_capacity(policy.max_output_bytes().saturating_add(1));
+    file.take(policy.max_output_bytes() as u64 + 1)
+        .read_to_end(&mut bytes)
         .map_err(|e| ToolError::Io(format!("reading {}: {e}", checked.display())))?;
 
     // Enforce the output cap.

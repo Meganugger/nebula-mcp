@@ -41,9 +41,10 @@ use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response as AxumResponse};
 use axum::routing::post;
 use axum::{Json, Router};
+use dashmap::DashMap;
 use nebula_mcp_core::config::HttpConfig;
 use nebula_mcp_protocol::{error_codes, ErrorObject, Request, Response};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::server::Server;
@@ -52,8 +53,16 @@ use crate::server::Server;
 struct HttpState {
     server: Arc<Server>,
     config: HttpConfig,
-    /// Fan-out of server-initiated notifications to any open SSE streams.
+    /// Legacy HTTP negotiation state, keyed by the client session id.
+    sessions: DashMap<String, Arc<HttpSession>>,
+}
+
+/// Per-client notification state for the legacy HTTP transport.
+struct HttpSession {
+    version: String,
+    sender: mpsc::UnboundedSender<serde_json::Value>,
     notifications: broadcast::Sender<String>,
+    subscriptions: Arc<crate::resources::SubscriptionManager>,
 }
 
 /// Bind and serve the HTTP transport until `cancel` fires.
@@ -97,24 +106,10 @@ pub async fn serve_on(
     listener: tokio::net::TcpListener,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
-    let (tx, _rx) = broadcast::channel::<String>(256);
-
-    // Bridge the engine's notifier channel into the SSE broadcast.
-    let mut notif_rx = server.install_notifier();
-    let notif_tx = tx.clone();
-    tokio::spawn(async move {
-        while let Some(value) = notif_rx.recv().await {
-            if let Ok(line) = serde_json::to_string(&value) {
-                // Ignore send errors: they only mean no SSE client is attached.
-                let _ = notif_tx.send(line);
-            }
-        }
-    });
-
     let state = Arc::new(HttpState {
         server,
         config: config.clone(),
-        notifications: tx,
+        sessions: DashMap::new(),
     });
 
     let app = Router::new()
@@ -230,14 +225,15 @@ fn check_protocol_version(state: &HttpState, headers: &HeaderMap) -> Option<Axum
             )
         }
     };
-    match state.server.negotiated_protocol_version() {
+    let session_id = headers.get("mcp-session-id").and_then(|v| v.to_str().ok());
+    match session_id.and_then(|id| state.sessions.get(id).map(|v| v.version.clone())) {
         Some(negotiated) if presented == negotiated => None,
         Some(negotiated) => Some(
             (
                 StatusCode::BAD_REQUEST,
                 format!(
                     "MCP-Protocol-Version '{presented}' does not match the version \
-                     negotiated during initialize ('{negotiated}')"
+                     negotiated for this HTTP session ('{negotiated}')"
                 ),
             )
                 .into_response(),
@@ -254,6 +250,57 @@ fn check_protocol_version(state: &HttpState, headers: &HeaderMap) -> Option<Axum
                 .into_response(),
         ),
     }
+}
+
+/// Validate the current revision's per-request metadata/header contract.
+fn check_modern_headers(message: &serde_json::Value, headers: &HeaderMap) -> Option<AxumResponse> {
+    let method = message.get("method").and_then(|v| v.as_str())?;
+    let params = message.get("params").and_then(|v| v.as_object())?;
+    let meta = params.get("_meta").and_then(|v| v.as_object())?;
+    let version = meta
+        .get("io.modelcontextprotocol/protocolVersion")
+        .and_then(|v| v.as_str())?;
+    if !nebula_mcp_protocol::is_modern_protocol_version(version) {
+        return None;
+    }
+
+    let header_value = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    if header_value("mcp-protocol-version") != Some(version) {
+        return Some(modern_header_error(
+            error_codes::HEADER_MISMATCH,
+            "MCP-Protocol-Version must match _meta protocolVersion",
+        ));
+    }
+    if header_value("mcp-method") != Some(method) {
+        return Some(modern_header_error(
+            error_codes::HEADER_MISMATCH,
+            "Mcp-Method must match the JSON-RPC method",
+        ));
+    }
+
+    let required_name = match method {
+        "tools/call" => params.get("name").and_then(|v| v.as_str()),
+        "resources/read" => params.get("uri").and_then(|v| v.as_str()),
+        "prompts/get" => params.get("name").and_then(|v| v.as_str()),
+        _ => None,
+    };
+    if let Some(name) = required_name {
+        if header_value("mcp-name") != Some(name) {
+            return Some(modern_header_error(
+                error_codes::HEADER_MISMATCH,
+                "Mcp-Name must match the request target",
+            ));
+        }
+    }
+    None
+}
+
+fn modern_header_error(code: i64, message: &str) -> AxumResponse {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(Response::error(None, ErrorObject::new(code, message, None))),
+    )
+        .into_response()
 }
 
 /// Handle a `POST` carrying one JSON-RPC message or an array of them.
@@ -283,6 +330,12 @@ async fn handle_post(
         other => vec![other],
     };
 
+    for message in &messages {
+        if let Some(rejected) = check_modern_headers(message, &headers) {
+            return rejected;
+        }
+    }
+
     // The protocol-version header only applies to requests *after* the
     // handshake — an `initialize` request is what establishes the version, so
     // a body carrying one is exempt from the check.
@@ -294,6 +347,41 @@ async fn handle_post(
             return rejected;
         }
     }
+
+    let modern = messages.iter().any(|message| {
+        message
+            .get("params")
+            .and_then(|params| params.get("_meta"))
+            .and_then(|meta| meta.get("io.modelcontextprotocol/protocolVersion"))
+            .and_then(|version| version.as_str())
+            .map(nebula_mcp_protocol::is_modern_protocol_version)
+            .unwrap_or(false)
+    });
+    let existing_session = headers
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+
+    // Current requests are stateless and must not use the process-wide
+    // notification sink. Legacy requests get a stable per-session sink so
+    // progress and resource updates cannot cross client boundaries.
+    let session = if modern {
+        None
+    } else if let Some(id) = existing_session.as_deref() {
+        state.sessions.get(id).map(|session| session.clone())
+    } else {
+        Some(new_http_session("2025-03-26".to_string()))
+    };
+    if !modern && existing_session.is_some() && session.is_none() {
+        return (StatusCode::NOT_FOUND, "unknown Mcp-Session-Id").into_response();
+    }
+    let request_notifier = session
+        .as_ref()
+        .map(|session| session.sender.clone())
+        .unwrap_or_else(|| {
+            let (sender, _receiver) = mpsc::unbounded_channel();
+            sender
+        });
 
     let mut responses: Vec<Response> = Vec::new();
     for msg in messages {
@@ -307,7 +395,19 @@ async fn handle_post(
                 continue;
             }
         };
-        if let Some(resp) = state.server.clone().dispatch(req).await {
+        if let Some(resp) = state
+            .server
+            .clone()
+            .dispatch_with_session(
+                req,
+                request_notifier.clone(),
+                session
+                    .as_ref()
+                    .map(|value| value.subscriptions.clone())
+                    .unwrap_or_else(|| Arc::new(crate::resources::SubscriptionManager::new())),
+            )
+            .await
+        {
             responses.push(resp);
         }
     }
@@ -317,12 +417,41 @@ async fn handle_post(
         return StatusCode::ACCEPTED.into_response();
     }
 
-    let session = new_session_id();
-    let headers = [(header::HeaderName::from_static("mcp-session-id"), session)];
+    if !modern {
+        let session_id = existing_session.unwrap_or_else(new_session_id);
+        let negotiated = responses
+            .first()
+            .and_then(|response| response.result.as_ref())
+            .and_then(|result| result.get("protocolVersion"))
+            .and_then(|version| version.as_str())
+            .unwrap_or("2025-03-26")
+            .to_string();
+        if let Some(session) = session {
+            state.sessions.insert(
+                session_id.clone(),
+                Arc::new(HttpSession {
+                    version: negotiated,
+                    sender: session.sender.clone(),
+                    notifications: session.notifications.clone(),
+                    subscriptions: session.subscriptions.clone(),
+                }),
+            );
+        }
+        let headers = [(
+            header::HeaderName::from_static("mcp-session-id"),
+            session_id,
+        )];
+        return if responses.len() == 1 {
+            (StatusCode::OK, headers, Json(responses.pop().unwrap())).into_response()
+        } else {
+            (StatusCode::OK, headers, Json(responses)).into_response()
+        };
+    }
+
     if responses.len() == 1 {
-        (StatusCode::OK, headers, Json(responses.pop().unwrap())).into_response()
+        (StatusCode::OK, Json(responses.pop().unwrap())).into_response()
     } else {
-        (StatusCode::OK, headers, Json(responses)).into_response()
+        (StatusCode::OK, Json(responses)).into_response()
     }
 }
 
@@ -351,7 +480,21 @@ async fn handle_get(State(state): State<Arc<HttpState>>, headers: HeaderMap) -> 
     if let Some(rejected) = check_protocol_version(&state, &headers) {
         return rejected;
     }
-    let rx = state.notifications.subscribe();
+    let session_id = match headers.get("mcp-session-id").and_then(|v| v.to_str().ok()) {
+        Some(id) => id,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "legacy SSE requires Mcp-Session-Id",
+            )
+                .into_response()
+        }
+    };
+    let session = match state.sessions.get(session_id) {
+        Some(session) => session.clone(),
+        None => return (StatusCode::NOT_FOUND, "unknown Mcp-Session-Id").into_response(),
+    };
+    let rx = session.notifications.subscribe();
     let keep_alive_secs = state.config.sse_keep_alive_secs;
     let stream = async_stream::stream! {
         let mut rx = rx;
@@ -396,7 +539,29 @@ async fn handle_delete(State(state): State<Arc<HttpState>>, headers: HeaderMap) 
     if let Some(rejected) = check_protocol_version(&state, &headers) {
         return rejected;
     }
+    if let Some(id) = headers.get("mcp-session-id").and_then(|v| v.to_str().ok()) {
+        state.sessions.remove(id);
+    }
     StatusCode::OK.into_response()
+}
+
+fn new_http_session(version: String) -> Arc<HttpSession> {
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let (notifications, _) = broadcast::channel(256);
+    let output = notifications.clone();
+    tokio::spawn(async move {
+        while let Some(value) = receiver.recv().await {
+            if let Ok(line) = serde_json::to_string(&value) {
+                let _ = output.send(line);
+            }
+        }
+    });
+    Arc::new(HttpSession {
+        version,
+        sender,
+        notifications,
+        subscriptions: Arc::new(crate::resources::SubscriptionManager::new()),
+    })
 }
 
 fn new_session_id() -> String {
