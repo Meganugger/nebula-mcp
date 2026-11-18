@@ -39,8 +39,20 @@ jobs:
         run: cargo test -p nebula-mcp-protocol --all-targets
       - name: Test tools common
         run: "cargo test -p nebula-mcp-tools common::"
-      - name: Test tools filesystem
-        run: "cargo test -p nebula-mcp-tools filesystem::"
+      - name: Test tools filesystem edit
+        run: "cargo test -p nebula-mcp-tools filesystem::tests::edit_replaces_exact_string"
+      - name: Test tools filesystem read/write
+        run: "cargo test -p nebula-mcp-tools filesystem::tests::write_read_roundtrip"
+      - name: Test tools filesystem delete
+        run: "cargo test -p nebula-mcp-tools filesystem::tests::delete_requires_destructive_policy"
+      - name: Test tools filesystem hash
+        run: "cargo test -p nebula-mcp-tools filesystem::tests::hash_matches_known_value"
+      - name: Test tools filesystem search
+        run: "cargo test -p nebula-mcp-tools filesystem::tests::search_finds_matches"
+      - name: Test tools filesystem glob
+        run: "cargo test -p nebula-mcp-tools filesystem::tests::glob_lists_files"
+      - name: Test tools filesystem escape
+        run: "cargo test -p nebula-mcp-tools filesystem::tests::path_escape_denied"
       - name: Test tools git
         run: "cargo test -p nebula-mcp-tools git::"
       - name: Test tools network
@@ -113,8 +125,20 @@ jobs:
         run: cargo test -p nebula-mcp-protocol --all-targets
       - name: Test tools common
         run: "cargo test -p nebula-mcp-tools common::"
-      - name: Test tools filesystem
-        run: "cargo test -p nebula-mcp-tools filesystem::"
+      - name: Test tools filesystem edit
+        run: "cargo test -p nebula-mcp-tools filesystem::tests::edit_replaces_exact_string"
+      - name: Test tools filesystem read/write
+        run: "cargo test -p nebula-mcp-tools filesystem::tests::write_read_roundtrip"
+      - name: Test tools filesystem delete
+        run: "cargo test -p nebula-mcp-tools filesystem::tests::delete_requires_destructive_policy"
+      - name: Test tools filesystem hash
+        run: "cargo test -p nebula-mcp-tools filesystem::tests::hash_matches_known_value"
+      - name: Test tools filesystem search
+        run: "cargo test -p nebula-mcp-tools filesystem::tests::search_finds_matches"
+      - name: Test tools filesystem glob
+        run: "cargo test -p nebula-mcp-tools filesystem::tests::glob_lists_files"
+      - name: Test tools filesystem escape
+        run: "cargo test -p nebula-mcp-tools filesystem::tests::path_escape_denied"
       - name: Test tools git
         run: "cargo test -p nebula-mcp-tools git::"
       - name: Test tools network
@@ -169,8 +193,20 @@ jobs:
         run: cargo test -p nebula-mcp-protocol --all-targets
       - name: Test tools common
         run: "cargo test -p nebula-mcp-tools common::"
-      - name: Test tools filesystem
-        run: "cargo test -p nebula-mcp-tools filesystem::"
+      - name: Test tools filesystem edit
+        run: "cargo test -p nebula-mcp-tools filesystem::tests::edit_replaces_exact_string"
+      - name: Test tools filesystem read/write
+        run: "cargo test -p nebula-mcp-tools filesystem::tests::write_read_roundtrip"
+      - name: Test tools filesystem delete
+        run: "cargo test -p nebula-mcp-tools filesystem::tests::delete_requires_destructive_policy"
+      - name: Test tools filesystem hash
+        run: "cargo test -p nebula-mcp-tools filesystem::tests::hash_matches_known_value"
+      - name: Test tools filesystem search
+        run: "cargo test -p nebula-mcp-tools filesystem::tests::search_finds_matches"
+      - name: Test tools filesystem glob
+        run: "cargo test -p nebula-mcp-tools filesystem::tests::glob_lists_files"
+      - name: Test tools filesystem escape
+        run: "cargo test -p nebula-mcp-tools filesystem::tests::path_escape_denied"
       - name: Test tools git
         run: "cargo test -p nebula-mcp-tools git::"
       - name: Test tools network
