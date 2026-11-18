@@ -1111,6 +1111,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     fn ctx_for(dir: &Path, destructive: bool) -> ToolContext {
+        let dir = std::fs::canonicalize(dir).unwrap();
         let base = SecurityConfig {
             allowed_paths: vec![format!("{}/**", dir.display()), dir.display().to_string()],
             allow_destructive: destructive,
@@ -1122,7 +1123,7 @@ mod tests {
         let policy = EffectivePolicy::build("fs", &base, None).unwrap();
         ToolContext {
             policy: Arc::new(policy),
-            working_dir: dir.to_path_buf(),
+            working_dir: dir,
             cancel: CancellationToken::new(),
             metrics: Metrics::new(),
             config: Arc::new(Default::default()),
