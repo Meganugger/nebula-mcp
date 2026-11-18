@@ -20,6 +20,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
 use tokio::sync::Notify;
 
+use super::exec::kill_process_tree;
+
 /// A bounded output buffer shared between reader tasks and readers.
 struct OutputBuffer {
     data: Mutex<VecDeque<u8>>,
@@ -117,6 +119,46 @@ impl SessionManager {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        cmd.env_clear();
+        for key in [
+            "PATH",
+            "SystemRoot",
+            "SYSTEMROOT",
+            "WINDIR",
+            "TEMP",
+            "TMP",
+            "TMPDIR",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "LC_MESSAGES",
+        ] {
+            if let Ok(value) = std::env::var(key) {
+                cmd.env(key, value);
+            }
+        }
+        for (k, _) in env {
+            let upper = k.to_ascii_uppercase();
+            if [
+                "TOKEN",
+                "PASSWORD",
+                "PASS",
+                "SECRET",
+                "PRIVATE_KEY",
+                "API_KEY",
+                "CREDENTIAL",
+                "AWS_",
+                "GITHUB_",
+                "GH_",
+            ]
+            .iter()
+            .any(|needle| upper.contains(needle))
+            {
+                return Err(ToolError::PermissionDenied(format!(
+                    "environment variable '{k}' is not permitted for child processes"
+                )));
+            }
+        }
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -196,6 +238,9 @@ impl SessionManager {
         // Drop stdin to signal EOF, then kill.
         session.stdin.lock().await.take();
         let mut child = session.child.lock();
+        if let Some(pid) = child.id() {
+            kill_process_tree(pid);
+        }
         let _ = child.start_kill();
         Ok(())
     }

@@ -168,7 +168,7 @@ pub async fn run_checked(
         let hctx = ctx.clone();
         let program = spec.program.clone();
         let start = Instant::now();
-        Some(tokio::spawn(async move {
+        Some(HeartbeatGuard(tokio::spawn(async move {
             let mut tick = 1.0_f64;
             loop {
                 tokio::time::sleep(Duration::from_secs(3)).await;
@@ -179,16 +179,25 @@ pub async fn run_checked(
                 );
                 tick += 1.0;
             }
-        }))
+        })))
     } else {
         None
     };
 
     let result = run_raw(ctx, spec, timeout).await;
-    if let Some(h) = heartbeat {
-        h.abort();
-    }
+    drop(heartbeat);
     result
+}
+
+/// Aborting a tool future must also stop its progress producer. Without an
+/// owning guard this task outlives the request and keeps emitting notifications
+/// for a token the client has already abandoned.
+struct HeartbeatGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for HeartbeatGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Run without the command allowlist check. Only for internal callers that have
@@ -198,10 +207,14 @@ pub async fn run_raw(
     spec: CommandSpec,
     timeout: Duration,
 ) -> Result<ExecResult, ToolError> {
-    // Resolve the executable for a precise "not found" error.
-    resolve_program(&spec.program)?;
+    // Resolve first, then authorize the executable that will actually be
+    // launched. This prevents an absolute path to a planted binary named like
+    // an allowlisted command from bypassing the policy.
+    let resolved = resolve_program(&spec.program)?;
+    ctx.policy
+        .check_command_resolved(&spec.program, &resolved)?;
 
-    let mut cmd = Command::new(&spec.program);
+    let mut cmd = Command::new(&resolved);
     cmd.args(&spec.args)
         .current_dir(&spec.cwd)
         .stdin(if spec.stdin.is_some() {
@@ -213,10 +226,35 @@ pub async fn run_raw(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    if spec.clear_env {
-        cmd.env_clear();
+    // Never inherit the server's complete environment: it may contain
+    // GitHub/cloud/API credentials. Preserve only process portability values;
+    // callers can add explicit non-secret variables through `spec.env`.
+    cmd.env_clear();
+    if !spec.clear_env {
+        for key in [
+            "PATH",
+            "SystemRoot",
+            "SYSTEMROOT",
+            "WINDIR",
+            "TEMP",
+            "TMP",
+            "TMPDIR",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "LC_MESSAGES",
+        ] {
+            if let Ok(value) = std::env::var(key) {
+                cmd.env(key, value);
+            }
+        }
     }
     for (k, v) in &spec.env {
+        if is_secret_environment_key(k) {
+            return Err(ToolError::PermissionDenied(format!(
+                "environment variable '{k}' is not permitted for child processes"
+            )));
+        }
         cmd.env(k, v);
     }
 
@@ -230,14 +268,28 @@ pub async fn run_raw(
     let mut child = cmd
         .spawn()
         .map_err(|e| ToolError::Io(format!("spawning '{}': {e}", spec.program)))?;
+    let mut group = ProcessGroupGuard::new(child.id());
+    let deadline = Instant::now() + timeout;
 
     // Feed stdin if provided.
     if let Some(data) = spec.stdin.clone() {
         if let Some(mut sink) = child.stdin.take() {
             use tokio::io::AsyncWriteExt;
-            // Ignore broken-pipe if the child exits early.
-            let _ = sink.write_all(&data).await;
-            let _ = sink.shutdown().await;
+            tokio::select! {
+                biased;
+                () = ctx.cancel.cancelled() => {
+                    terminate(&mut child, &mut group).await;
+                    return Err(ToolError::Cancelled);
+                }
+                _ = tokio::time::sleep_until(deadline.into()) => {
+                    terminate(&mut child, &mut group).await;
+                    return Err(ToolError::Timeout(timeout));
+                }
+                _ = sink.write_all(&data) => {
+                    // Ignore broken-pipe if the child exits early.
+                    let _ = sink.shutdown().await;
+                }
+            }
         }
     }
 
@@ -247,29 +299,35 @@ pub async fn run_raw(
     let out_task = tokio::spawn(async move { read_capped(stdout, limit).await });
     let err_task = tokio::spawn(async move { read_capped(stderr, limit).await });
 
+    let remaining = deadline.saturating_duration_since(Instant::now());
     let status = tokio::select! {
         biased;
         () = ctx.cancel.cancelled() => {
-            terminate(&mut child).await;
+            terminate(&mut child, &mut group).await;
             let _ = out_task.await;
             let _ = err_task.await;
             return Err(ToolError::Cancelled);
         }
-        r = tokio::time::timeout(timeout, child.wait()) => match r {
+        r = tokio::time::timeout(remaining, child.wait()) => match r {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
+                group.deactivate();
                 let _ = out_task.await;
                 let _ = err_task.await;
                 return Err(ToolError::Io(format!("waiting for '{}': {e}", spec.program)));
             }
             Err(_) => {
-                terminate(&mut child).await;
+                terminate(&mut child, &mut group).await;
                 let _ = out_task.await;
                 let _ = err_task.await;
                 return Err(ToolError::Timeout(timeout));
             }
         }
     };
+    // A command can exit while a background descendant keeps the pipe open.
+    // Reap the entire process group before waiting for output readers.
+    group.terminate_group();
+    group.deactivate();
 
     let (stdout_bytes, stdout_truncated) = out_task
         .await
@@ -322,19 +380,64 @@ where
 }
 
 /// Terminate a child and its group best-effort.
-async fn terminate(child: &mut tokio::process::Child) {
-    #[cfg(unix)]
-    {
-        if let Some(pid) = child.id() {
-            // Negative pid targets the whole process group created above.
-            // SIGTERM first, then rely on kill_on_drop / start_kill for SIGKILL.
-            unsafe {
-                libc_kill(-(pid as i32), 15);
-            }
-        }
-    }
+async fn terminate(child: &mut tokio::process::Child, group: &mut ProcessGroupGuard) {
+    group.terminate_group();
     let _ = child.start_kill();
     let _ = child.wait().await;
+    group.deactivate();
+}
+
+struct ProcessGroupGuard {
+    pid: Option<u32>,
+}
+
+impl ProcessGroupGuard {
+    fn new(pid: Option<u32>) -> Self {
+        Self { pid }
+    }
+
+    fn terminate_group(&self) {
+        if let Some(pid) = self.pid {
+            kill_process_tree(pid);
+        }
+    }
+
+    fn deactivate(&mut self) {
+        self.pid = None;
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        self.terminate_group();
+    }
+}
+
+/// Terminate a process and descendants without relying on the client-facing
+/// command allowlist. This is cleanup for a process Nebula started itself.
+pub fn kill_process_tree(pid: u32) {
+    #[cfg(unix)]
+    {
+        // SIGTERM followed by SIGKILL makes cancellation deterministic for
+        // descendants that ignore the cooperative signal.
+        unsafe {
+            libc_kill(-(pid as i32), 15);
+            libc_kill(-(pid as i32), 9);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let taskkill = std::env::var_os("SystemRoot")
+            .map(|root| {
+                std::path::PathBuf::from(root)
+                    .join("System32")
+                    .join("taskkill.exe")
+            })
+            .unwrap_or_else(|| std::path::PathBuf::from("taskkill.exe"));
+        let _ = std::process::Command::new(taskkill)
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .status();
+    }
 }
 
 #[cfg(unix)]
@@ -351,11 +454,33 @@ pub fn resolve_program(program: &str) -> Result<PathBuf, ToolError> {
     let p = Path::new(program);
     if p.is_absolute() || program.contains('/') || program.contains('\\') {
         if p.exists() {
-            return Ok(p.to_path_buf());
+            return std::fs::canonicalize(p)
+                .map_err(|_| ToolError::ToolNotFound(program.to_string()));
         }
         return Err(ToolError::ToolNotFound(program.to_string()));
     }
-    which::which(program).map_err(|_| ToolError::ToolNotFound(program.to_string()))
+    let path = which::which(program).map_err(|_| ToolError::ToolNotFound(program.to_string()))?;
+    std::fs::canonicalize(&path).map_err(|_| ToolError::ToolNotFound(program.to_string()))
+}
+
+fn is_secret_environment_key(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    [
+        "TOKEN",
+        "PASSWORD",
+        "PASS",
+        "SECRET",
+        "PRIVATE_KEY",
+        "API_KEY",
+        "CREDENTIAL",
+        "AWS_",
+        "GITHUB_",
+        "GH_",
+        "OPENAI_",
+        "ANTHROPIC_",
+    ]
+    .iter()
+    .any(|needle| upper.contains(needle))
 }
 
 /// Whether a program is available (for capability probing / diagnostics).

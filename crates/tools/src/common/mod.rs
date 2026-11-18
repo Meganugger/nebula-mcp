@@ -2,6 +2,7 @@
 
 pub mod args;
 pub mod exec;
+pub mod network;
 pub mod output;
 pub mod platform;
 pub mod scheduler;
