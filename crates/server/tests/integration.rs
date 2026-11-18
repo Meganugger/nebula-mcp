@@ -12,7 +12,12 @@ use tokio_util::sync::CancellationToken;
 /// Build a server with a permissive-but-bounded policy for tests.
 fn make_server(cancel: CancellationToken) -> Arc<Server> {
     let mut config = Config::default();
-    config.security.allowed_paths = vec!["/tmp/**".into(), "/tmp".into()];
+    let temp_root = std::env::temp_dir()
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string();
+    config.security.allowed_paths = vec![format!("{temp_root}/**"), temp_root];
     config.security.allowed_commands = vec!["echo".into(), "sleep".into()];
     config.security.default_timeout_secs = 30;
     config.security.max_runtime_secs = 60;
@@ -194,7 +199,7 @@ async fn resources_list_and_read() {
     let name = format!("nebula_res_{}.txt", uuid_like());
     let path = std::env::temp_dir().join(&name);
     std::fs::write(&path, "resource-body").unwrap();
-    let uri = format!("file://{}", path.display());
+    let uri = url::Url::from_file_path(&path).unwrap().to_string();
 
     let server = make_server(CancellationToken::new());
     let input = [
@@ -292,7 +297,7 @@ async fn resource_subscription_emits_update_on_change() {
     // A file under the workspace root (/tmp) to watch.
     let path = std::env::temp_dir().join(format!("nebula_sub_{}.txt", uuid_like()));
     std::fs::write(&path, "initial").unwrap();
-    let uri = format!("file://{}", path.display());
+    let uri = url::Url::from_file_path(&path).unwrap().to_string();
 
     let server = make_server(CancellationToken::new());
 
