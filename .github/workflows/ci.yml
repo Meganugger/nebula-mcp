@@ -99,6 +99,9 @@ jobs:
       - name: Resolve patched RustSec dependencies
         run: cargo update --workspace
       - name: Install cargo-audit
-        uses: taiki-e/install-action@cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit@0.23.0
+          fallback: cargo-install
       - name: Audit dependencies
         run: cargo audit --deny warnings
