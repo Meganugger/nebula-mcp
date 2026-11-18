@@ -519,10 +519,28 @@ mod tests {
         }
     }
 
+    fn echo_program() -> &'static str {
+        if cfg!(windows) {
+            "cmd"
+        } else {
+            "echo"
+        }
+    }
+
+    fn echo_args(text: &str) -> Vec<String> {
+        if cfg!(windows) {
+            vec!["/C".into(), "echo".into(), text.into()]
+        } else {
+            vec![text.into()]
+        }
+    }
+
     #[tokio::test]
     async fn runs_and_captures_stdout() {
-        let ctx = ctx_with(&["echo"], 4096, 10);
-        let spec = CommandSpec::new("echo", std::env::temp_dir(), &ctx).arg("hello world");
+        let program = echo_program();
+        let ctx = ctx_with(&[program], 4096, 10);
+        let spec =
+            CommandSpec::new(program, std::env::temp_dir(), &ctx).args(echo_args("hello world"));
         let r = run_checked(&ctx, spec, None).await.unwrap();
         assert!(r.success());
         assert!(r.stdout.contains("hello world"));
@@ -550,6 +568,9 @@ mod tests {
 
     #[tokio::test]
     async fn enforces_timeout() {
+        if !program_available("sleep") {
+            return;
+        }
         let ctx = ctx_with(&["sleep"], 4096, 1);
         let spec = CommandSpec::new("sleep", std::env::temp_dir(), &ctx).arg("30");
         let err = run_checked(&ctx, spec, Some(1)).await.unwrap_err();
@@ -558,6 +579,9 @@ mod tests {
 
     #[tokio::test]
     async fn truncates_large_output() {
+        if !program_available("sh") || !program_available("seq") {
+            return;
+        }
         let ctx = ctx_with(&["sh"], 16, 10);
         let spec = CommandSpec::new("sh", std::env::temp_dir(), &ctx)
             .arg("-c")
@@ -569,6 +593,9 @@ mod tests {
 
     #[tokio::test]
     async fn feeds_stdin() {
+        if !program_available("cat") {
+            return;
+        }
         let ctx = ctx_with(&["cat"], 4096, 10);
         let spec = CommandSpec::new("cat", std::env::temp_dir(), &ctx)
             .stdin_bytes(b"piped-input".to_vec());
@@ -578,6 +605,9 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_stops_process() {
+        if !program_available("sleep") {
+            return;
+        }
         let ctx = ctx_with(&["sleep"], 4096, 30);
         let spec = CommandSpec::new("sleep", std::env::temp_dir(), &ctx).arg("30");
         let cancel = ctx.cancel.clone();
