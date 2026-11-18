@@ -96,7 +96,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Resolve patched RustSec dependencies
-        run: cargo update -p time --precise 0.3.47
+        run: cargo update --workspace
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
