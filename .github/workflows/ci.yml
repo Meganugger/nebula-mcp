@@ -37,8 +37,30 @@ jobs:
         run: "cargo test -p nebula-mcp-core tool::"
       - name: Test protocol
         run: cargo test -p nebula-mcp-protocol --all-targets
-      - name: Test tools
-        run: cargo test -p nebula-mcp-tools --all-targets
+      - name: Test tools common
+        run: "cargo test -p nebula-mcp-tools common::"
+      - name: Test tools filesystem
+        run: "cargo test -p nebula-mcp-tools filesystem::"
+      - name: Test tools git
+        run: "cargo test -p nebula-mcp-tools git::"
+      - name: Test tools network
+        run: "cargo test -p nebula-mcp-tools network::"
+      - name: Test tools security
+        run: "cargo test -p nebula-mcp-tools security::"
+      - name: Test tools process
+        run: "cargo test -p nebula-mcp-tools process::"
+      - name: Test tools browser
+        run: "cargo test -p nebula-mcp-tools browser::"
+      - name: Test tools docker
+        run: "cargo test -p nebula-mcp-tools docker::"
+      - name: Test tools diagnostics
+        run: "cargo test -p nebula-mcp-tools diagnostics::"
+      - name: Test tools powershell
+        run: "cargo test -p nebula-mcp-tools powershell::"
+      - name: Test tools windows
+        run: "cargo test -p nebula-mcp-tools windows::"
+      - name: Test tools github
+        run: "cargo test -p nebula-mcp-tools github::"
       - name: Test server
         run: cargo test -p nebula-mcp-server --all-targets
       - name: Generated tool documentation
@@ -89,8 +111,30 @@ jobs:
         run: "cargo test -p nebula-mcp-core tool::"
       - name: Test protocol
         run: cargo test -p nebula-mcp-protocol --all-targets
-      - name: Test tools
-        run: cargo test -p nebula-mcp-tools --all-targets
+      - name: Test tools common
+        run: "cargo test -p nebula-mcp-tools common::"
+      - name: Test tools filesystem
+        run: "cargo test -p nebula-mcp-tools filesystem::"
+      - name: Test tools git
+        run: "cargo test -p nebula-mcp-tools git::"
+      - name: Test tools network
+        run: "cargo test -p nebula-mcp-tools network::"
+      - name: Test tools security
+        run: "cargo test -p nebula-mcp-tools security::"
+      - name: Test tools process
+        run: "cargo test -p nebula-mcp-tools process::"
+      - name: Test tools browser
+        run: "cargo test -p nebula-mcp-tools browser::"
+      - name: Test tools docker
+        run: "cargo test -p nebula-mcp-tools docker::"
+      - name: Test tools diagnostics
+        run: "cargo test -p nebula-mcp-tools diagnostics::"
+      - name: Test tools powershell
+        run: "cargo test -p nebula-mcp-tools powershell::"
+      - name: Test tools windows
+        run: "cargo test -p nebula-mcp-tools windows::"
+      - name: Test tools github
+        run: "cargo test -p nebula-mcp-tools github::"
       - name: Test server
         run: cargo test -p nebula-mcp-server --all-targets
 
@@ -123,8 +167,30 @@ jobs:
         run: "cargo test -p nebula-mcp-core tool::"
       - name: Test protocol
         run: cargo test -p nebula-mcp-protocol --all-targets
-      - name: Test tools
-        run: cargo test -p nebula-mcp-tools --all-targets
+      - name: Test tools common
+        run: "cargo test -p nebula-mcp-tools common::"
+      - name: Test tools filesystem
+        run: "cargo test -p nebula-mcp-tools filesystem::"
+      - name: Test tools git
+        run: "cargo test -p nebula-mcp-tools git::"
+      - name: Test tools network
+        run: "cargo test -p nebula-mcp-tools network::"
+      - name: Test tools security
+        run: "cargo test -p nebula-mcp-tools security::"
+      - name: Test tools process
+        run: "cargo test -p nebula-mcp-tools process::"
+      - name: Test tools browser
+        run: "cargo test -p nebula-mcp-tools browser::"
+      - name: Test tools docker
+        run: "cargo test -p nebula-mcp-tools docker::"
+      - name: Test tools diagnostics
+        run: "cargo test -p nebula-mcp-tools diagnostics::"
+      - name: Test tools powershell
+        run: "cargo test -p nebula-mcp-tools powershell::"
+      - name: Test tools windows
+        run: "cargo test -p nebula-mcp-tools windows::"
+      - name: Test tools github
+        run: "cargo test -p nebula-mcp-tools github::"
       - name: Test server
         run: cargo test -p nebula-mcp-server --all-targets
       - name: Build release
