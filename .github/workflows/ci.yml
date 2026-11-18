@@ -64,7 +64,9 @@ jobs:
 
   macos:
     name: macOS — build, test, lint
-    runs-on: macos-latest
+    # Keep the macOS lane on the supported Intel runner until arm64 native
+    # dependency/toolchain coverage is explicitly added as a separate job.
+    runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -85,7 +87,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Check declared MSRV
         run: cargo check --workspace --all-targets
