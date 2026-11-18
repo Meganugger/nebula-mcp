@@ -206,7 +206,7 @@ impl SessionManager {
         stdin
             .flush()
             .await
-            .map_err(|e| ToolError::Io(format!("flushing session stdin: {e}")))?;
+            .map_err(|e| ToolError::Io(format!("flushing to session stdin: {e}")))?;
         Ok(())
     }
 
@@ -294,14 +294,26 @@ mod tests {
 
     #[tokio::test]
     async fn open_write_read_close_shell() {
-        if which::which("sh").is_err() {
-            return;
-        }
+        let (program, args, input) = if cfg!(windows) {
+            if which::which("cmd").is_err() {
+                return;
+            }
+            (
+                "cmd",
+                vec!["/Q".to_string(), "/K".to_string()],
+                b"echo session-hello\r\n".as_slice(),
+            )
+        } else {
+            if which::which("sh").is_err() {
+                return;
+            }
+            ("sh", Vec::new(), b"echo session-hello\n".as_slice())
+        };
         let mgr = SessionManager::new();
         let id = mgr
-            .open("sh", &[], std::env::temp_dir(), &[], 65536)
+            .open(program, &args, std::env::temp_dir(), &[], 65536)
             .unwrap();
-        mgr.write(&id, b"echo session-hello\n").await.unwrap();
+        mgr.write(&id, input).await.unwrap();
         // Give the shell a moment and read.
         let (out, _dropped) = mgr.read(&id, 500).await.unwrap();
         // Read again in case output arrived after the first drain.
