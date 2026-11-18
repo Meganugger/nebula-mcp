@@ -19,6 +19,7 @@ use nebula_mcp_protocol::{CallToolResult, Content};
 use serde_json::{json, Value};
 
 use crate::common::exec::{run_checked, CommandSpec};
+use crate::common::network::validate_url;
 use crate::common::{Args, ObjectSchema};
 
 const CATEGORY: &str = "browser";
@@ -70,6 +71,13 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
 
 async fn run_driver(ctx: &ToolContext, cfg: Value, timeout: Option<u64>) -> Result<CallToolResult> {
     ctx.policy.ensure_network_allowed()?;
+    let raw_url = cfg
+        .get("url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ToolError::InvalidArguments("browser URL is required".into()))?;
+    let validated_url = validate_url(raw_url, &["http", "https"]).await?;
+    let mut cfg = cfg;
+    cfg["url"] = json!(validated_url.to_string());
 
     // Write the driver + config to temp files.
     let dir = std::env::temp_dir();
