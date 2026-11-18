@@ -27,7 +27,8 @@ async fn spawn_http_with_keep_alive(sse_keep_alive_secs: u64) -> (String, Cancel
     } else {
         vec!["echo".into()]
     };
-    let temp_root = std::env::temp_dir()
+    let temp_root = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
         .to_string_lossy()
         .replace('\\', "/")
         .trim_end_matches('/')

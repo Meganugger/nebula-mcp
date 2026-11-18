@@ -12,7 +12,8 @@ use tokio_util::sync::CancellationToken;
 /// Build a server with a permissive-but-bounded policy for tests.
 fn make_server(cancel: CancellationToken) -> Arc<Server> {
     let mut config = Config::default();
-    let temp_root = std::env::temp_dir()
+    let temp_root = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
         .to_string_lossy()
         .replace('\\', "/")
         .trim_end_matches('/')
