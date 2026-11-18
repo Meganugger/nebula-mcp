@@ -847,7 +847,11 @@ mod tests {
     fn test_server() -> Arc<Server> {
         let mut config = Config::default();
         config.security.allowed_paths = vec!["/**".into()];
-        config.security.allowed_commands = vec!["echo".into()];
+        config.security.allowed_commands = if cfg!(windows) {
+            vec!["cmd".into()]
+        } else {
+            vec!["echo".into()]
+        };
         let store = ConfigStore::new(config);
         let registry = nebula_mcp_tools::build_registry(&ToolServices::new());
         Arc::new(Server::new(
@@ -856,6 +860,14 @@ mod tests {
             std::env::temp_dir(),
             CancellationToken::new(),
         ))
+    }
+
+    fn echo_arguments(text: &str) -> serde_json::Value {
+        if cfg!(windows) {
+            serde_json::json!({"program": "cmd", "args": ["/C", "echo", text]})
+        } else {
+            serde_json::json!({"program": "echo", "args": [text]})
+        }
     }
 
     #[tokio::test]
@@ -902,7 +914,7 @@ mod tests {
             method: "tools/call".into(),
             params: Some(serde_json::json!({
                 "name": "terminal.run",
-                "arguments": {"program": "echo", "args": ["hi"]}
+                "arguments": echo_arguments("hi")
             })),
         };
         let resp = server
