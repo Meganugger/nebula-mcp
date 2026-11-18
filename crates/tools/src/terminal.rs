@@ -9,7 +9,7 @@ use nebula_mcp_protocol::mcp::ToolAnnotations;
 use nebula_mcp_protocol::CallToolResult;
 use serde_json::{json, Value};
 
-use crate::common::exec::{run_checked, CommandSpec};
+use crate::common::exec::{resolve_program, run_checked, CommandSpec};
 use crate::common::output::{exec_result, json_value_result};
 use crate::common::session::SessionManager;
 use crate::common::{Args, ObjectSchema};
@@ -135,16 +135,21 @@ impl Tool for SessionOpen {
     async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
         let a = Args::new(&args)?;
         let program = a.str("program")?;
-        ctx.policy.check_command(program)?;
+        let resolved = resolve_program(program)?;
+        ctx.policy.check_command_resolved(program, &resolved)?;
         let cmd_args = a.opt_str_array("args")?;
         let cwd = match a.opt_str("cwd")? {
             Some(c) => ctx.resolve_path(c)?,
             None => ctx.working_dir.clone(),
         };
         let env = a.opt_string_map("env")?;
-        let id =
-            self.sessions
-                .open(program, &cmd_args, cwd, &env, ctx.policy.max_output_bytes())?;
+        let id = self.sessions.open(
+            &resolved.display().to_string(),
+            &cmd_args,
+            cwd,
+            &env,
+            ctx.policy.max_output_bytes(),
+        )?;
         Ok(json_value_result(json!({ "sessionId": id })))
     }
 }
