@@ -462,8 +462,12 @@ impl Tool for DesktopWindows {
         };
         let script = format!(
             "Get-Process | Where-Object {{ {visibility} -and $_.MainWindowTitle -like '*{escaped}*' }} | \
-             Select-Object -First {limit} Id,ProcessName,MainWindowHandle,MainWindowTitle | \
-             ConvertTo-Json -Depth 3"
+             Select-Object -First {limit} | ForEach-Object {{ \
+             $h = '0x{{0}}' -f $_.MainWindowHandle.ToInt64().ToString('X'); \
+             [pscustomobject]@{{windowId=$h;nativeHandle=$h;title=$_.MainWindowTitle;\
+             processId=$_.Id;executable=$_.Path;visible=$true;enabled=$true;\
+             minimized=$false;maximized=$false;bounds=$null;coordinateSpace='physical_screen'}} \
+             }} | ConvertTo-Json -Depth 3"
         );
         let result = run_powershell(ctx, POWERSHELL, &script, None).await?;
         Ok(exec_result("window enumeration", &result))
