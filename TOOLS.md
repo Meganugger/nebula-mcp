@@ -1,6 +1,6 @@
 # Nebula MCP — Tool Reference
 
-Auto-generated from `nebula-mcp list-tools`. **110 tools across 13 categories.**
+Auto-generated from `nebula-mcp list-tools`. **118 tools across 14 categories.**
 
 Cross-platform categories work on Linux, macOS and Windows. Categories marked *(Windows)* compile everywhere but return `platform_unsupported` when the host is not Windows. Every call is subject to the permission policy described in [SECURITY.md](SECURITY.md).
 
@@ -8,6 +8,17 @@ Cross-platform categories work on Linux, macOS and Windows. Categories marked *(
 
 - **`browser.capture`** — Drive Playwright to navigate a URL and optionally capture a screenshot, PDF (Chromium), Playwright trace, console logs and network activity. Requires Node.js + Playwright.
 - **`browser.screenshot`** — Capture a screenshot of a URL to a file with Playwright. Requires Node.js + Playwright.
+
+### `desktop`
+
+- **`desktop.lease_acquire`** — Acquire exclusive ownership of the interactive desktop for a bounded time.
+- **`desktop.lease_release`** — Release an interactive desktop lease owned by the caller.
+- **`desktop.windows`** — List visible top-level windows with titles and physical desktop bounds.
+- **`desktop.mouse_move`** — Move the pointer to an explicit physical or logical desktop coordinate.
+- **`desktop.mouse_click`** — Click a mouse button through the Windows input queue.
+- **`desktop.type_text`** — Type bounded Unicode text into the currently focused Windows application.
+- **`desktop.key_press`** — Send a bounded virtual-key press to the focused Windows application.
+- **`desktop.focus_window`** — Bring a top-level window to the foreground when Windows permits it.
 
 ### `diagnostics`
 

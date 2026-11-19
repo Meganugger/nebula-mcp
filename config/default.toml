@@ -110,6 +110,8 @@ allow_network = false
 # Whether destructive operations (delete, reset --hard, container rm) are
 # permitted at all.
 allow_destructive = false
+# Whether tools may move the pointer, type, click, or focus windows.
+allow_desktop_mutation = false
 
 # ---------------------------------------------------------------------------
 # Per-category enable switches. Disabling a category disables all of its tools.
