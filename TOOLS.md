@@ -11,14 +11,18 @@ Cross-platform categories work on Linux, macOS and Windows. Categories marked *(
 
 ### `desktop`
 
-- **`desktop.lease_acquire`** — Acquire exclusive ownership of the interactive desktop for a bounded time.
-- **`desktop.lease_release`** — Release an interactive desktop lease owned by the caller.
-- **`desktop.windows`** — List visible top-level windows with titles and physical desktop bounds.
-- **`desktop.mouse_move`** — Move the pointer to an explicit physical or logical desktop coordinate.
-- **`desktop.mouse_click`** — Click a mouse button through the Windows input queue.
-- **`desktop.type_text`** — Type bounded Unicode text into the currently focused Windows application.
-- **`desktop.key_press`** — Send a bounded virtual-key press to the focused Windows application.
-- **`desktop.focus_window`** — Bring a top-level window to the foreground when Windows permits it.
+- **`desktop.lock_acquire`** — Acquire an exclusive, expiring lease for a desktop resource.
+- **`desktop.lock_release`** — Release a lease owned by the current MCP request.
+- **`desktop.lock_status`** — List live desktop leases.
+- **`desktop.displays`** — Enumerate Windows display adapters and reported modes.
+- **`desktop.cursor`** — Read the physical-screen cursor position.
+- **`desktop.windows`** — List top-level application windows visible to the interactive user.
+- **`desktop.input`** — Send bounded mouse and keyboard actions through `SendInput`; requires policy and a desktop lease.
+- **`desktop.window`** — Focus, minimize, maximize, restore, or gracefully close a window; force-close is destructive.
+
+Desktop mutation requires both `security.allow_desktop_mutation = true` (or a
+scoped tool override) and a live `desktop.lock_acquire` lease. These tools are
+interactive-session tools, not a UAC bypass or a service desktop bridge.
 
 ### `diagnostics`
 

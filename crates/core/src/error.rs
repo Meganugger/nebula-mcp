@@ -68,6 +68,14 @@ pub enum ToolError {
     /// A dependency or subsystem returned an unexpected internal error.
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// Another authenticated client currently owns a shared resource lock.
+    #[error("resource busy: {0}")]
+    ResourceBusy(String),
+
+    /// A previously observed native handle is no longer valid.
+    #[error("stale handle: {0}")]
+    StaleHandle(String),
 }
 
 impl ToolError {
@@ -84,7 +92,9 @@ impl ToolError {
             | ToolError::ToolNotFound(_)
             | ToolError::PlatformUnsupported(_)
             | ToolError::Io(_)
-            | ToolError::Execution(_) => error_codes::TOOL_EXECUTION_ERROR,
+            | ToolError::Execution(_)
+            | ToolError::ResourceBusy(_)
+            | ToolError::StaleHandle(_) => error_codes::TOOL_EXECUTION_ERROR,
             ToolError::Internal(_) => error_codes::INTERNAL_ERROR,
         }
     }
@@ -104,6 +114,8 @@ impl ToolError {
             ToolError::PlatformUnsupported(_) => "platform_unsupported",
             ToolError::Io(_) => "io",
             ToolError::Execution(_) => "execution",
+            ToolError::ResourceBusy(_) => "resource_busy",
+            ToolError::StaleHandle(_) => "stale_handle",
             ToolError::Internal(_) => "internal",
         }
     }

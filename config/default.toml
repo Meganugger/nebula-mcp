@@ -116,7 +116,7 @@ allow_desktop_mutation = false
 # ---------------------------------------------------------------------------
 # Per-category enable switches. Disabling a category disables all of its tools.
 # Categories: filesystem, terminal, process, git, github, network, powershell,
-#             windows, diagnostics, browser, docker, scheduler, security
+#             windows, diagnostics, browser, desktop, docker, scheduler, security
 # ---------------------------------------------------------------------------
 # [categories.powershell]
 # enabled = false
