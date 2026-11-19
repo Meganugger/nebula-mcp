@@ -66,6 +66,7 @@ The global baseline every tool inherits. See [SECURITY.md](SECURITY.md).
 | `allow_elevated` | bool | `false` | Permit elevated/admin execution. |
 | `allow_network` | bool | `false` | Permit off-box network access. |
 | `allow_destructive` | bool | `false` | Permit destructive operations. |
+| `allow_desktop_mutation` | bool | `false` | Permit interactive desktop input and window focus tools. |
 
 Globs use `**` to span path separators. On Windows, use escaped backslashes in
 TOML strings (`"C:\\src\\**"`) or forward slashes.
@@ -74,7 +75,7 @@ TOML strings (`"C:\\src\\**"`) or forward slashes.
 
 Enable/disable a whole category. Categories: `filesystem`, `terminal`,
 `process`, `git`, `github`, `network`, `powershell`, `windows`, `diagnostics`,
-`browser`, `docker`, `scheduler`, `security`.
+`browser`, `desktop`, `docker`, `scheduler`, `security`.
 
 ```toml
 [categories.powershell]
@@ -94,6 +95,7 @@ Per-tool overrides layered on the `[security]` baseline. All fields optional.
 | `allowed_commands` | [string] | **Additional** commands (merged with baseline). |
 | `allow_destructive` | bool | Override the destructive gate for this tool. |
 | `allow_elevated` | bool | Override the elevation gate for this tool (least-privilege scoping). |
+| `allow_desktop_mutation` | bool | Override the desktop-mutation gate for this tool. |
 
 Example (least-privilege: destructive ops off globally, granted only to a
 single tool, and a longer timeout for builds):
