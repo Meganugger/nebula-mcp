@@ -27,7 +27,7 @@
                     └──────────┬───────────┘
                                │
                     ┌──────────▼───────────┐
-                    │  nebula-mcp-tools    │  110 tools in 13 category modules
+                    │  nebula-mcp-tools    │  tool implementations and desktop leases
                     └──────────┬───────────┘
                                │
                     ┌──────────▼───────────┐
@@ -91,6 +91,12 @@ building blocks live in `common`:
 - **args / schema / output** — typed argument extraction with precise errors, a
   small JSON-Schema builder, and result formatting.
 - **platform** — `ensure_windows()` gating and a shared PowerShell runner.
+
+The `desktop` module adds a process-local `DesktopLockManager` shared through
+`ToolServices`. Inspection calls are read-only; input and window mutation must
+pass both the explicit desktop-mutation policy gate and an owner-bound,
+expiring lease. This manager coordinates requests inside one server process
+only; it is not a named-pipe or operating-system security boundary.
 
 Windows-specific tools are **typed command wrappers** over the real Windows
 tooling (`sc.exe`, `reg.exe`, `pnputil`, `schtasks`, `logman`, `cdb`,

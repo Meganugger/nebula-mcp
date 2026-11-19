@@ -176,6 +176,7 @@ impl Tool for PolicyInspect {
             "allowElevated": policy.allow_elevated(),
             "allowNetwork": policy.allow_network(),
             "allowDestructive": policy.allow_destructive(),
+            "allowDesktopMutation": policy.allow_desktop_mutation(),
             "allowedPathPatternCount": policy.allowed_pattern_count(),
             "allowedCommands": policy.allowed_commands(),
         })))

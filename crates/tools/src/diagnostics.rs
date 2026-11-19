@@ -204,6 +204,7 @@ impl Tool for EffectiveConfig {
                 "allowElevated": c.security.allow_elevated,
                 "allowNetwork": c.security.allow_network,
                 "allowDestructive": c.security.allow_destructive,
+                "allowDesktopMutation": c.security.allow_desktop_mutation,
             },
             "workingDir": ctx.working_dir.display().to_string(),
             "disabledCategories": disabled_categories,

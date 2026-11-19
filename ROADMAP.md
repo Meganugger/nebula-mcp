@@ -28,6 +28,11 @@ following is the remaining work, ordered by trust impact.
 
 - Expand native Windows cleanup tests and add macOS-specific process and
   filesystem coverage.
+- Add Windows UI Automation, monitor-aware DPI coordinate conversion, desktop
+  capture, and a separately scoped privileged broker only after their trust
+  boundaries and native test coverage are in place.
+- Add interactive desktop-agent process separation, installer/service artifacts,
+  and operator approval records for sensitive desktop workflows.
 - Add signed release binaries and packaging only after the trust and CI
   guarantees above remain green.
 
@@ -40,3 +45,12 @@ following is the remaining work, ordered by trust impact.
   elevation.
 - OS-level confinement for arbitrary interpreters, shells, Git, and Docker is
   outside the server's typed-tool policy and must be supplied by the operator.
+
+## Universal computer-control implementation status
+
+The first governed desktop slice is now present: explicit deny-first desktop
+mutation policy, process-local leases, bounded input schemas, and Windows
+inspection/input adapters. The lease manager is intentionally not presented as
+cross-process authorization. The next increments are the authenticated
+interactive-session agent and its named-pipe protocol, followed by UI
+Automation/capture and only then a separately scoped privileged broker.

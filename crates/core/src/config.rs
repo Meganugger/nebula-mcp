@@ -214,6 +214,10 @@ pub struct SecurityConfig {
     /// Whether destructive operations (delete, reset --hard, driver uninstall)
     /// are permitted at all.
     pub allow_destructive: bool,
+    /// Whether interactive desktop mutations (input, focus, and window
+    /// changes) are permitted at all. This never bypasses Windows integrity
+    /// levels, UAC, secure desktops, or session isolation.
+    pub allow_desktop_mutation: bool,
 }
 
 impl Default for SecurityConfig {
@@ -231,6 +235,7 @@ impl Default for SecurityConfig {
             // off-box access.
             allow_network: false,
             allow_destructive: false,
+            allow_desktop_mutation: false,
         }
     }
 }
@@ -268,6 +273,8 @@ pub struct ToolOverride {
     pub allow_destructive: Option<bool>,
     /// Override the elevation flag for this tool (least-privilege scoping).
     pub allow_elevated: Option<bool>,
+    /// Override the desktop-mutation flag for this tool.
+    pub allow_desktop_mutation: Option<bool>,
 }
 
 /// Per-category enable switch. A disabled category disables all of its tools.

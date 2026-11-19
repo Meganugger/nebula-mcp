@@ -10,7 +10,7 @@ Point an AI platform at Nebula MCP — over a local stdio pipe *or a remote URL*
 
 ## Why Nebula MCP
 
-- **110 tools across 13 categories**, all designed for autonomous coding agents.
+- **118 tools across 14 categories**, all designed for autonomous coding agents.
 - **Two transports.** Local **stdio** for editors (Claude Code, Cursor, Codex, Zed…) and remote **Streamable HTTP** so you can expose a **URL** to a hosted AI platform.
 - **Security-first.** Nothing is permitted by default. Every call is checked against an allowlist-based permission policy (paths, commands, elevation, network, destructive ops) before it runs. Paths are symlink-aware and denied entries are filtered recursively. No shell interpolation — arguments are passed verbatim.
 - **Robust runtime.** Bounded concurrency, per-call timeouts and a hard runtime ceiling, cooperative cancellation, output caps, structured logging, Prometheus metrics and optional OpenTelemetry.
@@ -32,6 +32,7 @@ Point an AI platform at Nebula MCP — over a local stdio pipe *or a remote URL*
 | `scheduler` | 5 | deferred and recurring background jobs with captured results |
 | `security` | 3 | dry-run the path/command policy and inspect the effective policy for any tool |
 | `browser` | 2 | Playwright navigation + screenshot/PDF/trace/console/network capture |
+| `desktop` | 8 | Lease-coordinated Windows display, cursor, window, pointer, keyboard, and focus control |
 | `powershell` | 3 | non-interactive, elevated and remote PowerShell *(Windows)* |
 | `windows` | 8 | services, registry, event log, perf counters, scheduled tasks, env, firewall, adapters *(Windows)* |
 | `diagnostics` | 9 | toolchain capabilities, live metrics, config summary, WER, crash dumps, procdump, cdb analyze, ETW *(mostly Windows)* |
@@ -133,7 +134,7 @@ Nebula MCP is **empty-deny by default**:
 - A tool may only touch a path matching `allowed_paths` and not matching the built-in and configured `denied_paths` (which ships denying `.ssh`, `.aws`, `.gnupg`, `*.pem`, `*.key`, `id_rsa*`, `.env*`). Existing path components are resolved before matching.
 - A tool may only execute a program named in `allowed_commands`; explicit paths must match the resolved executable. Arguments are passed as a verbatim array — **there is no shell**, so no command injection.
 - Per-call **timeouts**, a hard **runtime ceiling**, and **output caps** bound every call.
-- `allow_elevated`, `allow_network` and `allow_destructive` are explicit gates, off by default, scopable per tool. Docker is additionally treated as elevated because its daemon is commonly root-equivalent.
+- `allow_elevated`, `allow_network`, `allow_destructive` and `allow_desktop_mutation` are explicit gates, off by default, scopable per tool. Docker is additionally treated as elevated because its daemon is commonly root-equivalent.
 - Paths are normalised and existing symlink components are resolved before matching. The GitHub token is read from the environment and never echoed.
 
 Every gate can be relaxed globally under `[security]` or, better, scoped per tool under `[tools."<name>"]`. Dry-run any decision with the `security.*` tools before trusting it.
@@ -163,7 +164,7 @@ Four crates:
 | --- | --- |
 | `nebula-mcp-protocol` | JSON-RPC 2.0 + MCP types + stdio framing (no `unsafe`) |
 | `nebula-mcp-core` | TOML config + hot reload, permission engine, telemetry/metrics, the `Tool` trait + registry + per-call context |
-| `nebula-mcp-tools` | all 110 tool implementations, grouped by category |
+| `nebula-mcp-tools` | all 118 tool implementations, grouped by category |
 | `nebula-mcp-server` | dispatch engine + **stdio and HTTP transports** + `nebula-mcp` CLI |
 
 See [ARCHITECTURE.md](ARCHITECTURE.md).

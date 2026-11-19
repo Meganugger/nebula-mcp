@@ -59,6 +59,11 @@ single choke point for:
   may report private addresses; it does not open a connection.
 - `allow_destructive` — required by `fs.delete`, `process.kill`, `git.reset
   --hard`, `git.clean`, `docker.rm`, registry/service deletion.
+- `allow_desktop_mutation` — required by interactive desktop input and window
+  focus tools. A desktop lease is also required for every mutation. This gate
+  does not bypass UIPI, UAC, session isolation, or secure-desktop restrictions.
+  Leases are process-local, owner-bound, expire automatically, and are
+  released when the server exits.
 
 Per-tool overrides let you, for example, enable `git.push` broadly while keeping
 `fs.delete` disabled, or raise `terminal.run`'s timeout without loosening
@@ -90,7 +95,7 @@ Start from `config/default.toml` and:
 1. Set `allowed_paths` to just your source/build trees.
 2. Set `allowed_commands` to just the toolchain you use (`git`, `cargo`,
    `msbuild`, `powershell`, …).
-3. Leave `allow_elevated`, `allow_destructive` **off**; enable per-tool only
+3. Leave `allow_elevated`, `allow_destructive`, and `allow_desktop_mutation` **off**; enable per-tool only
    where required.
 4. Keep `denied_paths` and extend it with any project-specific secret patterns.
 5. Run the server as a least-privileged user; only grant admin when a specific
@@ -150,3 +155,7 @@ host it returns `platform_unsupported`.
   and debugger tooling) remain intentionally high impact. They are gated by
   command, elevation, destructive, network, and path policy where applicable,
   but they are not a substitute for an OS-level Windows sandbox.
+- **Desktop input** is limited to the interactive session in which the server
+  is running. `SendInput` and foreground-window activation remain subject to
+  Windows integrity-level and foreground-activation rules. Nebula does not
+  inject into secure desktops or claim to control UAC prompts.

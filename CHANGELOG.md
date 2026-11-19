@@ -34,6 +34,14 @@ configuration, transport, and execution-policy changes.
 - Removed the client-controlled debugger command string from
   `diagnostics.analyze_dump`; it now runs only the fixed analysis command.
 - Added an 8 MiB stdio JSON frame limit with oversized-frame recovery.
+- Added an opt-in desktop-mutation policy gate and lease-coordinated Windows
+  desktop tools for top-level window enumeration, pointer/keyboard input, and
+  foreground activation. UI Automation, capture, broker IPC, and service
+  packaging remain deferred.
+- Added bounded `desktop.lock_*`, `desktop.displays`, `desktop.cursor`,
+  `desktop.input`, and `desktop.window` tools. Desktop mutations require both
+  policy and an owner-bound expiring lease; deferred subsystems remain
+  explicitly documented rather than reported as complete.
 
 The original 0.1.0 release of Nebula MCP as a standalone,
 **general-purpose** autonomous software-engineering MCP server, extracted from
@@ -63,7 +71,7 @@ transport.
     lock-free per-tool metrics.
   - The `Tool` trait, a registry honouring category/tool enable switches, and a
     per-call `ToolContext` with unified timeout + cancellation.
-- **110 tools** (`nebula-mcp-tools`) across 13 general-purpose categories:
+- **118 tools** (`nebula-mcp-tools`) across 14 general-purpose categories:
   - **filesystem** (14): read/write/edit/append/rename/delete/move/copy, content
     search, glob, tree, hash, metadata, permissions, with large-file streaming
     and binary-safe base64 read/write.
@@ -84,6 +92,9 @@ transport.
     analysis, live stack capture, ETW sessions.
   - **browser** (2): Playwright-driven capture (screenshot/PDF/trace/console/
     network) and a screenshot convenience.
+  - **desktop** (8): lease acquisition/release, top-level window enumeration,
+    pointer movement, mouse clicks, Unicode typing, virtual-key presses, and
+    foreground-window activation.
   - **docker** (9): ps, images, build, run, stop, rm, logs, exec, and compose.
   - **scheduler** (5): run allowlisted commands after a delay or on an interval
     and poll their captured results.

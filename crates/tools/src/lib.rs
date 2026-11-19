@@ -13,6 +13,7 @@
 
 pub mod browser;
 pub mod common;
+pub mod desktop;
 pub mod diagnostics;
 pub mod docker;
 pub mod filesystem;
@@ -42,6 +43,8 @@ pub struct ToolServices {
     pub scheduler: Arc<SchedulerManager>,
     /// Shared HTTP client with connection reuse for network/github tools.
     pub http: reqwest::Client,
+    /// Lease manager shared by all desktop-mutating tools.
+    pub desktop_locks: Arc<desktop::DesktopLockManager>,
 }
 
 impl ToolServices {
@@ -57,6 +60,7 @@ impl ToolServices {
             sessions: Arc::new(SessionManager::new()),
             scheduler: Arc::new(SchedulerManager::new()),
             http,
+            desktop_locks: Arc::new(desktop::DesktopLockManager::new()),
         }
     }
 }
@@ -94,5 +98,6 @@ pub fn all_tools(services: &ToolServices) -> Vec<Arc<dyn Tool>> {
     v.extend(docker::tools());
     v.extend(scheduler::tools(services));
     v.extend(security::tools());
+    v.extend(desktop::tools(services));
     v
 }
