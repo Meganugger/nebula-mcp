@@ -71,7 +71,7 @@ transport.
     lock-free per-tool metrics.
   - The `Tool` trait, a registry honouring category/tool enable switches, and a
     per-call `ToolContext` with unified timeout + cancellation.
-- **118 tools** (`nebula-mcp-tools`) across 14 general-purpose categories:
+- **126 tools** (`nebula-mcp-tools`) across 15 general-purpose categories:
   - **filesystem** (14): read/write/edit/append/rename/delete/move/copy, content
     search, glob, tree, hash, metadata, permissions, with large-file streaming
     and binary-safe base64 read/write.
