@@ -13,6 +13,9 @@ use tokio::sync::Mutex;
 
 use crate::jsonrpc::{Request, Response};
 
+/// Maximum newline-delimited JSON frame accepted from stdio.
+pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
 /// Errors that can occur while reading or writing frames.
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
@@ -22,6 +25,12 @@ pub enum TransportError {
     /// A line could not be parsed as a JSON-RPC request.
     #[error("failed to decode JSON-RPC frame: {0}")]
     Decode(#[from] serde_json::Error),
+    /// The peer sent a frame larger than the transport limit.
+    #[error("JSON-RPC frame exceeds the {max} byte limit")]
+    FrameTooLarge {
+        /// Maximum accepted frame size.
+        max: usize,
+    },
 }
 
 /// Reads newline-delimited JSON-RPC requests from an async source.
@@ -50,7 +59,7 @@ where
     pub async fn next_frame(&mut self) -> Result<Option<Request>, TransportError> {
         loop {
             self.line.clear();
-            let n = self.inner.read_line(&mut self.line).await?;
+            let n = self.read_bounded_line().await?;
             if n == 0 {
                 return Ok(None);
             }
@@ -60,6 +69,52 @@ where
             }
             let req: Request = serde_json::from_str(trimmed)?;
             return Ok(Some(req));
+        }
+    }
+
+    async fn read_bounded_line(&mut self) -> Result<usize, TransportError> {
+        let mut total = 0;
+        loop {
+            let chunk = self.inner.fill_buf().await?;
+            if chunk.is_empty() {
+                return Ok(total);
+            }
+            let newline = chunk.iter().position(|byte| *byte == b'\n');
+            let take = newline.map_or(chunk.len(), |position| position + 1);
+            if total + take > MAX_FRAME_BYTES {
+                self.inner.consume(take);
+                if newline.is_none() {
+                    self.discard_until_newline().await?;
+                }
+                self.line.clear();
+                return Err(TransportError::FrameTooLarge {
+                    max: MAX_FRAME_BYTES,
+                });
+            }
+            self.line.push_str(&String::from_utf8_lossy(&chunk[..take]));
+            self.inner.consume(take);
+            total += take;
+            if newline.is_some() {
+                return Ok(total);
+            }
+        }
+    }
+
+    async fn discard_until_newline(&mut self) -> Result<(), TransportError> {
+        loop {
+            let chunk = self.inner.fill_buf().await?;
+            if chunk.is_empty() {
+                return Ok(());
+            }
+            let take = match chunk.iter().position(|byte| *byte == b'\n') {
+                Some(position) => position + 1,
+                None => chunk.len(),
+            };
+            let done = take < chunk.len() || chunk[take - 1] == b'\n';
+            self.inner.consume(take);
+            if done {
+                return Ok(());
+            }
         }
     }
 }
@@ -186,5 +241,18 @@ mod tests {
         let req = reader.next_frame().await.unwrap().unwrap();
         assert_eq!(req.method, "m");
         assert_eq!(req.id, Some(RequestId::String("café".into())));
+    }
+
+    #[tokio::test]
+    async fn oversized_frame_is_rejected_and_discarded() {
+        let oversized = format!("{}\n", "x".repeat(MAX_FRAME_BYTES));
+        let valid = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ok\"}\n";
+        let input = [oversized, valid.to_string()].concat();
+        let mut reader = FrameReader::new(input.as_bytes());
+        assert!(matches!(
+            reader.next_frame().await,
+            Err(TransportError::FrameTooLarge { .. })
+        ));
+        assert_eq!(reader.next_frame().await.unwrap().unwrap().method, "ok");
     }
 }

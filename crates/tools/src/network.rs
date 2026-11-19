@@ -16,6 +16,7 @@ use nebula_mcp_protocol::CallToolResult;
 use serde_json::{json, Value};
 
 use crate::common::exec::{run_checked, CommandSpec};
+use crate::common::network::{reject_option_like, validate_host, validate_url};
 use crate::common::output::{exec_result, json_value_result};
 use crate::common::{Args, ObjectSchema};
 use crate::ToolServices;
@@ -91,11 +92,12 @@ impl Tool for HttpRequest {
     async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
         let a = Args::new(&args)?;
         ctx.policy.ensure_network_allowed()?;
-        let url = a.str("url")?;
+        let url = validate_url(a.str("url")?, &["http", "https"]).await?;
+        let url = url.to_string();
         let method = a.str_or("method", "GET")?.to_ascii_uppercase();
         let method = reqwest::Method::from_bytes(method.as_bytes())
             .map_err(|_| ToolError::InvalidArguments(format!("invalid method '{method}'")))?;
-        let mut req = self.http.request(method, url);
+        let mut req = self.http.request(method, &url);
         for (k, v) in a.opt_string_map("headers")? {
             req = req.header(k, v);
         }
@@ -180,7 +182,9 @@ impl Tool for Download {
 
         let a = Args::new(&args)?;
         ctx.policy.ensure_network_allowed()?;
-        let url = a.str("url")?.to_string();
+        let url = validate_url(a.str("url")?, &["http", "https"])
+            .await?
+            .to_string();
         let out = ctx.resolve_path(a.str("outputPath")?)?;
         let max_bytes = a.u64_or("maxBytes", 100 * 1024 * 1024)?;
         let timeout = ctx.timeout(a.opt_u64("timeoutSecs")?);
@@ -315,6 +319,7 @@ impl Tool for TcpConnect {
             .opt_u64("port")?
             .ok_or_else(|| ToolError::InvalidArguments("missing 'port'".into()))?
             as u16;
+        validate_host(&host, port).await?;
         let to = Duration::from_millis(a.u64_or("timeoutMs", 5000)?);
         let (ok, elapsed, err) = connect_once(&host, port, to).await;
         Ok(json_value_result(json!({
@@ -367,6 +372,7 @@ impl Tool for LatencySample {
             .opt_u64("port")?
             .ok_or_else(|| ToolError::InvalidArguments("missing 'port'".into()))?
             as u16;
+        validate_host(&host, port).await?;
         let count = a.u64_or("count", 5)?.clamp(1, 50);
         let to = Duration::from_millis(a.u64_or("timeoutMs", 3000)?);
 
@@ -430,6 +436,7 @@ impl Tool for TlsInfo {
         ctx.policy.ensure_network_allowed()?;
         let host = a.str("host")?.to_string();
         let port = a.u64_or("port", 443)? as u16;
+        validate_host(&host, port).await?;
         let to = Duration::from_millis(a.u64_or("timeoutMs", 8000)?);
         let v = tokio::time::timeout(to, tls_handshake(host.clone(), port))
             .await
@@ -441,6 +448,11 @@ impl Tool for TlsInfo {
 async fn tls_handshake(host: String, port: u16) -> Result<Value> {
     use tokio_rustls::TlsConnector;
 
+    // rustls 0.23 requires an explicit crypto provider when more than one
+    // provider is present in the dependency graph (reqwest can bring in
+    // aws-lc-rs while this crate also enables ring). Install ring once so a
+    // request returns a tool error instead of panicking the whole server.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let config = rustls::ClientConfig::builder()
@@ -538,7 +550,9 @@ impl Tool for WebSocketProbe {
 
         let a = Args::new(&args)?;
         ctx.policy.ensure_network_allowed()?;
-        let url = a.str("url")?.to_string();
+        let url = validate_url(a.str("url")?, &["ws", "wss"])
+            .await?
+            .to_string();
         let send = a.opt_str("send")?.map(str::to_string);
         let read_ms = a.u64_or("readMs", 1500)?;
         let max_msgs = a.u64_or("maxMessages", 10)? as usize;
@@ -613,6 +627,8 @@ impl Tool for Ping {
         let a = Args::new(&args)?;
         ctx.policy.ensure_network_allowed()?;
         let host = a.str("host")?.to_string();
+        reject_option_like(&host, "host")?;
+        validate_host(&host, 0).await?;
         let count = a.u64_or("count", 4)?.to_string();
         // Windows uses -n, Unix uses -c for count.
         let count_flag = if cfg!(windows) { "-n" } else { "-c" };
@@ -655,7 +671,10 @@ impl Tool for Iperf {
         let a = Args::new(&args)?;
         ctx.policy.ensure_network_allowed()?;
         let server = a.str("server")?.to_string();
-        let port = a.u64_or("port", 5201)?.to_string();
+        reject_option_like(&server, "server")?;
+        let server_port = a.u64_or("port", 5201)? as u16;
+        validate_host(&server, server_port).await?;
+        let port = server_port.to_string();
         let dur = a.u64_or("durationSecs", 10)?.to_string();
         let mut iperf_args = vec![
             "-c".to_string(),
@@ -717,6 +736,7 @@ impl Tool for PacketCapture {
         ctx.policy.ensure_network_allowed()?;
         ctx.policy.ensure_elevation_allowed()?;
         let iface = a.str("interface")?.to_string();
+        reject_option_like(&iface, "interface")?;
         let out = ctx.resolve_path(a.str("outputPath")?)?;
         let dur = a.u64_or("durationSecs", 10)?;
         let filter = a.opt_str("filter")?.map(str::to_string);
@@ -791,7 +811,7 @@ impl Tool for QuicProbe {
     async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
         let a = Args::new(&args)?;
         ctx.policy.ensure_network_allowed()?;
-        let url = a.str("url")?.to_string();
+        let url = validate_url(a.str("url")?, &["https"]).await?.to_string();
         let spec = CommandSpec::new("curl", ctx.working_dir.clone(), ctx).args(vec![
             "--http3".to_string(),
             "-sS".into(),
@@ -866,16 +886,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tcp_connect_to_closed_port_reports_failure() {
+    async fn tcp_connect_rejects_private_destination() {
         let c = ctx(true);
-        let res = TcpConnect
+        let err = TcpConnect
             .call(
                 &c,
                 json!({"host": "127.0.0.1", "port": 1, "timeoutMs": 300}),
             )
             .await
-            .unwrap();
-        // Connection should fail but the tool returns a structured success result.
-        assert_eq!(res.is_error, Some(false));
+            .unwrap_err();
+        assert!(matches!(err, ToolError::PermissionDenied(_)));
     }
 }

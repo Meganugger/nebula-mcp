@@ -17,7 +17,7 @@ Cross-platform categories work on Linux, macOS and Windows. Categories marked *(
 - **`diagnostics.wer_reports`** — List recent Windows Error Reporting (application crash) events as JSON. Windows only.
 - **`diagnostics.crash_dumps`** — List crash dump (.dmp) files under the local WER CrashDumps directory or a provided directory. Windows only.
 - **`diagnostics.create_dump`** — Create a full memory dump of a process with procdump (Sysinternals). Windows only.
-- **`diagnostics.analyze_dump`** — Analyse a crash dump with cdb (!analyze -v) and return the analysis text. cdb must be allowlisted. Windows only.
+- **`diagnostics.analyze_dump`** — Analyse a crash dump with the fixed safe cdb command (`!analyze -v`; cdb must be allowlisted). Arbitrary debugger commands are not accepted. Windows only.
 - **`diagnostics.stack_trace`** — Capture stacks of all threads in a running process via cdb (~*k). Windows only.
 - **`diagnostics.etw_trace`** — Control an ETW trace session with logman: create/start/stop/delete/query. Windows only.
 

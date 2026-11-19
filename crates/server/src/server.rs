@@ -10,16 +10,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use dashmap::DashMap;
+use futures::FutureExt;
 use nebula_mcp_core::config::ConfigStore;
 use nebula_mcp_core::security::EffectivePolicy;
 use nebula_mcp_core::{
     LogControl, Metrics, Outcome, ProgressSink, ToolContext, ToolError, ToolRegistry,
 };
 use nebula_mcp_protocol::{
-    error_codes, negotiate_protocol_version, CallToolParams, CallToolResult, Content, ErrorObject,
-    FrameReader, FrameWriter, GetPromptParams, Implementation, InitializeResult, ListToolsResult,
+    error_codes, is_modern_protocol_version, is_supported_protocol_version,
+    negotiate_protocol_version, CallToolParams, CallToolResult, Content, ErrorObject, FrameReader,
+    FrameWriter, GetPromptParams, Implementation, InitializeResult, ListToolsResult,
     PromptsCapability, ReadResourceParams, Request, ResourcesCapability, Response,
     ServerCapabilities, SetLevelParams, ToolsCapability, LATEST_PROTOCOL_VERSION,
+    SUPPORTED_PROTOCOL_VERSIONS,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::UnboundedSender;
@@ -46,7 +49,7 @@ pub struct Server {
     /// Optional runtime log-level control (honours `logging/setLevel`).
     log_control: std::sync::Mutex<Option<LogControl>>,
     /// Active `resources/subscribe` watches.
-    subscriptions: crate::resources::SubscriptionManager,
+    subscriptions: Arc<crate::resources::SubscriptionManager>,
 }
 
 impl Server {
@@ -70,7 +73,7 @@ impl Server {
             negotiated_protocol: std::sync::Mutex::new(None),
             notifier: std::sync::Mutex::new(None),
             log_control: std::sync::Mutex::new(None),
-            subscriptions: crate::resources::SubscriptionManager::new(),
+            subscriptions: Arc::new(crate::resources::SubscriptionManager::new()),
         }
     }
 
@@ -160,7 +163,7 @@ impl Server {
                 let id = request.id.clone();
                 let response = server
                     .clone()
-                    .handle_request(request, request_key.clone(), cancel)
+                    .handle_request(request, request_key.clone(), cancel, None, None)
                     .await;
                 server.inflight.remove(&request_key);
                 if let Some(resp) = response {
@@ -208,22 +211,79 @@ impl Server {
     /// `notifications/cancelled` can abort an in-flight call, and the hard
     /// runtime ceiling / bounded concurrency still apply.
     pub async fn dispatch(self: Arc<Self>, request: Request) -> Option<Response> {
+        self.dispatch_inner(request, None, None).await
+    }
+
+    /// Dispatch a request with a transport-owned notification sink.
+    ///
+    /// HTTP sessions use this instead of the process-wide stdio sink.  A
+    /// caller that owns the sink can therefore receive only notifications
+    /// produced by its own requests and subscriptions.
+    pub async fn dispatch_with_notifier(
+        self: Arc<Self>,
+        request: Request,
+        notifier: UnboundedSender<serde_json::Value>,
+    ) -> Option<Response> {
+        self.dispatch_inner(request, Some(notifier), None).await
+    }
+
+    /// Dispatch a request with transport-owned notifications and subscriptions.
+    pub async fn dispatch_with_session(
+        self: Arc<Self>,
+        request: Request,
+        notifier: UnboundedSender<serde_json::Value>,
+        subscriptions: Arc<crate::resources::SubscriptionManager>,
+    ) -> Option<Response> {
+        self.dispatch_inner(request, Some(notifier), Some(subscriptions))
+            .await
+    }
+
+    async fn dispatch_inner(
+        self: Arc<Self>,
+        request: Request,
+        notifier: Option<UnboundedSender<serde_json::Value>>,
+        subscriptions: Option<Arc<crate::resources::SubscriptionManager>>,
+    ) -> Option<Response> {
         if request.is_notification() {
             self.handle_notification(&request);
             return None;
         }
-        let request_key = request
-            .id
-            .as_ref()
-            .map(|r| r.to_string())
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let modern_version = request_modern_version(&request).map(str::to_owned);
+        if let Some(version) = modern_version.as_deref() {
+            if !is_supported_protocol_version(version) {
+                return Some(Response::error(
+                    request.id.clone(),
+                    ErrorObject::new(
+                        error_codes::UNSUPPORTED_PROTOCOL_VERSION,
+                        "Unsupported protocol version",
+                        Some(serde_json::json!({
+                            "supported": SUPPORTED_PROTOCOL_VERSIONS,
+                            "requested": version,
+                        })),
+                    ),
+                ));
+            }
+        }
+        let method = request.method.clone();
+        let request_key = uuid::Uuid::new_v4().to_string();
         let cancel = self.root_cancel.child_token();
         self.inflight.insert(request_key.clone(), cancel.clone());
-        let resp = self
+        let mut resp = self
             .clone()
-            .handle_request(request, request_key.clone(), cancel)
+            .handle_request(
+                request,
+                request_key.clone(),
+                cancel,
+                notifier,
+                subscriptions,
+            )
             .await;
         self.inflight.remove(&request_key);
+        if modern_version.is_some() {
+            if let Some(response) = resp.as_mut() {
+                add_modern_result_metadata(response, &method);
+            }
+        }
         resp
     }
 
@@ -267,10 +327,23 @@ impl Server {
         req: Request,
         request_key: String,
         cancel: CancellationToken,
+        notifier: Option<UnboundedSender<serde_json::Value>>,
+        subscriptions: Option<Arc<crate::resources::SubscriptionManager>>,
     ) -> Option<Response> {
         let id = req.id.clone();
+        let modern = request_modern_version(&req).is_some();
         match req.method.as_str() {
             "initialize" => {
+                if modern {
+                    return Some(Response::error(
+                        id,
+                        ErrorObject::new(
+                            error_codes::METHOD_NOT_FOUND,
+                            "initialize is a legacy-only method; use server/discover",
+                            None,
+                        ),
+                    ));
+                }
                 // Version negotiation per the MCP lifecycle spec: echo the
                 // client's requested revision when we support it, otherwise
                 // offer our latest supported revision and let the client
@@ -298,7 +371,16 @@ impl Server {
                     serde_json::to_value(self.initialize_result(negotiated)).unwrap_or_default(),
                 ))
             }
-            "ping" => Some(Response::success(id, serde_json::json!({}))),
+            "ping" if !modern => Some(Response::success(id, serde_json::json!({}))),
+            "ping" => Some(Response::error(
+                id,
+                ErrorObject::new(
+                    error_codes::METHOD_NOT_FOUND,
+                    "ping is not part of the current protocol revision",
+                    None,
+                ),
+            )),
+            "server/discover" => Some(Response::success(id, self.discover_result())),
             "tools/list" => {
                 let config = self.config.snapshot();
                 let result = ListToolsResult {
@@ -310,17 +392,40 @@ impl Server {
                     serde_json::to_value(result).unwrap_or_default(),
                 ))
             }
-            "tools/call" => Some(self.handle_tool_call(req, request_key, cancel).await),
+            "tools/call" => Some(
+                self.handle_tool_call(req, request_key, cancel, notifier.clone())
+                    .await,
+            ),
             "resources/list" => Some(self.handle_resources_list(id)),
             "resources/read" => Some(self.handle_resources_read(req)),
-            "resources/subscribe" => Some(self.handle_resources_subscribe(req, true)),
-            "resources/unsubscribe" => Some(self.handle_resources_subscribe(req, false)),
+            "resources/subscribe" if !modern => {
+                Some(self.handle_resources_subscribe(req, true, notifier, subscriptions))
+            }
+            "resources/unsubscribe" if !modern => {
+                Some(self.handle_resources_subscribe(req, false, notifier, subscriptions))
+            }
+            "resources/subscribe" | "resources/unsubscribe" => Some(Response::error(
+                id,
+                ErrorObject::new(
+                    error_codes::METHOD_NOT_FOUND,
+                    "resource subscriptions moved to subscriptions/listen in the current protocol",
+                    None,
+                ),
+            )),
             "prompts/list" => Some(Response::success(
                 id,
                 serde_json::to_value(crate::prompts::list()).unwrap_or_default(),
             )),
             "prompts/get" => Some(self.handle_prompts_get(req)),
-            "logging/setLevel" => Some(self.handle_set_level(req)),
+            "logging/setLevel" if !modern => Some(self.handle_set_level(req)),
+            "logging/setLevel" => Some(Response::error(
+                id,
+                ErrorObject::new(
+                    error_codes::METHOD_NOT_FOUND,
+                    "logging/setLevel is not part of the current protocol revision",
+                    None,
+                ),
+            )),
             other => Some(Response::error(
                 id,
                 ErrorObject::new(
@@ -338,6 +443,28 @@ impl Server {
             Ok(result) => Response::success(id, serde_json::to_value(result).unwrap_or_default()),
             Err(e) => Response::error(id, ErrorObject::new(e.json_rpc_code(), e.to_string(), None)),
         }
+    }
+
+    fn discover_result(&self) -> serde_json::Value {
+        let config = self.config.snapshot();
+        serde_json::json!({
+            "resultType": "complete",
+            "supportedVersions": SUPPORTED_PROTOCOL_VERSIONS,
+            "capabilities": {
+                "tools": {},
+                "resources": {},
+                "prompts": {}
+            },
+            "_meta": {
+                "io.modelcontextprotocol/serverInfo": {
+                    "name": config.server.name,
+                    "version": config.server.version
+                }
+            },
+            "instructions": config.server.instructions,
+            "ttlMs": 3_600_000u64,
+            "cacheScope": "public"
+        })
     }
 
     fn handle_resources_read(&self, req: Request) -> Response {
@@ -359,7 +486,13 @@ impl Server {
         }
     }
 
-    fn handle_resources_subscribe(&self, req: Request, subscribe: bool) -> Response {
+    fn handle_resources_subscribe(
+        &self,
+        req: Request,
+        subscribe: bool,
+        request_notifier: Option<UnboundedSender<serde_json::Value>>,
+        request_subscriptions: Option<Arc<crate::resources::SubscriptionManager>>,
+    ) -> Response {
         let id = req.id.clone();
         let params: ReadResourceParams = match req
             .params
@@ -372,10 +505,11 @@ impl Server {
             }
         };
         if !subscribe {
-            let existed = self.subscriptions.unsubscribe(&params.uri);
+            let subscriptions = request_subscriptions.unwrap_or_else(|| self.subscriptions.clone());
+            let existed = subscriptions.unsubscribe(&params.uri);
             return Response::success(id, serde_json::json!({ "unsubscribed": existed }));
         }
-        let notifier = self.notifier.lock().unwrap().clone();
+        let notifier = request_notifier.or_else(|| self.notifier.lock().unwrap().clone());
         let Some(notifier) = notifier else {
             return Response::error(
                 id,
@@ -387,10 +521,8 @@ impl Server {
             );
         };
         let config = self.config.snapshot();
-        match self
-            .subscriptions
-            .subscribe(&config, &self.working_dir, &params.uri, notifier)
-        {
+        let subscriptions = request_subscriptions.unwrap_or_else(|| self.subscriptions.clone());
+        match subscriptions.subscribe(&config, &self.working_dir, &params.uri, notifier) {
             Ok(()) => Response::success(id, serde_json::json!({ "subscribed": params.uri })),
             Err(e) => Response::error(id, ErrorObject::new(e.json_rpc_code(), e.to_string(), None)),
         }
@@ -493,6 +625,7 @@ impl Server {
         req: Request,
         request_id: String,
         cancel: CancellationToken,
+        notifier: Option<UnboundedSender<serde_json::Value>>,
     ) -> Response {
         let id = req.id.clone();
         let params: CallToolParams = match req
@@ -529,6 +662,13 @@ impl Server {
             }
         };
 
+        if let Err(error) = tool.validate_arguments(&params.arguments) {
+            return Response::error(
+                id,
+                ErrorObject::new(error.json_rpc_code(), error.to_string(), None),
+            );
+        }
+
         // Resolve policy for this tool.
         let policy = match EffectivePolicy::resolve(&config, &params.name) {
             Ok(p) => Arc::new(p),
@@ -543,7 +683,7 @@ impl Server {
         // Per-request cancellation token was registered by the read loop.
         // If the client supplied a progress token, wire a progress sink that
         // forwards updates as `notifications/progress` frames.
-        let progress = self.build_progress_sink(&params);
+        let progress = self.build_progress_sink(&params, notifier);
         let ctx = ToolContext {
             policy: policy.clone(),
             working_dir: self.working_dir.clone(),
@@ -573,9 +713,16 @@ impl Server {
 
         // Enforce the hard runtime ceiling and cancellation uniformly, on top of
         // any finer-grained timeout the tool applies internally.
-        let outcome = ctx
-            .guarded(hard_ceiling, tool.call(&ctx, params.arguments))
-            .await;
+        let outcome = std::panic::AssertUnwindSafe(
+            ctx.guarded(hard_ceiling, tool.call(&ctx, params.arguments)),
+        )
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|_| {
+            Err(ToolError::Internal(
+                "tool panicked; the request was isolated".to_string(),
+            ))
+        });
         let elapsed = started.elapsed();
 
         let (result, metric) = match outcome {
@@ -615,9 +762,13 @@ impl Server {
 
     /// If the call carries a progress token and a notifier is active, build a
     /// [`ProgressSink`] whose updates are forwarded as `notifications/progress`.
-    fn build_progress_sink(&self, params: &CallToolParams) -> Option<ProgressSink> {
+    fn build_progress_sink(
+        &self,
+        params: &CallToolParams,
+        request_notifier: Option<UnboundedSender<serde_json::Value>>,
+    ) -> Option<ProgressSink> {
         let token = params.progress_token()?;
-        let notifier = self.notifier.lock().unwrap().clone()?;
+        let notifier = request_notifier.or_else(|| self.notifier.lock().unwrap().clone())?;
         let (sink, mut rx) = ProgressSink::channel();
         tokio::spawn(async move {
             while let Some(update) = rx.recv().await {
@@ -649,6 +800,43 @@ fn cancel_key(v: &serde_json::Value) -> String {
     }
 }
 
+/// Extract the current protocol revision from per-request MCP metadata.
+fn request_modern_version(req: &Request) -> Option<&str> {
+    req.params
+        .as_ref()?
+        .get("_meta")?
+        .get("io.modelcontextprotocol/protocolVersion")?
+        .as_str()
+        .filter(|version| is_modern_protocol_version(version))
+}
+
+/// Add the current revision's common result fields without changing legacy
+/// response shapes or requiring every tool implementation to know the new
+/// envelope.
+fn add_modern_result_metadata(response: &mut Response, method: &str) {
+    let Some(result) = response
+        .result
+        .as_mut()
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    result
+        .entry("resultType")
+        .or_insert_with(|| serde_json::Value::String("complete".into()));
+    if matches!(
+        method,
+        "tools/list" | "resources/list" | "resources/read" | "prompts/list" | "server/discover"
+    ) {
+        result
+            .entry("ttlMs")
+            .or_insert_with(|| serde_json::Value::from(3_600_000u64));
+        result
+            .entry("cacheScope")
+            .or_insert_with(|| serde_json::Value::String("private".into()));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -659,7 +847,11 @@ mod tests {
     fn test_server() -> Arc<Server> {
         let mut config = Config::default();
         config.security.allowed_paths = vec!["/**".into()];
-        config.security.allowed_commands = vec!["echo".into()];
+        config.security.allowed_commands = if cfg!(windows) {
+            vec!["cmd".into()]
+        } else {
+            vec!["echo".into()]
+        };
         let store = ConfigStore::new(config);
         let registry = nebula_mcp_tools::build_registry(&ToolServices::new());
         Arc::new(Server::new(
@@ -668,6 +860,14 @@ mod tests {
             std::env::temp_dir(),
             CancellationToken::new(),
         ))
+    }
+
+    fn echo_arguments(text: &str) -> serde_json::Value {
+        if cfg!(windows) {
+            serde_json::json!({"program": "cmd", "args": ["/C", "echo", text]})
+        } else {
+            serde_json::json!({"program": "echo", "args": [text]})
+        }
     }
 
     #[tokio::test]
@@ -685,7 +885,7 @@ mod tests {
         };
         let resp = server
             .clone()
-            .handle_request(init, "1".into(), CancellationToken::new())
+            .handle_request(init, "1".into(), CancellationToken::new(), None, None)
             .await
             .unwrap();
         assert!(resp.result.is_some());
@@ -698,7 +898,7 @@ mod tests {
         };
         let resp = server
             .clone()
-            .handle_request(list, "2".into(), CancellationToken::new())
+            .handle_request(list, "2".into(), CancellationToken::new(), None, None)
             .await
             .unwrap();
         let tools = resp.result.unwrap()["tools"].as_array().unwrap().len();
@@ -714,11 +914,11 @@ mod tests {
             method: "tools/call".into(),
             params: Some(serde_json::json!({
                 "name": "terminal.run",
-                "arguments": {"program": "echo", "args": ["hi"]}
+                "arguments": echo_arguments("hi")
             })),
         };
         let resp = server
-            .handle_request(call, "3".into(), CancellationToken::new())
+            .handle_request(call, "3".into(), CancellationToken::new(), None, None)
             .await
             .unwrap();
         let result = resp.result.unwrap();
@@ -737,7 +937,7 @@ mod tests {
             params: Some(serde_json::json!({"name": "does.not.exist", "arguments": {}})),
         };
         let resp = server
-            .handle_request(call, "3".into(), CancellationToken::new())
+            .handle_request(call, "3".into(), CancellationToken::new(), None, None)
             .await
             .unwrap();
         assert_eq!(resp.error.unwrap().code, error_codes::METHOD_NOT_FOUND);
@@ -757,10 +957,69 @@ mod tests {
             })),
         };
         let resp = server
-            .handle_request(call, "3".into(), CancellationToken::new())
+            .handle_request(call, "3".into(), CancellationToken::new(), None, None)
             .await
             .unwrap();
         let result = resp.result.unwrap();
         assert_eq!(result["isError"], true);
+    }
+
+    #[tokio::test]
+    async fn invalid_tool_arguments_are_rejected_before_call() {
+        let server = test_server();
+        let call = Request {
+            jsonrpc: "2.0".into(),
+            id: Some(RequestId::Number(6)),
+            method: "tools/call".into(),
+            params: Some(serde_json::json!({
+                "name": "terminal.run",
+                "arguments": {"args": ["echo", "should-not-run"]}
+            })),
+        };
+        let resp = server
+            .handle_request(call, "6".into(), CancellationToken::new(), None, None)
+            .await
+            .unwrap();
+        let error = resp
+            .error
+            .expect("schema validation should return an error");
+        assert_eq!(error.code, error_codes::INVALID_PARAMS);
+        assert!(error.message.contains("program"));
+    }
+
+    #[tokio::test]
+    async fn modern_discovery_and_metadata_are_supported() {
+        let server = test_server();
+        let discover = Request {
+            jsonrpc: "2.0".into(),
+            id: Some(RequestId::Number(7)),
+            method: "server/discover".into(),
+            params: Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": LATEST_PROTOCOL_VERSION
+                }
+            })),
+        };
+        let response = server.clone().dispatch(discover).await.unwrap();
+        let result = response.result.unwrap();
+        assert_eq!(result["resultType"], "complete");
+        assert!(result["supportedVersions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == LATEST_PROTOCOL_VERSION));
+
+        let list = Request {
+            jsonrpc: "2.0".into(),
+            id: Some(RequestId::Number(8)),
+            method: "tools/list".into(),
+            params: Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": LATEST_PROTOCOL_VERSION
+                }
+            })),
+        };
+        let response = server.dispatch(list).await.unwrap();
+        assert_eq!(response.result.unwrap()["resultType"], "complete");
     }
 }

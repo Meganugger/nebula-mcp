@@ -22,8 +22,18 @@ async fn spawn_http() -> (String, CancellationToken) {
 /// Spawn the HTTP transport with a custom SSE keep-alive interval (seconds).
 async fn spawn_http_with_keep_alive(sse_keep_alive_secs: u64) -> (String, CancellationToken) {
     let mut config = Config::default();
-    config.security.allowed_commands = vec!["echo".into()];
-    config.security.allowed_paths = vec!["/tmp/**".into()];
+    config.security.allowed_commands = if cfg!(windows) {
+        vec!["cmd".into()]
+    } else {
+        vec!["echo".into()]
+    };
+    let temp_root = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string();
+    config.security.allowed_paths = vec![format!("{temp_root}/**"), temp_root];
     config.logging.level = "error".into();
     let store = ConfigStore::new(config);
     let registry = build_registry(&ToolServices::new());
@@ -57,8 +67,37 @@ async fn spawn_http_with_keep_alive(sse_keep_alive_secs: u64) -> (String, Cancel
     (format!("http://{addr}/mcp"), cancel)
 }
 
+fn echo_arguments(text: &str) -> Value {
+    if cfg!(windows) {
+        json!({"program": "cmd", "args": ["/C", "echo", text]})
+    } else {
+        json!({"program": "echo", "args": [text]})
+    }
+}
+
 fn client() -> reqwest::Client {
     reqwest::Client::new()
+}
+
+async fn legacy_session(url: &str, version: &str) -> String {
+    let response = client()
+        .post(url)
+        .bearer_auth(TOKEN)
+        .json(&json!({
+            "jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"protocolVersion":version,"capabilities":{},"clientInfo":{"name":"it","version":"1"}}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    response
+        .headers()
+        .get("mcp-session-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string()
 }
 
 /// Append chunks from an open SSE response into `buf` until `pred(buf)` holds.
@@ -283,7 +322,7 @@ async fn tools_list_and_call_over_http() {
         .bearer_auth(TOKEN)
         .json(&json!({
             "jsonrpc":"2.0","id":3,"method":"tools/call",
-            "params":{"name":"terminal.run","arguments":{"program":"echo","args":["http-e2e"]}}
+            "params":{"name":"terminal.run","arguments":echo_arguments("http-e2e")}
         }))
         .send()
         .await
@@ -324,7 +363,14 @@ async fn sse_get_requires_token() {
 #[tokio::test]
 async fn sse_stream_emits_periodic_keep_alive_comments() {
     let (url, cancel) = spawn_http_with_keep_alive(1).await;
-    let mut resp = client().get(&url).bearer_auth(TOKEN).send().await.unwrap();
+    let session = legacy_session(&url, "2025-11-25").await;
+    let mut resp = client()
+        .get(&url)
+        .bearer_auth(TOKEN)
+        .header("Mcp-Session-Id", session)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let content_type = resp.headers()[reqwest::header::CONTENT_TYPE]
         .to_str()
@@ -348,7 +394,14 @@ async fn sse_stream_emits_periodic_keep_alive_comments() {
 #[tokio::test]
 async fn sse_keep_alive_interleaves_with_real_notifications() {
     let (url, cancel) = spawn_http_with_keep_alive(1).await;
-    let mut resp = client().get(&url).bearer_auth(TOKEN).send().await.unwrap();
+    let session = legacy_session(&url, "2025-11-25").await;
+    let mut resp = client()
+        .get(&url)
+        .bearer_auth(TOKEN)
+        .header("Mcp-Session-Id", &session)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
     // First heartbeat proves the SSE subscription is live before we trigger work.
@@ -363,11 +416,12 @@ async fn sse_keep_alive_interleaves_with_real_notifications() {
     let call: Value = client()
         .post(&url)
         .bearer_auth(TOKEN)
+        .header("Mcp-Session-Id", session)
         .json(&json!({
             "jsonrpc":"2.0","id":7,"method":"tools/call",
             "params":{
                 "name":"terminal.run",
-                "arguments":{"program":"echo","args":["sse-interleave"]},
+                "arguments":echo_arguments("sse-interleave"),
                 "_meta":{"progressToken":"sse-test"}
             }
         }))
@@ -390,6 +444,48 @@ async fn sse_keep_alive_interleaves_with_real_notifications() {
         b.matches(": keep-alive").count() > seen
     })
     .await;
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn legacy_sse_notifications_are_isolated_per_session() {
+    let (url, cancel) = spawn_http_with_keep_alive(0).await;
+    let session_a = legacy_session(&url, "2025-11-25").await;
+    let session_b = legacy_session(&url, "2025-11-25").await;
+
+    let mut stream_b = client()
+        .get(&url)
+        .bearer_auth(TOKEN)
+        .header("Mcp-Session-Id", &session_b)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stream_b.status(), reqwest::StatusCode::OK);
+
+    let response = client()
+        .post(&url)
+        .bearer_auth(TOKEN)
+        .header("Mcp-Session-Id", session_a)
+        .json(&json!({
+            "jsonrpc":"2.0","id":7,"method":"tools/call",
+            "params":{
+                "name":"terminal.run",
+                "arguments":echo_arguments("session-a"),
+                "_meta":{"progressToken":"only-a"}
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    // With keep-alives disabled, session B must receive no event from A.
+    let no_cross_session_event =
+        tokio::time::timeout(std::time::Duration::from_millis(300), stream_b.chunk()).await;
+    assert!(
+        no_cross_session_event.is_err(),
+        "session B observed a notification produced by session A"
+    );
     cancel.cancel();
 }
 

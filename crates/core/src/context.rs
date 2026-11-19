@@ -129,8 +129,14 @@ mod tests {
     use crate::config::SecurityConfig;
 
     fn ctx() -> ToolContext {
+        let temp_root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_string();
         let base = SecurityConfig {
-            allowed_paths: vec!["/work/**".into()],
+            allowed_paths: vec![format!("{temp_root}/**"), temp_root.clone()],
             default_timeout_secs: 1,
             max_runtime_secs: 5,
             ..Default::default()
@@ -138,7 +144,7 @@ mod tests {
         let policy = EffectivePolicy::build("t", &base, None).unwrap();
         ToolContext {
             policy: Arc::new(policy),
-            working_dir: PathBuf::from("/work"),
+            working_dir: std::env::temp_dir(),
             cancel: CancellationToken::new(),
             metrics: Metrics::new(),
             config: Arc::new(Config::default()),
@@ -171,6 +177,11 @@ mod tests {
     fn resolve_path_enforces_policy() {
         let c = ctx();
         assert!(c.resolve_path("src/main.rs").is_ok());
-        assert!(c.resolve_path("/etc/passwd").is_err());
+        let outside = if cfg!(windows) {
+            PathBuf::from(r"C:\Windows\System32\config\SAM")
+        } else {
+            PathBuf::from("/etc/passwd")
+        };
+        assert!(c.resolve_path(outside.to_str().unwrap()).is_err());
     }
 }

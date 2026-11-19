@@ -4,8 +4,9 @@
 //! per-tool override (if any) on top of the global [`SecurityConfig`] baseline.
 //! The policy is the single choke point for:
 //!
-//! * path access (allow/deny glob lists, lexical `..` containment),
-//! * command allowlisting (basename match, Windows-insensitive),
+//! * path access (allow/deny glob lists, lexical `..` containment and
+//!   symlink-aware resolution),
+//! * command allowlisting (resolved executable match, Windows-insensitive),
 //! * timeouts and maximum runtime,
 //! * maximum captured output,
 //! * elevation, network and destructive-operation gates.
@@ -13,10 +14,11 @@
 //! An empty allowlist denies rather than permits. The only "allow everything"
 //! switch is an explicit standalone `"*"` entry in `allowed_commands`.
 
+use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use globset::{GlobSet, GlobSetBuilder};
 
 use crate::config::{Config, SecurityConfig, ToolOverride};
 use crate::error::ToolError;
@@ -55,6 +57,8 @@ impl EffectivePolicy {
     ) -> Result<Self, ToolError> {
         let mut allowed_patterns = base.allowed_paths.clone();
         let mut allowed_commands = base.allowed_commands.clone();
+        let mut denied_patterns = crate::config::default_denied_paths();
+        denied_patterns.extend(base.denied_paths.iter().cloned());
         let mut timeout_secs = base.default_timeout_secs;
         let mut max_output_bytes = base.max_output_bytes;
         let mut allow_destructive = base.allow_destructive;
@@ -86,7 +90,7 @@ impl EffectivePolicy {
         let timeout = Duration::from_secs(timeout_secs.max(1)).min(max_runtime);
 
         let allowed = build_globset(&allowed_patterns)?;
-        let denied = build_globset(&base.denied_paths)?;
+        let denied = build_globset(&denied_patterns)?;
 
         Ok(Self {
             tool: tool.to_string(),
@@ -156,7 +160,7 @@ impl EffectivePolicy {
         self.allow_elevated
     }
 
-    /// The command allowlist (executable basenames).
+    /// The command allowlist (names or explicit executable paths).
     #[must_use]
     pub fn allowed_commands(&self) -> &[String] {
         &self.allowed_commands
@@ -201,52 +205,70 @@ impl EffectivePolicy {
         }
     }
 
-    /// Validate and normalise a path against the allow/deny lists.
+    /// Validate and resolve a path against the allow/deny lists.
     ///
-    /// Returns the normalised absolute path on success. The input may be
-    /// relative; it is resolved against `base_dir`. `..` components that would
-    /// escape the resolved root are rejected before any glob matching.
+    /// Returns a path whose existing components have been canonicalized on
+    /// success. The input may be relative; it is resolved against `base_dir`.
+    /// Canonicalizing the deepest existing ancestor catches symlink escapes
+    /// both for existing files and for new files below an existing symlink.
     pub fn check_path(&self, path: &Path, base_dir: &Path) -> Result<PathBuf, ToolError> {
         let normalized = normalize_path(path, base_dir)?;
+        let checked = resolve_existing_ancestor(&normalized)?;
 
         // Deny list always wins.
-        if self.denied.is_match(&normalized) {
+        if self.denied.is_match(&checked) {
             return Err(ToolError::PermissionDenied(format!(
                 "path '{}' matches a denied pattern",
-                normalized.display()
+                checked.display()
             )));
         }
 
         if !self.allowed_has_patterns {
             return Err(ToolError::PermissionDenied(format!(
                 "no allowed_paths configured; access to '{}' denied",
-                normalized.display()
+                checked.display()
             )));
         }
 
-        if !self.allowed.is_match(&normalized) {
+        if !self.allowed.is_match(&checked) {
             return Err(ToolError::PathNotAllowed {
-                path: normalized.display().to_string(),
+                path: checked.display().to_string(),
             });
         }
 
-        Ok(normalized)
+        Ok(checked)
     }
 
     /// Validate an executable name/path against the command allowlist.
     ///
-    /// Matching is by basename (without a trailing `.exe`), case-insensitive on
-    /// Windows. A standalone `"*"` entry permits every command name. Returns the
-    /// original program string on success.
+    /// Bare command names match the resolved executable's basename. A program
+    /// supplied as a path must be explicitly allowed by that path (or by
+    /// `"*"`); this prevents a planted `/tmp/echo` from satisfying an
+    /// allowlist entry for the trusted `echo` command.
     pub fn check_command(&self, program: &str) -> Result<(), ToolError> {
+        self.check_command_resolved(program, Path::new(program))
+    }
+
+    /// Validate a command against the executable that will actually be
+    /// spawned. `resolved` must be the result of executable resolution.
+    pub fn check_command_resolved(&self, program: &str, resolved: &Path) -> Result<(), ToolError> {
         if self.allowed_commands.is_empty() {
             return Err(ToolError::CommandNotAllowed(program.to_string()));
         }
+        let explicit_path = has_path_separator(program);
         let candidate = command_key(program);
-        let permitted = self
-            .allowed_commands
-            .iter()
-            .any(|c| c == "*" || command_key(c) == candidate);
+        let resolved = resolved.to_string_lossy();
+        let permitted = self.allowed_commands.iter().any(|c| {
+            if c == "*" {
+                return true;
+            }
+            if explicit_path || has_path_separator(c) {
+                return normalize_command_path(c)
+                    .map(|p| p == normalize_command_path(&resolved).unwrap_or_default())
+                    .unwrap_or(false);
+            }
+            command_key(c) == candidate
+        });
         if permitted {
             Ok(())
         } else {
@@ -267,6 +289,19 @@ impl EffectivePolicy {
 }
 
 /// Reduce an executable path/name to a comparison key.
+fn has_path_separator(program: &str) -> bool {
+    program.contains('/') || program.contains('\\') || Path::new(program).is_absolute()
+}
+
+fn normalize_command_path(program: &str) -> Option<String> {
+    Some(
+        std::fs::canonicalize(program)
+            .unwrap_or_else(|_| PathBuf::from(program))
+            .to_string_lossy()
+            .replace('\\', "/"),
+    )
+}
+
 fn command_key(program: &str) -> String {
     let base = Path::new(program)
         .file_name()
@@ -281,17 +316,63 @@ fn command_key(program: &str) -> String {
 }
 
 /// Build a [`GlobSet`] from patterns, enabling literal-separator matching so
-/// `**` behaves intuitively across path separators.
+/// `**` behaves intuitively across path separators. A trailing `/**` also
+/// grants the directory itself, which is what operators expect from an
+/// allowed root.
 fn build_globset(patterns: &[String]) -> Result<GlobSet, ToolError> {
     let mut builder = GlobSetBuilder::new();
-    for p in patterns {
-        let glob = Glob::new(p)
+    let mut expanded = BTreeSet::new();
+    for pattern in patterns {
+        expanded.insert(pattern.clone());
+        if let Some(root) = pattern.strip_suffix("/**") {
+            expanded.insert(root.to_string());
+        }
+    }
+    for p in expanded {
+        let glob = globset::GlobBuilder::new(&p)
+            .literal_separator(true)
+            .case_insensitive(cfg!(windows))
+            .build()
             .map_err(|e| ToolError::Internal(format!("invalid glob pattern '{p}': {e}")))?;
         builder.add(glob);
     }
     builder
         .build()
         .map_err(|e| ToolError::Internal(format!("building glob set: {e}")))
+}
+
+/// Canonicalize the deepest existing ancestor and append the missing suffix.
+///
+/// This is intentionally performed before matching the allowlist. A lexical
+/// path such as `allowed/link/secret` is not trusted merely because the
+/// lexical spelling is under `allowed`; if `link` points outside, the
+/// canonical path is outside as well. New files are handled by canonicalizing
+/// their nearest existing parent.
+fn resolve_existing_ancestor(path: &Path) -> Result<PathBuf, ToolError> {
+    let mut existing = path.to_path_buf();
+    let mut missing = Vec::new();
+    while std::fs::symlink_metadata(&existing).is_err() {
+        let name = existing.file_name().ok_or_else(|| {
+            ToolError::PermissionDenied(format!(
+                "path '{}' has no existing ancestor",
+                path.display()
+            ))
+        })?;
+        missing.push(name.to_os_string());
+        if !existing.pop() {
+            return Err(ToolError::PermissionDenied(format!(
+                "path '{}' has no existing ancestor",
+                path.display()
+            )));
+        }
+    }
+    let mut resolved = std::fs::canonicalize(&existing).map_err(|e| {
+        ToolError::PermissionDenied(format!("cannot resolve path '{}': {e}", path.display()))
+    })?;
+    for component in missing.iter().rev() {
+        resolved.push(component);
+    }
+    Ok(resolved)
 }
 
 /// Lexically normalise `path` (resolving `.`/`..`) against `base_dir` without
@@ -338,62 +419,89 @@ mod tests {
         EffectivePolicy::build("test.tool", &base, None).unwrap()
     }
 
+    fn canonical_temp_dir() -> std::path::PathBuf {
+        std::fs::canonicalize(std::env::temp_dir()).unwrap()
+    }
+
     #[test]
     fn empty_allowlist_denies_everything() {
+        let dir = tempfile::tempdir().unwrap();
         let p = policy_with(&[], &[]);
         let err = p
-            .check_path(Path::new("/work/a.txt"), Path::new("/work"))
+            .check_path(&dir.path().join("a.txt"), dir.path())
             .unwrap_err();
         assert!(matches!(err, ToolError::PermissionDenied(_)));
     }
 
     #[test]
     fn allowed_glob_permits_matching_path() {
-        let p = policy_with(&["/work/**"], &[]);
-        let ok = p
-            .check_path(Path::new("/work/src/main.rs"), Path::new("/work"))
-            .unwrap();
-        assert_eq!(ok, PathBuf::from("/work/src/main.rs"));
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_temp_dir()
+            .join(dir.path().file_name().unwrap())
+            .join("work");
+        std::fs::create_dir_all(&root).unwrap();
+        let pattern = format!("{}/**", root.display());
+        let p = policy_with(&[&pattern], &[]);
+        let ok = p.check_path(&root.join("src/main.rs"), &root).unwrap();
+        assert_eq!(ok, root.join("src/main.rs"));
     }
 
     #[test]
     fn denied_glob_overrides_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_temp_dir()
+            .join(dir.path().file_name().unwrap())
+            .join("work");
+        std::fs::create_dir_all(&root).unwrap();
+        let allowed = format!("{}/**", root.display());
         let base = SecurityConfig {
-            allowed_paths: vec!["/work/**".into()],
+            allowed_paths: vec![allowed],
             denied_paths: vec!["**/*.key".into()],
             ..Default::default()
         };
         let p = EffectivePolicy::build("t", &base, None).unwrap();
-        let err = p
-            .check_path(Path::new("/work/secret.key"), Path::new("/work"))
-            .unwrap_err();
+        let err = p.check_path(&root.join("secret.key"), &root).unwrap_err();
         assert!(matches!(err, ToolError::PermissionDenied(_)));
     }
 
     #[test]
     fn parent_traversal_is_contained() {
-        let p = policy_with(&["/work/**"], &[]);
-        let err = p
-            .check_path(Path::new("../etc/passwd"), Path::new("/work"))
-            .unwrap_err();
-        // Normalises to /etc/passwd which is outside /work/**.
-        assert!(matches!(err, ToolError::PathNotAllowed { .. }));
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_temp_dir()
+            .join(dir.path().file_name().unwrap())
+            .join("work");
+        std::fs::create_dir_all(&root).unwrap();
+        let pattern = format!("{}/**", root.display());
+        let p = policy_with(&[&pattern], &[]);
+        let err = p.check_path(Path::new("../etc/passwd"), &root).unwrap_err();
+        // Normalises outside the temporary allowed root.
+        assert!(matches!(
+            err,
+            ToolError::PathNotAllowed { .. } | ToolError::PermissionDenied(_)
+        ));
     }
 
     #[test]
     fn relative_paths_resolve_against_base() {
-        let p = policy_with(&["/work/**"], &[]);
-        let ok = p
-            .check_path(Path::new("src/lib.rs"), Path::new("/work"))
-            .unwrap();
-        assert_eq!(ok, PathBuf::from("/work/src/lib.rs"));
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_temp_dir()
+            .join(dir.path().file_name().unwrap())
+            .join("work");
+        std::fs::create_dir_all(&root).unwrap();
+        let pattern = format!("{}/**", root.display());
+        let p = policy_with(&[&pattern], &[]);
+        let ok = p.check_path(Path::new("src/lib.rs"), &root).unwrap();
+        assert_eq!(ok, root.join("src/lib.rs"));
     }
 
     #[test]
     fn command_allowlist_matches_basename() {
         let p = policy_with(&[], &["git", "cargo"]);
         assert!(p.check_command("git").is_ok());
-        assert!(p.check_command("/usr/bin/git").is_ok());
+        assert!(p.check_command("/usr/bin/git").is_err());
+        let resolved =
+            std::fs::canonicalize("/usr/bin/git").unwrap_or_else(|_| PathBuf::from("/usr/bin/git"));
+        assert!(p.check_command_resolved("git", &resolved).is_ok());
         assert!(p.check_command("rm").is_err());
     }
 
@@ -413,7 +521,10 @@ mod tests {
             "C:\\Tools\\some-arbitrary-tool.exe",
             "totally-unknown-binary",
         ] {
-            assert!(p.check_command(program).is_ok(), "{program} should be allowed");
+            assert!(
+                p.check_command(program).is_ok(),
+                "{program} should be allowed"
+            );
         }
 
         // Without a standalone "*" entry the allowlist stays exact.
@@ -459,5 +570,34 @@ mod tests {
         };
         let p2 = EffectivePolicy::build("docker.rm", &base, Some(&ov)).unwrap();
         assert!(p2.ensure_elevation_allowed().is_ok());
+    }
+
+    #[test]
+    fn allowed_root_matches_the_root_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_temp_dir()
+            .join(dir.path().file_name().unwrap())
+            .join("work");
+        std::fs::create_dir_all(&root).unwrap();
+        let pattern = format!("{}/**", root.display());
+        let p = policy_with(&[&pattern], &[]);
+        assert!(p.check_path(&root, dir.path()).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_outside_allowed_root_is_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        let allowed = dir.path().join("allowed");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink(&outside, allowed.join("link")).unwrap();
+        let p = policy_with(&[format!("{}/**", allowed.display()).as_str()], &[]);
+        let err = p
+            .check_path(&allowed.join("link/secret.txt"), dir.path())
+            .unwrap_err();
+        assert!(matches!(err, ToolError::PathNotAllowed { .. }));
     }
 }

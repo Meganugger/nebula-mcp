@@ -11,6 +11,7 @@ use nebula_mcp_protocol::CallToolResult;
 use serde_json::Value;
 
 use crate::common::exec::{run_checked, CommandSpec};
+use crate::common::network::validate_host;
 use crate::common::output::exec_result;
 use crate::common::platform::{ensure_windows, run_powershell, POWERSHELL};
 use crate::common::{Args, ObjectSchema};
@@ -141,6 +142,8 @@ impl Tool for PsRemote {
         ensure_windows(self.name())?;
         let a = Args::new(&args)?;
         let computer = a.str("computer")?;
+        ctx.policy.ensure_network_allowed()?;
+        validate_host(computer, 5985).await?;
         let script = a.str("script")?.replace('\'', "''");
         let cred = a.opt_str("credentialUser")?;
         let cred_clause = match cred {

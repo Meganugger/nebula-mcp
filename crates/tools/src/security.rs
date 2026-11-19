@@ -191,9 +191,15 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     fn ctx() -> ToolContext {
+        let temp_root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_string();
         let config = Config {
             security: SecurityConfig {
-                allowed_paths: vec!["/work/**".into()],
+                allowed_paths: vec![format!("{temp_root}/**"), temp_root.clone()],
                 allowed_commands: vec!["git".into(), "cargo".into()],
                 ..Default::default()
             },
@@ -202,7 +208,7 @@ mod tests {
         let policy = Pol::build("security", &config.security, None).unwrap();
         ToolContext {
             policy: Arc::new(policy),
-            working_dir: std::path::PathBuf::from("/work"),
+            working_dir: std::env::temp_dir(),
             cancel: CancellationToken::new(),
             metrics: Metrics::new(),
             config: Arc::new(config),
@@ -224,7 +230,14 @@ mod tests {
         assert!(text.contains("\"allowed\": true"));
 
         let denied = CheckPath
-            .call(&ctx(), json!({"path": "/etc/passwd"}))
+            .call(
+                &ctx(),
+                json!({"path": if cfg!(windows) {
+                    r"C:\Windows\System32\config\SAM"
+                } else {
+                    "/etc/passwd"
+                }}),
+            )
             .await
             .unwrap();
         let text = match &denied.content[0] {

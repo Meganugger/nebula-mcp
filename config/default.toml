@@ -8,14 +8,14 @@
 #
 # Security note: the allowlists below are EMPTY-DENY by default. A tool can only
 # touch a path that matches `allowed_paths` (and not `denied_paths`), and can
-# only execute a program named in `allowed_commands`. There is no wildcard
-# "allow everything" switch by design.
+# only execute a program named in `allowed_commands`. A standalone "*" is an
+# explicit allow-everything command switch and should not be used remotely.
 
 [server]
 # Advertised over the MCP `initialize` handshake.
 name = "nebula-mcp"
 # `version` defaults to the crate version; override only if you must.
-# version = "0.1.0"
+# version = "0.2.0"
 # Instructions surfaced to the model on initialize.
 instructions = "Nebula MCP: a general-purpose autonomous software-engineering backend for building, testing and shipping any program."
 # Maximum tool calls executed concurrently.
@@ -83,7 +83,7 @@ denied_paths = [
     "**/*.pem",
     "**/*.key",
     "**/id_rsa*",
-    "**/.env",
+    "**/.env*",
 ]
 # Executables permitted for terminal/process tools. Matched by basename
 # (case-insensitive on Windows, `.exe` stripped). Examples:
@@ -106,7 +106,7 @@ max_output_bytes = 8388608
 # Whether tools may request elevated (admin) execution.
 allow_elevated = false
 # Whether tools that reach external networks are permitted.
-allow_network = true
+allow_network = false
 # Whether destructive operations (delete, reset --hard, container rm) are
 # permitted at all.
 allow_destructive = false

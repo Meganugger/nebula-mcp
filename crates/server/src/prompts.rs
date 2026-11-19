@@ -113,11 +113,11 @@ const PROMPTS: &[PromptDef] = &[
         render: |a| {
             format!(
                 "Build a new project in `{dir}` from this spec:\n\n{spec}\n\n\
-                 1. Choose an appropriate language/toolchain and lay out the directory with `fs.write`/`fs.mkdir`.\n\
-                 2. Initialise version control with `git.init` and a sensible `.gitignore`.\n\
+                 1. Choose an appropriate language/toolchain and lay out the directory with `fs.write`.\n\
+                 2. Initialise version control with `terminal.run` calling `git init`, then add a sensible `.gitignore`.\n\
                  3. Install dependencies and build with `terminal.run` (stream output with a progressToken).\n\
                  4. Add tests and run them; iterate with `fs.edit` until the build and tests pass.\n\
-                 5. Commit the working tree with `git.add`/`git.commit` and summarise how to run it.",
+                 5. Stage new files with `terminal.run` calling `git add -A`, then use `git.commit` and summarise how to run it.",
                 dir = arg(a, "directory"),
                 spec = arg(a, "spec")
             )

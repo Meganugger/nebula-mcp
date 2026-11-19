@@ -283,11 +283,13 @@ impl Tool for CrashDumps {
         ensure_windows(self.name())?;
         let a = Args::new(&args)?;
         let dir = match a.opt_str("directory")? {
-            Some(d) => d.to_string(),
+            Some(d) => ctx.resolve_path(d)?.display().to_string(),
             None => {
                 let local = std::env::var("LOCALAPPDATA")
                     .map_err(|_| ToolError::Execution("LOCALAPPDATA not set".into()))?;
-                format!("{local}\\CrashDumps")
+                ctx.resolve_path(&format!("{local}\\CrashDumps"))?
+                    .display()
+                    .to_string()
             }
         };
         let script = format!(
@@ -364,11 +366,6 @@ impl Tool for AnalyzeDump {
     fn input_schema(&self) -> Value {
         ObjectSchema::new()
             .string("dump", "Path to the .dmp file.", true)
-            .string(
-                "commands",
-                "Debugger commands (default '!analyze -v').",
-                false,
-            )
             .integer("timeoutSecs", "Timeout override.", false)
             .build()
     }
@@ -382,8 +379,9 @@ impl Tool for AnalyzeDump {
         ensure_windows(self.name())?;
         let a = Args::new(&args)?;
         let dump = ctx.resolve_path(a.str("dump")?)?;
-        let commands = a.str_or("commands", "!analyze -v")?;
-        let script = format!("{commands}; q");
+        // Do not expose cdb's command language to the client: debugger
+        // commands can launch shells and write arbitrary files.
+        let script = "!analyze -v; q".to_string();
         run_cmd(
             ctx,
             "cdb",

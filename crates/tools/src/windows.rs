@@ -97,7 +97,12 @@ impl Tool for WinService {
             .build()
     }
     fn annotations(&self) -> Option<ToolAnnotations> {
-        ro()
+        Some(ToolAnnotations {
+            read_only_hint: Some(false),
+            destructive_hint: Some(true),
+            open_world_hint: Some(true),
+            ..Default::default()
+        })
     }
     async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
         ensure_windows(self.name())?;
@@ -149,6 +154,8 @@ impl Tool for WinService {
             }
             "create" => {
                 ctx.policy.ensure_elevation_allowed()?;
+                ctx.policy
+                    .ensure_destructive_allowed("windows.service create")?;
                 let bin = a.opt_str("binPath")?.ok_or_else(|| {
                     ToolError::InvalidArguments("create requires 'binPath'".into())
                 })?;
@@ -170,6 +177,8 @@ impl Tool for WinService {
             }
             "config" => {
                 ctx.policy.ensure_elevation_allowed()?;
+                ctx.policy
+                    .ensure_destructive_allowed("windows.service config")?;
                 let mut v = vec!["config".to_string(), name.clone()];
                 if let Some(b) = a.opt_str("binPath")? {
                     v.push("binPath=".into());
@@ -476,6 +485,7 @@ impl Tool for WinEnv {
                 Ok(exec_result("GetEnvironmentVariable", &r))
             }
             "set" => {
+                ctx.policy.ensure_destructive_allowed("windows.env set")?;
                 if scope == "Machine" {
                     ctx.policy.ensure_elevation_allowed()?;
                 }

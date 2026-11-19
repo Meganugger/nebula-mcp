@@ -353,6 +353,7 @@ impl Tool for RenamePath {
         let a = Args::new(&args)?;
         let from = ctx.resolve_path(a.str("from")?)?;
         let to = ctx.resolve_path(a.str("to")?)?;
+        validate_tree(&ctx.policy, &from)?;
         tokio::fs::rename(&from, &to)
             .await
             .map_err(|e| map_io("rename", &from, e))?;
@@ -400,6 +401,7 @@ impl Tool for DeletePath {
             .map_err(|e| map_io("stat", &path, e))?;
         if meta.is_dir() {
             if recursive {
+                validate_tree(&ctx.policy, &path)?;
                 tokio::fs::remove_dir_all(&path)
                     .await
                     .map_err(|e| map_io("remove dir", &path, e))?;
@@ -444,13 +446,14 @@ impl Tool for MovePath {
         let a = Args::new(&args)?;
         let from = ctx.resolve_path(a.str("from")?)?;
         let to = ctx.resolve_path(a.str("to")?)?;
+        validate_tree(&ctx.policy, &from)?;
         if tokio::fs::rename(&from, &to).await.is_err() {
             // Cross-device: copy then delete.
             let meta = tokio::fs::symlink_metadata(&from)
                 .await
                 .map_err(|e| map_io("stat", &from, e))?;
             if meta.is_dir() {
-                copy_dir_recursive(&from, &to).await?;
+                copy_dir_recursive(&from, &to, &ctx.policy).await?;
                 tokio::fs::remove_dir_all(&from)
                     .await
                     .map_err(|e| map_io("remove source dir", &from, e))?;
@@ -494,11 +497,12 @@ impl Tool for CopyPath {
         let a = Args::new(&args)?;
         let from = ctx.resolve_path(a.str("from")?)?;
         let to = ctx.resolve_path(a.str("to")?)?;
+        validate_tree(&ctx.policy, &from)?;
         let meta = tokio::fs::symlink_metadata(&from)
             .await
             .map_err(|e| map_io("stat", &from, e))?;
         let bytes = if meta.is_dir() {
-            copy_dir_recursive(&from, &to).await?
+            copy_dir_recursive(&from, &to, &ctx.policy).await?
         } else {
             tokio::fs::copy(&from, &to)
                 .await
@@ -558,6 +562,7 @@ impl Tool for SearchContent {
         let max_results = a.u64_or("maxResults", 500)? as usize;
         let max_output = ctx.policy.max_output_bytes();
         let cancel = ctx.cancel.clone();
+        let policy = ctx.policy.clone();
 
         let re = regex::RegexBuilder::new(&pattern)
             .case_insensitive(ignore_case)
@@ -591,6 +596,9 @@ impl Tool for SearchContent {
                     Err(_) => continue,
                 };
                 if !entry.file_type().is_file() {
+                    continue;
+                }
+                if policy.check_path(entry.path(), Path::new("/")).is_err() {
                     continue;
                 }
                 if let Some(m) = &matcher {
@@ -690,6 +698,7 @@ impl Tool for GlobFiles {
         let pattern = a.str("pattern")?.to_string();
         let max_results = a.u64_or("maxResults", 2000)? as usize;
         let cancel = ctx.cancel.clone();
+        let policy = ctx.policy.clone();
 
         let matcher = globset::Glob::new(&pattern)
             .map_err(|e| ToolError::InvalidArguments(format!("invalid glob: {e}")))?
@@ -703,6 +712,9 @@ impl Tool for GlobFiles {
                     return Err(ToolError::Cancelled);
                 }
                 let Ok(entry) = entry else { continue };
+                if policy.check_path(entry.path(), Path::new("/")).is_err() {
+                    continue;
+                }
                 let rel = entry.path().strip_prefix(&root).unwrap_or(entry.path());
                 if matcher.is_match(rel) || matcher.is_match(entry.path()) {
                     paths.push(entry.path().display().to_string());
@@ -763,6 +775,7 @@ impl Tool for DirectoryTree {
         let max_depth = a.u64_or("maxDepth", 4)? as usize;
         let max_entries = a.u64_or("maxEntries", 5000)? as usize;
         let cancel = ctx.cancel.clone();
+        let policy = ctx.policy.clone();
 
         let result = tokio::task::spawn_blocking(move || {
             #[derive(Serialize)]
@@ -783,6 +796,9 @@ impl Tool for DirectoryTree {
                     return Err(ToolError::Cancelled);
                 }
                 let Ok(entry) = entry else { continue };
+                if policy.check_path(entry.path(), Path::new("/")).is_err() {
+                    continue;
+                }
                 let ft = entry.file_type();
                 let kind = if ft.is_dir() {
                     "dir"
@@ -1035,12 +1051,24 @@ fn map_io(op: &str, path: &Path, e: std::io::Error) -> ToolError {
     ToolError::Io(format!("failed to {op} '{}': {e}", path.display()))
 }
 
+/// Reject an operation that would move, copy, or delete any denied entry.
+fn validate_tree(policy: &nebula_mcp_core::security::EffectivePolicy, root: &Path) -> Result<()> {
+    for entry in walkdir::WalkDir::new(root).follow_links(false) {
+        let entry = entry.map_err(|e| ToolError::Io(format!("walking {}: {e}", root.display())))?;
+        policy.check_path(entry.path(), Path::new("/"))?;
+    }
+    Ok(())
+}
+
 /// Recursively copy a directory tree, returning the total bytes copied.
 fn copy_dir_recursive<'a>(
     from: &'a Path,
     to: &'a Path,
+    policy: &'a nebula_mcp_core::security::EffectivePolicy,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send + 'a>> {
     Box::pin(async move {
+        policy.check_path(from, Path::new("/"))?;
+        policy.check_path(to, Path::new("/"))?;
         tokio::fs::create_dir_all(to)
             .await
             .map_err(|e| map_io("create dir", to, e))?;
@@ -1059,8 +1087,10 @@ fn copy_dir_recursive<'a>(
                 .map_err(|e| map_io("stat", from, e))?;
             let src = entry.path();
             let dst = to.join(entry.file_name());
+            policy.check_path(&src, Path::new("/"))?;
+            policy.check_path(&dst, Path::new("/"))?;
             if ft.is_dir() {
-                total += copy_dir_recursive(&src, &dst).await?;
+                total += copy_dir_recursive(&src, &dst, policy).await?;
             } else {
                 total += tokio::fs::copy(&src, &dst)
                     .await
@@ -1081,6 +1111,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     fn ctx_for(dir: &Path, destructive: bool) -> ToolContext {
+        let dir = std::fs::canonicalize(dir).unwrap();
         let base = SecurityConfig {
             allowed_paths: vec![format!("{}/**", dir.display()), dir.display().to_string()],
             allow_destructive: destructive,
@@ -1092,7 +1123,7 @@ mod tests {
         let policy = EffectivePolicy::build("fs", &base, None).unwrap();
         ToolContext {
             policy: Arc::new(policy),
-            working_dir: dir.to_path_buf(),
+            working_dir: dir,
             cancel: CancellationToken::new(),
             metrics: Metrics::new(),
             config: Arc::new(Default::default()),

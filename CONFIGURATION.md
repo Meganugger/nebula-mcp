@@ -64,7 +64,7 @@ The global baseline every tool inherits. See [SECURITY.md](SECURITY.md).
 | `max_runtime_secs` | int | `3600` | Hard ceiling for any call. |
 | `max_output_bytes` | int | `8388608` | Max captured output per stream. |
 | `allow_elevated` | bool | `false` | Permit elevated/admin execution. |
-| `allow_network` | bool | `true` | Permit off-box network access. |
+| `allow_network` | bool | `false` | Permit off-box network access. |
 | `allow_destructive` | bool | `false` | Permit destructive operations. |
 
 Globs use `**` to span path separators. On Windows, use escaped backslashes in

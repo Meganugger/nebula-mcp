@@ -20,6 +20,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
 use tokio::sync::Notify;
 
+use super::exec::kill_process_tree;
+
 /// A bounded output buffer shared between reader tasks and readers.
 struct OutputBuffer {
     data: Mutex<VecDeque<u8>>,
@@ -117,6 +119,46 @@ impl SessionManager {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        cmd.env_clear();
+        for key in [
+            "PATH",
+            "SystemRoot",
+            "SYSTEMROOT",
+            "WINDIR",
+            "TEMP",
+            "TMP",
+            "TMPDIR",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "LC_MESSAGES",
+        ] {
+            if let Ok(value) = std::env::var(key) {
+                cmd.env(key, value);
+            }
+        }
+        for (k, _) in env {
+            let upper = k.to_ascii_uppercase();
+            if [
+                "TOKEN",
+                "PASSWORD",
+                "PASS",
+                "SECRET",
+                "PRIVATE_KEY",
+                "API_KEY",
+                "CREDENTIAL",
+                "AWS_",
+                "GITHUB_",
+                "GH_",
+            ]
+            .iter()
+            .any(|needle| upper.contains(needle))
+            {
+                return Err(ToolError::PermissionDenied(format!(
+                    "environment variable '{k}' is not permitted for child processes"
+                )));
+            }
+        }
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -164,7 +206,7 @@ impl SessionManager {
         stdin
             .flush()
             .await
-            .map_err(|e| ToolError::Io(format!("flushing session stdin: {e}")))?;
+            .map_err(|e| ToolError::Io(format!("flushing to session stdin: {e}")))?;
         Ok(())
     }
 
@@ -196,6 +238,9 @@ impl SessionManager {
         // Drop stdin to signal EOF, then kill.
         session.stdin.lock().await.take();
         let mut child = session.child.lock();
+        if let Some(pid) = child.id() {
+            kill_process_tree(pid);
+        }
         let _ = child.start_kill();
         Ok(())
     }
@@ -249,14 +294,26 @@ mod tests {
 
     #[tokio::test]
     async fn open_write_read_close_shell() {
-        if which::which("sh").is_err() {
-            return;
-        }
+        let (program, args, input) = if cfg!(windows) {
+            if which::which("cmd").is_err() {
+                return;
+            }
+            (
+                "cmd",
+                vec!["/Q".to_string(), "/K".to_string()],
+                b"echo session-hello\r\n".as_slice(),
+            )
+        } else {
+            if which::which("sh").is_err() {
+                return;
+            }
+            ("sh", Vec::new(), b"echo session-hello\n".as_slice())
+        };
         let mgr = SessionManager::new();
         let id = mgr
-            .open("sh", &[], std::env::temp_dir(), &[], 65536)
+            .open(program, &args, std::env::temp_dir(), &[], 65536)
             .unwrap();
-        mgr.write(&id, b"echo session-hello\n").await.unwrap();
+        mgr.write(&id, input).await.unwrap();
         // Give the shell a moment and read.
         let (out, _dropped) = mgr.read(&id, 500).await.unwrap();
         // Read again in case output arrived after the first drain.

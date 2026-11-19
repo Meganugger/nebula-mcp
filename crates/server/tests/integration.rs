@@ -12,8 +12,18 @@ use tokio_util::sync::CancellationToken;
 /// Build a server with a permissive-but-bounded policy for tests.
 fn make_server(cancel: CancellationToken) -> Arc<Server> {
     let mut config = Config::default();
-    config.security.allowed_paths = vec!["/tmp/**".into(), "/tmp".into()];
-    config.security.allowed_commands = vec!["echo".into(), "sleep".into()];
+    let temp_root = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string();
+    config.security.allowed_paths = vec![format!("{temp_root}/**"), temp_root];
+    config.security.allowed_commands = if cfg!(windows) {
+        vec!["cmd".into(), "sleep".into()]
+    } else {
+        vec!["echo".into(), "sleep".into()]
+    };
     config.security.default_timeout_secs = 30;
     config.security.max_runtime_secs = 60;
     config.logging.level = "error".into();
@@ -23,6 +33,14 @@ fn make_server(cancel: CancellationToken) -> Arc<Server> {
     // Install a no-op log control so logging/setLevel is exercisable in tests.
     server.set_log_control(std::sync::Arc::new(|_level: &str| Ok(())));
     server
+}
+
+fn echo_arguments(text: &str) -> Value {
+    if cfg!(windows) {
+        serde_json::json!({"program": "cmd", "args": ["/C", "echo", text]})
+    } else {
+        serde_json::json!({"program": "echo", "args": [text]})
+    }
 }
 
 /// Feed newline-delimited requests through the server and collect responses.
@@ -59,7 +77,7 @@ async fn full_protocol_round_trip() {
         line(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"it","version":"1"}}})),
         line(serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"})),
         line(serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}})),
-        line(serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"terminal.run","arguments":{"program":"echo","args":["integration"]}}})),
+        line(serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"terminal.run","arguments": echo_arguments("integration")}})),
         line(serde_json::json!({"jsonrpc":"2.0","id":4,"method":"ping"})),
     ]
     .concat();
@@ -145,7 +163,7 @@ async fn concurrent_calls_all_answered() {
     for i in 0..25 {
         lines.push(line(serde_json::json!({
             "jsonrpc":"2.0","id": i,"method":"tools/call",
-            "params":{"name":"terminal.run","arguments":{"program":"echo","args":[format!("n{i}")]}}
+            "params":{"name":"terminal.run","arguments": echo_arguments(&format!("n{i}"))}
         })));
     }
     let responses = round_trip(server, lines.concat()).await;
@@ -158,7 +176,7 @@ async fn concurrent_calls_all_answered() {
 
 #[tokio::test]
 async fn progress_notifications_are_emitted() {
-    if which::which("echo").is_err() {
+    if which::which(if cfg!(windows) { "cmd" } else { "echo" }).is_err() {
         return;
     }
     let server = make_server(CancellationToken::new());
@@ -167,7 +185,7 @@ async fn progress_notifications_are_emitted() {
         "jsonrpc":"2.0","id":1,"method":"tools/call",
         "params":{
             "name":"terminal.run",
-            "arguments":{"program":"echo","args":["progress"]},
+            "arguments": echo_arguments("progress"),
             "_meta":{"progressToken":"tok-42"}
         }
     }));
@@ -194,7 +212,7 @@ async fn resources_list_and_read() {
     let name = format!("nebula_res_{}.txt", uuid_like());
     let path = std::env::temp_dir().join(&name);
     std::fs::write(&path, "resource-body").unwrap();
-    let uri = format!("file://{}", path.display());
+    let uri = url::Url::from_file_path(&path).unwrap().to_string();
 
     let server = make_server(CancellationToken::new());
     let input = [
@@ -263,7 +281,7 @@ async fn stress_many_concurrent_calls() {
     for i in 0..N {
         lines.push(line(serde_json::json!({
             "jsonrpc":"2.0","id": i,"method":"tools/call",
-            "params":{"name":"terminal.run","arguments":{"program":"echo","args":[format!("s{i}")]}}
+            "params":{"name":"terminal.run","arguments": echo_arguments(&format!("s{i}"))}
         })));
     }
     let responses = tokio::time::timeout(
@@ -292,7 +310,7 @@ async fn resource_subscription_emits_update_on_change() {
     // A file under the workspace root (/tmp) to watch.
     let path = std::env::temp_dir().join(format!("nebula_sub_{}.txt", uuid_like()));
     std::fs::write(&path, "initial").unwrap();
-    let uri = format!("file://{}", path.display());
+    let uri = url::Url::from_file_path(&path).unwrap().to_string();
 
     let server = make_server(CancellationToken::new());
 

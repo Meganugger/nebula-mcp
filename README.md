@@ -12,7 +12,7 @@ Point an AI platform at Nebula MCP — over a local stdio pipe *or a remote URL*
 
 - **110 tools across 13 categories**, all designed for autonomous coding agents.
 - **Two transports.** Local **stdio** for editors (Claude Code, Cursor, Codex, Zed…) and remote **Streamable HTTP** so you can expose a **URL** to a hosted AI platform.
-- **Security-first.** Nothing is permitted by default. Every call is checked against an allowlist-based permission policy (paths, commands, elevation, network, destructive ops) before it runs. No shell interpolation — arguments are passed verbatim.
+- **Security-first.** Nothing is permitted by default. Every call is checked against an allowlist-based permission policy (paths, commands, elevation, network, destructive ops) before it runs. Paths are symlink-aware and denied entries are filtered recursively. No shell interpolation — arguments are passed verbatim.
 - **Robust runtime.** Bounded concurrency, per-call timeouts and a hard runtime ceiling, cooperative cancellation, output caps, structured logging, Prometheus metrics and optional OpenTelemetry.
 - **Fast and small.** Rust + Tokio, four tight crates, no `unsafe` in the protocol layer.
 
@@ -34,7 +34,7 @@ Point an AI platform at Nebula MCP — over a local stdio pipe *or a remote URL*
 | `browser` | 2 | Playwright navigation + screenshot/PDF/trace/console/network capture |
 | `powershell` | 3 | non-interactive, elevated and remote PowerShell *(Windows)* |
 | `windows` | 8 | services, registry, event log, perf counters, scheduled tasks, env, firewall, adapters *(Windows)* |
-| `diagnostics` | 7 | toolchain capabilities, live metrics, config summary, WER, crash dumps, procdump, cdb analyze, ETW *(mostly Windows)* |
+| `diagnostics` | 9 | toolchain capabilities, live metrics, config summary, WER, crash dumps, procdump, cdb analyze, ETW *(mostly Windows)* |
 
 Cross-platform categories work on Linux/macOS/Windows. Windows-only tools compile everywhere but return `platform_unsupported` off Windows. See [TOOLS.md](TOOLS.md) for every tool and argument.
 
@@ -96,7 +96,10 @@ The server now speaks the **MCP Streamable HTTP** transport at `http://127.0.0.1
 curl -s http://127.0.0.1:8765/mcp \
   -H "Authorization: Bearer $NEBULA_MCP_AUTH_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+  -H "Accept: application/json, text/event-stream" \
+  -H "MCP-Protocol-Version: 2026-07-28" \
+  -H "Mcp-Method: tools/list" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}'
 ```
 
 ---
@@ -127,11 +130,11 @@ The agent can now call every allowlisted tool on your machine.
 
 Nebula MCP is **empty-deny by default**:
 
-- A tool may only touch a path matching `allowed_paths` and not matching `denied_paths` (which ships denying `.ssh`, `.aws`, `.gnupg`, `*.pem`, `*.key`, `id_rsa*`, `.env`).
-- A tool may only execute a program named in `allowed_commands` (basename match). Arguments are passed as a verbatim array — **there is no shell**, so no command injection.
+- A tool may only touch a path matching `allowed_paths` and not matching the built-in and configured `denied_paths` (which ships denying `.ssh`, `.aws`, `.gnupg`, `*.pem`, `*.key`, `id_rsa*`, `.env*`). Existing path components are resolved before matching.
+- A tool may only execute a program named in `allowed_commands`; explicit paths must match the resolved executable. Arguments are passed as a verbatim array — **there is no shell**, so no command injection.
 - Per-call **timeouts**, a hard **runtime ceiling**, and **output caps** bound every call.
-- `allow_elevated`, `allow_network` and `allow_destructive` are explicit gates, off by default, scopable per tool.
-- Paths are lexically normalised (`..` contained) before matching. The GitHub token is read from the environment and never echoed.
+- `allow_elevated`, `allow_network` and `allow_destructive` are explicit gates, off by default, scopable per tool. Docker is additionally treated as elevated because its daemon is commonly root-equivalent.
+- Paths are normalised and existing symlink components are resolved before matching. The GitHub token is read from the environment and never echoed.
 
 Every gate can be relaxed globally under `[security]` or, better, scoped per tool under `[tools."<name>"]`. Dry-run any decision with the `security.*` tools before trusting it.
 
@@ -176,7 +179,8 @@ cargo fmt --all --check
 cargo check --workspace --target x86_64-pc-windows-gnu   # type-check Windows tools (needs mingw)
 ```
 
-CI runs the Linux build/test/clippy/fmt suite and a Linux→Windows cross-check on every push.
+CI runs Linux, macOS, and native Windows build/test jobs, a Linux→Windows cross-check,
+an MSRV check for the declared Rust version, and a dependency audit on every push.
 
 ---
 

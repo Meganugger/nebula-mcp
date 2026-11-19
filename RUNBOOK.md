@@ -20,7 +20,7 @@ object.
 ## 1. Scaffold
 
 ```jsonc
-{"name":"fs.mkdir","arguments":{"path":"myapp/src"}}
+{"name":"fs.write","arguments":{"path":"myapp/src/.gitkeep","content":""}}
 {"name":"fs.write","arguments":{"path":"myapp/README.md","content":"# myapp\n"}}
 {"name":"git.branch","arguments":{"mode":"list"}}                  // (in an existing repo)
 ```
@@ -63,15 +63,15 @@ Re-run the build/test calls until they pass.
 ## 4. Verify a running service
 
 ```jsonc
-{"name":"net.http_request","arguments":{"method":"GET","url":"http://127.0.0.1:3000/health"}}
-{"name":"browser.screenshot","arguments":{"url":"http://127.0.0.1:3000","path":"myapp/shot.png"}}
+{"name":"net.http_request","arguments":{"method":"GET","url":"https://service.example/health"}}
+{"name":"browser.screenshot","arguments":{"url":"https://service.example","path":"myapp/shot.png"}}
 {"name":"docker.compose","arguments":{"file":"myapp/compose.yaml","action":"up"}}
 ```
 
 ## 5. Ship
 
 ```jsonc
-{"name":"git.add","arguments":{"paths":["-A"]}}
+{"name":"terminal.run","arguments":{"program":"git","args":["add","-A"]}}
 {"name":"git.commit","arguments":{"message":"feat: initial working build","all":true}}
 {"name":"git.push","arguments":{"remote":"origin","branch":"main","setUpstream":true}}
 {"name":"github.pr_create","arguments":{

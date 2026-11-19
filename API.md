@@ -1,11 +1,11 @@
 # API
 
 The server speaks the [Model Context Protocol](https://modelcontextprotocol.io)
-using JSON-RPC 2.0. It supports protocol revisions **2024-11-05**,
-**2025-03-26**, **2025-06-18** and **2025-11-25** — the revision requested by
-the client in `initialize` is echoed back when supported, otherwise the server
-offers its latest supported revision (2025-11-25). It offers two transports
-that share the same method set below.
+using JSON-RPC 2.0. It supports current revision **2026-07-28** plus the
+legacy revisions **2024-11-05**, **2025-03-26**, **2025-06-18** and
+**2025-11-25**. Current requests select their revision independently in
+`params._meta.io.modelcontextprotocol/protocolVersion`; legacy clients use
+`initialize`. It offers two transports that share the same dispatch engine.
 
 ## Transports
 
@@ -23,30 +23,38 @@ newline.
 
 A single endpoint (default `/mcp`):
 
-- **`POST /mcp`** — body is one JSON-RPC message or an array of them. Requests
-  are answered with `Content-Type: application/json` (a single object, or an
-  array for a batch); a body of only notifications is acknowledged with
-  `202 Accepted`. Responses carry an `Mcp-Session-Id` header.
-- **`GET /mcp`** — opens a `text/event-stream` (SSE) carrying server-initiated
-  notifications (progress, resource updates) plus keep-alives.
+- **`POST /mcp`** — body is one JSON-RPC message or an array of them. Current
+  requests are answered with `Content-Type: application/json` and require
+  matching `MCP-Protocol-Version` and `Mcp-Method` headers. Legacy requests
+  retain a stable `Mcp-Session-Id` header.
+- **`GET /mcp`** — legacy compatibility SSE carrying server-initiated
+  notifications plus keep-alives. Current clients use request-scoped POST
+  responses instead of this endpoint.
 - **`DELETE /mcp`** — ends the session.
 
 Every request must present `Authorization: Bearer <token>` unless auth is
 explicitly disabled on a loopback bind. Malformed JSON yields `400` with a
 JSON-RPC parse-error body; a bad/absent token yields `401`.
 
-Per the Streamable HTTP spec, non-`initialize` requests should carry an
-`MCP-Protocol-Version` header naming the revision negotiated during
-`initialize`. A header naming any other revision yields `400 Bad Request`;
-an absent header is accepted for backwards compatibility with
-pre-2025-06-18 clients.
+Current requests also carry
+`params._meta.io.modelcontextprotocol/protocolVersion`; the HTTP version
+header must match it. Tool calls, resource reads, and prompt gets additionally
+require `Mcp-Name` matching the request target. Unsupported versions and
+header mismatches return structured `400` errors.
 
-The method set, parameters and results below are identical across both
-transports.
+The method set, parameters and results below are shared across both transports,
+but the current revision intentionally removes some legacy lifecycle methods.
 
 ## Methods
 
-### `initialize`
+### `server/discover` (current revision)
+
+Current clients send `_meta.io.modelcontextprotocol/protocolVersion` on every
+request. `server/discover` is the compatibility probe and returns
+`supportedVersions`, current capabilities, server identity, `resultType`,
+`ttlMs`, and `cacheScope`.
+
+### `initialize` (legacy revisions)
 
 Request:
 
@@ -67,7 +75,7 @@ Result (the negotiated `protocolVersion` echoes the request when supported):
     "prompts":{"listChanged":false},
     "logging":{}
   },
-  "serverInfo":{"name":"nebula-mcp","version":"0.1.0"},
+  "serverInfo":{"name":"nebula-mcp","version":"0.2.0"},
   "instructions":"..."}}
 ```
 
@@ -107,9 +115,12 @@ Result (`CallToolResult`):
 Most tools return a single `text` content block containing a JSON document.
 `browser.screenshot` and similar write artifacts to disk and return their paths.
 
-### `ping`
+### `ping` (legacy only)
 
 Request `{"jsonrpc":"2.0","id":4,"method":"ping"}` → result `{}`.
+
+Current-revision clients receive `METHOD_NOT_FOUND`; use `server/discover` as
+the current compatibility probe.
 
 ### `resources/list` and `resources/read`
 
@@ -130,7 +141,7 @@ Result: `{ "contents": [ { "uri", "mimeType", "text" | "blob" } ] }`. Text files
 return `text`; binary files return base64 `blob`. Reads are policy-checked and
 truncated to the configured output cap.
 
-Subscribe to change notifications for a resource:
+Subscribe to change notifications for a resource (legacy only):
 
 ```json
 {"jsonrpc":"2.0","id":6,"method":"resources/subscribe","params":{"uri":"file:///work/build.log"}}
@@ -155,7 +166,7 @@ investigation, PR review, bisect, display-pipeline diagnosis).
 
 `prompts/get` returns `{ "description", "messages":[{"role":"user","content":{"type":"text","text":"…"}}] }`.
 
-### `logging/setLevel`
+### `logging/setLevel` (legacy only)
 
 Adjust the server's log verbosity at runtime (syslog-style levels map onto the
 tracing filter):
@@ -164,7 +175,8 @@ tracing filter):
 {"jsonrpc":"2.0","id":9,"method":"logging/setLevel","params":{"level":"debug"}}
 ```
 
-Result `{}` on success.
+Result `{}` on success. Current-revision clients receive
+`METHOD_NOT_FOUND`; the current protocol replacement is not yet implemented.
 
 ### `notifications/cancelled`
 

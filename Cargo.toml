@@ -8,9 +8,9 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 authors = ["Nebula MCP contributors"]
 repository = "https://github.com/Meganugger/nebula-mcp"
@@ -26,6 +26,7 @@ async-trait = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
+jsonschema = "0.33"
 
 # Errors
 thiserror = "1.0"
@@ -46,13 +47,10 @@ regex = "1.10"
 notify = "6.1"
 notify-debouncer-mini = "0.4"
 which = "6.0"
-shell-words = "1.1"
 uuid = { version = "1.10", features = ["v4", "serde"] }
-time = { version = "0.3", features = ["formatting", "macros"] }
-dirs = "5.0"
+time = { version = "0.3.47", features = ["formatting", "macros"] }
 parking_lot = "0.12"
 dashmap = "6.1"
-num_cpus = "1.16"
 
 # HTTP / network
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }

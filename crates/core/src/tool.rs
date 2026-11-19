@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use crate::config::Config;
 use crate::context::ToolContext;
-use crate::error::Result;
+use crate::error::{Result, ToolError};
 
 /// A single MCP tool.
 ///
@@ -38,6 +38,25 @@ pub trait Tool: Send + Sync {
     /// Optional behavioural annotations.
     fn annotations(&self) -> Option<ToolAnnotations> {
         None
+    }
+
+    /// Validate caller arguments against the schema advertised by this tool.
+    ///
+    /// Keeping this check on the trait makes the dispatcher the only caller
+    /// that needs to remember it; tool implementations cannot accidentally
+    /// expose a schema that is advisory only.
+    fn validate_arguments(&self, args: &Value) -> Result<()> {
+        let schema = self.input_schema();
+        let validator = jsonschema::validator_for(&schema).map_err(|e| {
+            ToolError::Internal(format!("invalid input schema for '{}': {e}", self.name()))
+        })?;
+        if let Some(error) = validator.iter_errors(args).next() {
+            return Err(ToolError::InvalidArguments(format!(
+                "{} (path: {})",
+                error, error.instance_path
+            )));
+        }
+        Ok(())
     }
 
     /// Execute the tool.

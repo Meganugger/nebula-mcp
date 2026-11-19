@@ -22,7 +22,7 @@ use crate::error::ToolError;
 
 /// Root configuration document.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Server identity and handshake metadata.
     pub server: ServerConfig,
@@ -40,7 +40,7 @@ pub struct Config {
 
 /// How the server is exposed to clients.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct TransportConfig {
     /// Remote HTTP (MCP Streamable HTTP) transport. Disabled by default; when
     /// enabled the server listens for JSON-RPC over HTTP so it can be reached
@@ -50,7 +50,7 @@ pub struct TransportConfig {
 
 /// Configuration for the remote HTTP (Streamable HTTP) transport.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct HttpConfig {
     /// Enable the HTTP transport.
     pub enabled: bool,
@@ -97,7 +97,7 @@ impl Default for HttpConfig {
 
 /// Server identity section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
     /// Advertised server name.
     pub name: String,
@@ -131,7 +131,7 @@ impl Default for ServerConfig {
 
 /// Logging / telemetry section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct LoggingConfig {
     /// Verbosity filter (`error`, `warn`, `info`, `debug`, `trace`, or an
     /// `env_logger`-style directive such as `nebula=debug,info`).
@@ -191,7 +191,7 @@ pub enum LogRotation {
 
 /// Global permission baseline. Every tool inherits these unless overridden.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SecurityConfig {
     /// Glob patterns of paths tools may access. Empty means "deny all file
     /// access" — a safe default that forces explicit configuration.
@@ -226,14 +226,17 @@ impl Default for SecurityConfig {
             max_runtime_secs: 3600,
             max_output_bytes: 8 * 1024 * 1024,
             allow_elevated: false,
-            allow_network: true,
+            // Network access is an explicit opt-in. The server's advertised
+            // "nothing is allowed by default" security posture must include
+            // off-box access.
+            allow_network: false,
             allow_destructive: false,
         }
     }
 }
 
 /// Sensitive paths denied by default on every platform.
-fn default_denied_paths() -> Vec<String> {
+pub(crate) fn default_denied_paths() -> Vec<String> {
     vec![
         "**/.ssh/**".to_string(),
         "**/.aws/**".to_string(),
@@ -241,14 +244,15 @@ fn default_denied_paths() -> Vec<String> {
         "**/*.pem".to_string(),
         "**/*.key".to_string(),
         "**/id_rsa*".to_string(),
-        "**/.env".to_string(),
+        "**/id_ed25519*".to_string(),
+        "**/.env*".to_string(),
     ]
 }
 
 /// Optional per-tool override. All fields are optional; unset fields fall back
 /// to the [`SecurityConfig`] baseline.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ToolOverride {
     /// Explicitly enable/disable this tool.
     pub enabled: Option<bool>,
@@ -268,7 +272,7 @@ pub struct ToolOverride {
 
 /// Per-category enable switch. A disabled category disables all of its tools.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct CategoryConfig {
     /// Whether the category is enabled.
     pub enabled: bool,
@@ -390,6 +394,7 @@ mod tests {
         assert!(c.security.allowed_commands.is_empty());
         assert!(!c.security.allow_elevated);
         assert!(!c.security.allow_destructive);
+        assert!(!c.security.allow_network);
     }
 
     #[test]
@@ -423,6 +428,19 @@ mod tests {
         let text = c.to_toml_string().unwrap();
         let back = Config::from_toml_str(&text).unwrap();
         assert_eq!(back.server.name, c.server.name);
+    }
+
+    #[test]
+    fn rejects_unknown_keys_in_security_config() {
+        let err = Config::from_toml_str(
+            r#"
+                [security]
+                allowed_paths = ["/work/**"]
+                allow_netwrok = true
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field"));
     }
 
     #[test]
