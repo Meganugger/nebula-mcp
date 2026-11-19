@@ -62,6 +62,8 @@ single choke point for:
 - `allow_desktop_mutation` — required by interactive desktop input and window
   focus tools. A desktop lease is also required for every mutation. This gate
   does not bypass UIPI, UAC, session isolation, or secure-desktop restrictions.
+  Leases are process-local, owner-bound, expire automatically, and are
+  released when the server exits.
 
 Per-tool overrides let you, for example, enable `git.push` broadly while keeping
 `fs.delete` disabled, or raise `terminal.run`'s timeout without loosening

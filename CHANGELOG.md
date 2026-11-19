@@ -38,6 +38,10 @@ configuration, transport, and execution-policy changes.
   desktop tools for top-level window enumeration, pointer/keyboard input, and
   foreground activation. UI Automation, capture, broker IPC, and service
   packaging remain deferred.
+- Added bounded `desktop.lock_*`, `desktop.displays`, `desktop.cursor`,
+  `desktop.input`, and `desktop.window` tools. Desktop mutations require both
+  policy and an owner-bound expiring lease; deferred subsystems remain
+  explicitly documented rather than reported as complete.
 
 The original 0.1.0 release of Nebula MCP as a standalone,
 **general-purpose** autonomous software-engineering MCP server, extracted from

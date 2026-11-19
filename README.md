@@ -32,7 +32,7 @@ Point an AI platform at Nebula MCP — over a local stdio pipe *or a remote URL*
 | `scheduler` | 5 | deferred and recurring background jobs with captured results |
 | `security` | 3 | dry-run the path/command policy and inspect the effective policy for any tool |
 | `browser` | 2 | Playwright navigation + screenshot/PDF/trace/console/network capture |
-| `desktop` | 8 | Lease-coordinated Windows window enumeration, pointer, keyboard, and focus control |
+| `desktop` | 8 | Lease-coordinated Windows display, cursor, window, pointer, keyboard, and focus control |
 | `powershell` | 3 | non-interactive, elevated and remote PowerShell *(Windows)* |
 | `windows` | 8 | services, registry, event log, perf counters, scheduled tasks, env, firewall, adapters *(Windows)* |
 | `diagnostics` | 9 | toolchain capabilities, live metrics, config summary, WER, crash dumps, procdump, cdb analyze, ETW *(mostly Windows)* |

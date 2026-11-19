@@ -45,3 +45,12 @@ following is the remaining work, ordered by trust impact.
   elevation.
 - OS-level confinement for arbitrary interpreters, shells, Git, and Docker is
   outside the server's typed-tool policy and must be supplied by the operator.
+
+## Universal computer-control implementation status
+
+The first governed desktop slice is now present: explicit deny-first desktop
+mutation policy, process-local leases, bounded input schemas, and Windows
+inspection/input adapters. The lease manager is intentionally not presented as
+cross-process authorization. The next increments are the authenticated
+interactive-session agent and its named-pipe protocol, followed by UI
+Automation/capture and only then a separately scoped privileged broker.
