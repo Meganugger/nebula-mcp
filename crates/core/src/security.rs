@@ -38,6 +38,7 @@ pub struct EffectivePolicy {
     allow_elevated: bool,
     allow_network: bool,
     allow_destructive: bool,
+    allow_desktop_mutation: bool,
 }
 
 impl EffectivePolicy {
@@ -63,6 +64,7 @@ impl EffectivePolicy {
         let mut max_output_bytes = base.max_output_bytes;
         let mut allow_destructive = base.allow_destructive;
         let mut allow_elevated = base.allow_elevated;
+        let mut allow_desktop_mutation = base.allow_desktop_mutation;
 
         if let Some(o) = ov {
             if let Some(extra) = &o.allowed_paths {
@@ -82,6 +84,9 @@ impl EffectivePolicy {
             }
             if let Some(e) = o.allow_elevated {
                 allow_elevated = e;
+            }
+            if let Some(d) = o.allow_desktop_mutation {
+                allow_desktop_mutation = d;
             }
         }
 
@@ -105,6 +110,7 @@ impl EffectivePolicy {
             allow_elevated,
             allow_network: base.allow_network,
             allow_destructive,
+            allow_desktop_mutation,
         })
     }
 
@@ -158,6 +164,23 @@ impl EffectivePolicy {
     #[must_use]
     pub fn allow_elevated(&self) -> bool {
         self.allow_elevated
+    }
+
+    /// Whether interactive desktop mutation is permitted.
+    #[must_use]
+    pub fn allow_desktop_mutation(&self) -> bool {
+        self.allow_desktop_mutation
+    }
+
+    /// Ensure interactive desktop mutation is permitted.
+    pub fn ensure_desktop_mutation_allowed(&self, what: &str) -> Result<(), ToolError> {
+        if self.allow_desktop_mutation {
+            Ok(())
+        } else {
+            Err(ToolError::PermissionDenied(format!(
+                "desktop mutation '{what}' is disabled by policy"
+            )))
+        }
     }
 
     /// The command allowlist (names or explicit executable paths).
@@ -570,6 +593,19 @@ mod tests {
         };
         let p2 = EffectivePolicy::build("docker.rm", &base, Some(&ov)).unwrap();
         assert!(p2.ensure_elevation_allowed().is_ok());
+    }
+
+    #[test]
+    fn desktop_mutation_is_denied_by_default_and_scopable() {
+        let base = SecurityConfig::default();
+        let p = EffectivePolicy::build("desktop.input", &base, None).unwrap();
+        assert!(p.ensure_desktop_mutation_allowed("desktop.input").is_err());
+        let ov = crate::config::ToolOverride {
+            allow_desktop_mutation: Some(true),
+            ..Default::default()
+        };
+        let p2 = EffectivePolicy::build("desktop.input", &base, Some(&ov)).unwrap();
+        assert!(p2.ensure_desktop_mutation_allowed("desktop.input").is_ok());
     }
 
     #[test]

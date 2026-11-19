@@ -60,6 +60,7 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dwm",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_Threading",
 ] }
 # Pure-Rust PNG encoding for Desktop Duplication captures (Windows only).
