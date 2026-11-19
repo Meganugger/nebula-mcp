@@ -36,8 +36,21 @@ No platform-specific success is claimed from these blocked checks.
   Playwright session manager, hardware privacy APIs, installer, and operator
   approval records.
 
-## Next verification
+## CI repair verification
 
-Run the complete workspace checks on a machine with Rust 1.89 or newer, then
-run the Windows integration lane on a disposable interactive Windows account.
+The failing CI jobs were reproduced locally after installing Rust 1.89. The
+failure was the first-step formatting gate: `crates/tools/src/desktop.rs` was
+not rustfmt-clean. After formatting that file, the local verification passed:
+
+| Check | Result |
+| --- | --- |
+| `cargo fmt --all --check` | passed |
+| `cargo check --workspace` | passed |
+| `cargo test --workspace` | passed |
+| `cargo clippy --workspace --all-targets -- -D warnings` | passed |
+| `cargo build --release` | passed |
+| `python3 scripts/check_tools_doc.py` | passed |
+
+The Windows integration lane still requires a disposable interactive Windows
+account; no Windows-only runtime success is claimed from the Linux runner.
 Do not mark the deferred or partial items as implemented without that evidence.
