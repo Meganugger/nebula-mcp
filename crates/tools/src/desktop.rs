@@ -73,7 +73,9 @@ impl DesktopLockManager {
 
     fn reap_expired(&self) {
         let now = Instant::now();
-        self.leases.lock().retain(|_, record| record.expires_at > now);
+        self.leases
+            .lock()
+            .retain(|_, record| record.expires_at > now);
     }
 
     /// Acquire a resource lease, optionally waiting for a bounded period.
@@ -440,7 +442,11 @@ impl Tool for DesktopWindows {
     }
     fn input_schema(&self) -> Value {
         ObjectSchema::new()
-            .boolean("includeHidden", "Include processes without visible windows.", false)
+            .boolean(
+                "includeHidden",
+                "Include processes without visible windows.",
+                false,
+            )
             .string("titleContains", "Case-insensitive title filter.", false)
             .integer("limit", "Maximum rows to return.", false)
             .build()
@@ -656,14 +662,22 @@ impl Tool for DesktopWindow {
     fn input_schema(&self) -> Value {
         ObjectSchema::new()
             .string("lockId", "Desktop or window lease.", true)
-            .string("windowId", "Native window handle returned by desktop.windows.", true)
+            .string(
+                "windowId",
+                "Native window handle returned by desktop.windows.",
+                true,
+            )
             .enumerated(
                 "action",
                 "Window mutation.",
                 &["focus", "minimize", "maximize", "restore", "close"],
                 true,
             )
-            .boolean("force", "Reserved for explicitly destructive close behavior.", false)
+            .boolean(
+                "force",
+                "Reserved for explicitly destructive close behavior.",
+                false,
+            )
             .build()
     }
     fn annotations(&self) -> Option<ToolAnnotations> {
@@ -680,7 +694,8 @@ impl Tool for DesktopWindow {
         let action = a.str("action")?;
         let force = a.bool_or("force", false)?;
         if force {
-            ctx.policy.ensure_destructive_allowed("desktop.window force")?;
+            ctx.policy
+                .ensure_destructive_allowed("desktop.window force")?;
         }
         let handle = window_id.trim_start_matches("0x").trim_start_matches("0X");
         if !handle.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -759,7 +774,10 @@ mod tests {
             Err(ToolError::PermissionDenied(_))
         ));
         locks.release("one", &first.lock_id).unwrap();
-        assert!(locks.acquire("two", "desktop", 500, 0, "test").await.is_ok());
+        assert!(locks
+            .acquire("two", "desktop", 500, 0, "test")
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
