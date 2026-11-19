@@ -1,6 +1,6 @@
 # Nebula MCP — Tool Reference
 
-Auto-generated from `nebula-mcp list-tools`. **126 tools across 14 categories.**
+Auto-generated from `nebula-mcp list-tools`. **118 tools across 14 categories.**
 
 Cross-platform categories work on Linux, macOS and Windows. Categories marked *(Windows)* compile everywhere but return `platform_unsupported` when the host is not Windows. Every call is subject to the permission policy described in [SECURITY.md](SECURITY.md).
 
