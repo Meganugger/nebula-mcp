@@ -629,6 +629,11 @@ foreach($a in $actions) {{
 "#
         );
         let result = run_powershell(ctx, POWERSHELL, &script, None).await?;
+        if !result.success() && result.stderr.to_ascii_lowercase().contains("uipi") {
+            return Err(ToolError::UipiBlocked(
+                "Windows rejected injected input at the integrity boundary".into(),
+            ));
+        }
         Ok(exec_result("desktop input", &result))
     }
 }
@@ -683,35 +688,51 @@ impl Tool for DesktopWindow {
                 "windowId must be a hexadecimal native handle".into(),
             ));
         }
-        let verb = match action {
-            "focus" => "SetForegroundWindow",
-            "minimize" => "ShowWindow -WindowStyle Minimized",
-            "maximize" => "ShowWindow -WindowStyle Maximized",
-            "restore" => "ShowWindow -WindowStyle Normal",
-            "close" if force => "Stop-Process",
-            "close" => "CloseMainWindow",
+        match action {
+            "focus" | "minimize" | "maximize" | "restore" | "close" => {}
             other => {
                 return Err(ToolError::InvalidArguments(format!(
                     "unsupported window action '{other}'"
                 )))
             }
-        };
+        }
         // The handle is numeric and validated above. The command is fixed;
         // close without force is intentionally a graceful process close.
         let script = format!(
-            "$p=Get-Process | Where-Object {{$_.MainWindowHandle.ToString('X') -eq '{handle}'}} | \
+            r#"
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class NebulaWindow {{
+  [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int command);
+  public static bool Focus(IntPtr h) {{ return SetForegroundWindow(h); }}
+  public static bool Show(IntPtr h, int command) {{ return ShowWindow(h, command); }}
+}}
+'@
+$p=Get-Process | Where-Object {{$_.MainWindowHandle.ToString('X') -eq '{handle}'}} | \
              Select-Object -First 1; \
              if($null -eq $p){{throw 'stale window handle'}}; \
              $before=$p.MainWindowTitle; \
-             if('{verb}' -eq 'CloseMainWindow'){{$p.CloseMainWindow()|Out-Null}} \
-             elseif('{verb}' -eq 'Stop-Process'){{$p|Stop-Process -Force}} \
-             else{{[void]$p}}; \
-             [pscustomobject]@{{windowId='{handle}';action='{action}';title=$before;completed=$true}} | ConvertTo-Json -Compress"
+             $h=$p.MainWindowHandle; \
+             if('{action}' -eq 'focus'){{if(![NebulaWindow]::Focus($h)){{throw 'uipi_blocked'}}}} \
+             elseif('{action}' -eq 'minimize'){{[void][NebulaWindow]::Show($h,6)}} \
+             elseif('{action}' -eq 'maximize'){{[void][NebulaWindow]::Show($h,3)}} \
+             elseif('{action}' -eq 'restore'){{[void][NebulaWindow]::Show($h,9)}} \
+             elseif('{action}' -eq 'close' -and {force}){{Stop-Process -Id $p.Id -Force}} \
+             elseif('{action}' -eq 'close'){{$p.CloseMainWindow()|Out-Null}}; \
+             [pscustomobject]@{{windowId='0x{handle}';action='{action}';title=$before;completed=$true}} | ConvertTo-Json -Compress
+"#
         );
         let result = run_powershell(ctx, POWERSHELL, &script, None).await?;
         if !result.success() && result.stderr.to_ascii_lowercase().contains("stale") {
             return Err(ToolError::StaleHandle(format!(
                 "window handle '{window_id}' is no longer valid"
+            )));
+        }
+        if !result.success() && result.stderr.to_ascii_lowercase().contains("uipi") {
+            return Err(ToolError::UipiBlocked(format!(
+                "Windows rejected operation '{action}' for '{window_id}'"
             )));
         }
         Ok(exec_result("desktop window", &result))

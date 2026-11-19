@@ -76,6 +76,11 @@ pub enum ToolError {
     /// A previously observed native handle is no longer valid.
     #[error("stale handle: {0}")]
     StaleHandle(String),
+
+    /// Windows rejected an input or foreground operation at the integrity
+    /// boundary.
+    #[error("UIPI blocked the desktop operation: {0}")]
+    UipiBlocked(String),
 }
 
 impl ToolError {
@@ -94,7 +99,8 @@ impl ToolError {
             | ToolError::Io(_)
             | ToolError::Execution(_)
             | ToolError::ResourceBusy(_)
-            | ToolError::StaleHandle(_) => error_codes::TOOL_EXECUTION_ERROR,
+            | ToolError::StaleHandle(_)
+            | ToolError::UipiBlocked(_) => error_codes::TOOL_EXECUTION_ERROR,
             ToolError::Internal(_) => error_codes::INTERNAL_ERROR,
         }
     }
@@ -116,6 +122,7 @@ impl ToolError {
             ToolError::Execution(_) => "execution",
             ToolError::ResourceBusy(_) => "resource_busy",
             ToolError::StaleHandle(_) => "stale_handle",
+            ToolError::UipiBlocked(_) => "uipi_blocked",
             ToolError::Internal(_) => "internal",
         }
     }
