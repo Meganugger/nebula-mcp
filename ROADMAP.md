@@ -28,6 +28,11 @@ following is the remaining work, ordered by trust impact.
 
 - Expand native Windows cleanup tests and add macOS-specific process and
   filesystem coverage.
+- Add Windows UI Automation, monitor-aware DPI coordinate conversion, desktop
+  capture, and a separately scoped privileged broker only after their trust
+  boundaries and native test coverage are in place.
+- Add interactive desktop-agent process separation, installer/service artifacts,
+  and operator approval records for sensitive desktop workflows.
 - Add signed release binaries and packaging only after the trust and CI
   guarantees above remain green.
 
