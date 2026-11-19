@@ -98,9 +98,10 @@ impl DesktopLockManager {
             self.reap_expired();
             {
                 let mut leases = self.leases.lock();
-                if !leases.values().any(|record| {
-                    record.lease.resource == resource && record.lease.owner != owner
-                }) {
+                if !leases
+                    .values()
+                    .any(|record| record.lease.resource == resource)
+                {
                     let lock_id = Uuid::new_v4().to_string();
                     let expires_at = Instant::now() + Duration::from_millis(lease_ms);
                     let unix_ms = SystemTime::now()
@@ -487,6 +488,11 @@ impl Tool for DesktopInput {
     fn input_schema(&self) -> Value {
         ObjectSchema::new()
             .string("lockId", "Desktop or display lease.", true)
+            .string(
+                "displayId",
+                "Optional display id; when present the matching display lease is required.",
+                false,
+            )
             .prop(
                 "actions",
                 json!({
@@ -520,8 +526,12 @@ impl Tool for DesktopInput {
         ensure_windows(self.name())?;
         ctx.policy.ensure_desktop_mutation_allowed(self.name())?;
         let a = Args::new(&args)?;
+        let resource = a
+            .opt_str("displayId")?
+            .map(|id| format!("display:{id}"))
+            .unwrap_or_else(|| "desktop".to_string());
         self.locks
-            .require(&ctx.request_id, a.str("lockId")?, "desktop")?;
+            .require(&ctx.request_id, a.str("lockId")?, &resource)?;
         let actions = a
             .opt_value("actions")
             .and_then(Value::as_array)
