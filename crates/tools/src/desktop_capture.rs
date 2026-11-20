@@ -212,7 +212,11 @@ impl Tool for DesktopScreenshot {
             .string("windowId", "Hexadecimal native window handle.", false)
             .enumerated("format", "Image format.", &["png", "jpeg", "webp"], false)
             .integer("quality", "Lossy image quality from 1 to 100.", false)
-            .boolean("includeCursor", "Draw the cursor and return its position.", false)
+            .boolean(
+                "includeCursor",
+                "Draw the cursor and return its position.",
+                false,
+            )
             .prop(
                 "scale",
                 json!({"type": "number", "minimum": 0.1, "maximum": 2.0}),
@@ -220,7 +224,11 @@ impl Tool for DesktopScreenshot {
             )
             .integer("maxBytes", "Maximum encoded output size.", false)
             .enumerated("output", "Return mode.", &["inline", "file"], false)
-            .string("outputPath", "Policy-checked destination when output=file.", false)
+            .string(
+                "outputPath",
+                "Policy-checked destination when output=file.",
+                false,
+            )
             .build()
     }
 
@@ -302,10 +310,7 @@ impl Tool for DesktopScreenshot {
             _ => None,
         };
 
-        let capture_path = ctx.resolve_path(&format!(
-            ".nebula-capture-{}.png",
-            Uuid::new_v4()
-        ))?;
+        let capture_path = ctx.resolve_path(&format!(".nebula-capture-{}.png", Uuid::new_v4()))?;
         if let Some(parent) = capture_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -316,11 +321,14 @@ impl Tool for DesktopScreenshot {
             "includeCursor": a.bool_or("includeCursor", false)?,
             "outputPath": capture_path.display().to_string(),
         });
-        let encoded_config = base64::engine::general_purpose::STANDARD
-            .encode(serde_json::to_vec(&config)?);
+        let encoded_config =
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&config)?);
         let script = POWERSHELL_CAPTURE.replace("__CONFIG__", &encoded_config);
         let result = ctx
-            .guarded(ctx.timeout(None), run_powershell(ctx, POWERSHELL, &script, None))
+            .guarded(
+                ctx.timeout(None),
+                run_powershell(ctx, POWERSHELL, &script, None),
+            )
             .await;
         let result = match result {
             Ok(result) => result,
@@ -343,14 +351,12 @@ impl Tool for DesktopScreenshot {
                 "desktop screenshot failed: {detail}"
             )));
         }
-        let meta: CaptureMeta = serde_json::from_str(result.stdout.trim()).map_err(|e| {
-            ToolError::Execution(format!("invalid screenshot metadata: {e}"))
-        })?;
+        let meta: CaptureMeta = serde_json::from_str(result.stdout.trim())
+            .map_err(|e| ToolError::Execution(format!("invalid screenshot metadata: {e}")))?;
         let raw = tokio::fs::read(&capture_path).await?;
         let _ = tokio::fs::remove_file(&capture_path).await;
         ctx.ensure_active()?;
-        let (encoded, width, height, mut warnings) =
-            encode_image(&raw, scale, format, quality)?;
+        let (encoded, width, height, mut warnings) = encode_image(&raw, scale, format, quality)?;
         if encoded.len() as u64 > max_bytes {
             return Err(ToolError::OutputTooLarge {
                 limit: max_bytes as usize,
@@ -412,10 +418,8 @@ fn encode_image(
     match format {
         "jpeg" => {
             let rgb = image.to_rgb8();
-            let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
-                &mut output,
-                quality as u8,
-            );
+            let encoder =
+                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut output, quality as u8);
             encoder
                 .write_image(
                     rgb.as_raw(),
