@@ -137,6 +137,30 @@ impl DesktopLockManager {
         }
     }
 
+    /// Renew a live lease while preserving its resource and ownership.
+    pub fn renew(&self, owner: &str, lock_id: &str, lease_ms: u64) -> Result<DesktopLease> {
+        self.reap_expired();
+        let lease_ms = lease_ms.clamp(100, MAX_LEASE_MS);
+        let mut leases = self.leases.lock();
+        let Some(record) = leases.get_mut(lock_id) else {
+            return Err(ToolError::StaleHandle(format!(
+                "desktop lock '{lock_id}' is missing or expired"
+            )));
+        };
+        if record.lease.owner != owner {
+            return Err(ToolError::PermissionDenied(
+                "desktop lock is owned by another request".to_string(),
+            ));
+        }
+        record.expires_at = Instant::now() + Duration::from_millis(lease_ms);
+        record.lease.expires_at_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            + u128::from(lease_ms);
+        Ok(record.lease.clone())
+    }
+
     /// Release a lease.  Only its owner may release it.
     pub fn release(&self, owner: &str, lock_id: &str) -> Result<DesktopLease> {
         self.reap_expired();
@@ -207,6 +231,9 @@ impl DesktopLockManager {
 pub fn tools(services: &ToolServices) -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(DesktopLockAcquire {
+            locks: services.desktop_locks.clone(),
+        }),
+        Arc::new(DesktopLockRenew {
             locks: services.desktop_locks.clone(),
         }),
         Arc::new(DesktopLockRelease {
@@ -285,6 +312,51 @@ impl Tool for DesktopLockAcquire {
             "lockId": lease.lock_id,
             "resource": lease.resource,
             "owner": lease.owner,
+            "expiresAtUnixMs": lease.expires_at_unix_ms,
+            "renewalRequired": true,
+        })))
+    }
+}
+
+struct DesktopLockRenew {
+    locks: Arc<DesktopLockManager>,
+}
+
+#[async_trait]
+impl Tool for DesktopLockRenew {
+    fn name(&self) -> &str {
+        "desktop.lock_renew"
+    }
+    fn category(&self) -> &str {
+        CATEGORY
+    }
+    fn description(&self) -> &str {
+        "Renew a live desktop lease owned by the current MCP request."
+    }
+    fn input_schema(&self) -> Value {
+        ObjectSchema::new()
+            .string("lockId", "Opaque lock identifier.", true)
+            .integer(
+                "leaseMs",
+                "New lease duration, capped at five minutes.",
+                false,
+            )
+            .build()
+    }
+    fn annotations(&self) -> Option<ToolAnnotations> {
+        mutation()
+    }
+    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
+        let a = Args::new(&args)?;
+        let lease = self.locks.renew(
+            &ctx.request_id,
+            a.str("lockId")?,
+            a.u64_or("leaseMs", DEFAULT_LEASE_MS)?,
+        )?;
+        Ok(json_value_result(json!({
+            "renewed": true,
+            "lockId": lease.lock_id,
+            "resource": lease.resource,
             "expiresAtUnixMs": lease.expires_at_unix_ms,
             "renewalRequired": true,
         })))
@@ -790,6 +862,38 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(125)).await;
         assert!(matches!(
             locks.require("one", &lock.lock_id, "desktop"),
+            Err(ToolError::StaleHandle(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn live_lock_can_be_renewed_by_owner() {
+        let locks = DesktopLockManager::new();
+        let lock = locks
+            .acquire("one", "desktop", 100, 0, "test")
+            .await
+            .unwrap();
+        let renewed = locks.renew("one", &lock.lock_id, 500).unwrap();
+        assert_eq!(renewed.lock_id, lock.lock_id);
+        assert_eq!(renewed.resource, "desktop");
+        assert!(renewed.expires_at_unix_ms > lock.expires_at_unix_ms);
+        assert!(locks.require("one", &lock.lock_id, "desktop").is_ok());
+    }
+
+    #[tokio::test]
+    async fn renewal_is_owner_bound_and_expired_locks_cannot_be_revived() {
+        let locks = DesktopLockManager::new();
+        let lock = locks
+            .acquire("one", "desktop", 100, 0, "test")
+            .await
+            .unwrap();
+        assert!(matches!(
+            locks.renew("two", &lock.lock_id, 500),
+            Err(ToolError::PermissionDenied(_))
+        ));
+        tokio::time::sleep(Duration::from_millis(125)).await;
+        assert!(matches!(
+            locks.renew("one", &lock.lock_id, 500),
             Err(ToolError::StaleHandle(_))
         ));
     }

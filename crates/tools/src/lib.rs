@@ -14,6 +14,7 @@
 pub mod browser;
 pub mod common;
 pub mod desktop;
+pub mod desktop_capture;
 pub mod diagnostics;
 pub mod docker;
 pub mod filesystem;
@@ -99,5 +100,6 @@ pub fn all_tools(services: &ToolServices) -> Vec<Arc<dyn Tool>> {
     v.extend(scheduler::tools(services));
     v.extend(security::tools());
     v.extend(desktop::tools(services));
+    v.extend(desktop_capture::tools());
     v
 }

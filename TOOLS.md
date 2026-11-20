@@ -1,6 +1,6 @@
 # Nebula MCP — Tool Reference
 
-Auto-generated from `nebula-mcp list-tools`. **118 tools across 14 categories.**
+Auto-generated from `nebula-mcp list-tools`. **120 tools across 14 categories.**
 
 Cross-platform categories work on Linux, macOS and Windows. Categories marked *(Windows)* compile everywhere but return `platform_unsupported` when the host is not Windows. Every call is subject to the permission policy described in [SECURITY.md](SECURITY.md).
 
@@ -12,6 +12,7 @@ Cross-platform categories work on Linux, macOS and Windows. Categories marked *(
 ### `desktop`
 
 - **`desktop.lock_acquire`** — Acquire an exclusive, expiring lease for a desktop resource.
+- **`desktop.lock_renew`** — Renew a live lease owned by the current MCP request.
 - **`desktop.lock_release`** — Release a lease owned by the current MCP request.
 - **`desktop.lock_status`** — List live desktop leases.
 - **`desktop.displays`** — Enumerate Windows display adapters and reported modes.
@@ -19,6 +20,7 @@ Cross-platform categories work on Linux, macOS and Windows. Categories marked *(
 - **`desktop.windows`** — List top-level application windows visible to the interactive user.
 - **`desktop.input`** — Send bounded mouse and keyboard actions through `SendInput`; requires policy and a desktop lease.
 - **`desktop.window`** — Focus, minimize, maximize, restore, or gracefully close a window; force-close is destructive.
+- **`desktop.screenshot`** — Capture an interactive Windows display or window with bounded PNG, JPEG, or WebP output.
 
 Desktop mutation requires both `security.allow_desktop_mutation = true` (or a
 scoped tool override) and a live `desktop.lock_acquire` lease. These tools are
