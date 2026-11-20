@@ -15,12 +15,12 @@ Cross-platform categories work on Linux, macOS and Windows. Categories marked *(
 - **`desktop.lock_renew`** — Renew a live lease owned by the current MCP request.
 - **`desktop.lock_release`** — Release a lease owned by the current MCP request.
 - **`desktop.lock_status`** — List live desktop leases.
-- **`desktop.screenshot`** — Capture an interactive Windows display or window with bounded PNG, JPEG, or WebP output.
 - **`desktop.displays`** — Enumerate Windows display adapters and reported modes.
 - **`desktop.cursor`** — Read the physical-screen cursor position.
 - **`desktop.windows`** — List top-level application windows visible to the interactive user.
 - **`desktop.input`** — Send bounded mouse and keyboard actions through `SendInput`; requires policy and a desktop lease.
 - **`desktop.window`** — Focus, minimize, maximize, restore, or gracefully close a window; force-close is destructive.
+- **`desktop.screenshot`** — Capture an interactive Windows display or window with bounded PNG, JPEG, or WebP output.
 
 Desktop mutation requires both `security.allow_desktop_mutation = true` (or a
 scoped tool override) and a live `desktop.lock_acquire` lease. These tools are
