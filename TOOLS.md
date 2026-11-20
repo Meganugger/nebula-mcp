@@ -1,6 +1,6 @@
 # Nebula MCP — Tool Reference
 
-Auto-generated from `nebula-mcp list-tools`. **118 tools across 14 categories.**
+Auto-generated from `nebula-mcp list-tools`. **119 tools across 14 categories.**
 
 Cross-platform categories work on Linux, macOS and Windows. Categories marked *(Windows)* compile everywhere but return `platform_unsupported` when the host is not Windows. Every call is subject to the permission policy described in [SECURITY.md](SECURITY.md).
 
@@ -12,6 +12,7 @@ Cross-platform categories work on Linux, macOS and Windows. Categories marked *(
 ### `desktop`
 
 - **`desktop.lock_acquire`** — Acquire an exclusive, expiring lease for a desktop resource.
+- **`desktop.lock_renew`** — Renew a live lease owned by the current MCP request.
 - **`desktop.lock_release`** — Release a lease owned by the current MCP request.
 - **`desktop.lock_status`** — List live desktop leases.
 - **`desktop.displays`** — Enumerate Windows display adapters and reported modes.
