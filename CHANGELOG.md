@@ -44,6 +44,9 @@ configuration, transport, and execution-policy changes.
   explicitly documented rather than reported as complete.
 - Added `desktop.lock_renew` so long-running interactive workflows can extend
   a live owner-bound lease without releasing and reacquiring the resource.
+- Added bounded `desktop.screenshot` capture for displays and windows with
+  inline or policy-checked file output, PNG/JPEG/WebP encoding, cursor
+  metadata, SHA-256 integrity, cancellation, and explicit GDI limitations.
 
 The original 0.1.0 release of Nebula MCP as a standalone,
 **general-purpose** autonomous software-engineering MCP server, extracted from

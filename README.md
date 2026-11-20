@@ -10,7 +10,7 @@ Point an AI platform at Nebula MCP — over a local stdio pipe *or a remote URL*
 
 ## Why Nebula MCP
 
-- **119 tools across 14 categories**, all designed for autonomous coding agents.
+- **120 tools across 14 categories**, all designed for autonomous coding agents.
 - **Two transports.** Local **stdio** for editors (Claude Code, Cursor, Codex, Zed…) and remote **Streamable HTTP** so you can expose a **URL** to a hosted AI platform.
 - **Security-first.** Nothing is permitted by default. Every call is checked against an allowlist-based permission policy (paths, commands, elevation, network, destructive ops) before it runs. Paths are symlink-aware and denied entries are filtered recursively. No shell interpolation — arguments are passed verbatim.
 - **Robust runtime.** Bounded concurrency, per-call timeouts and a hard runtime ceiling, cooperative cancellation, output caps, structured logging, Prometheus metrics and optional OpenTelemetry.
@@ -164,7 +164,7 @@ Four crates:
 | --- | --- |
 | `nebula-mcp-protocol` | JSON-RPC 2.0 + MCP types + stdio framing (no `unsafe`) |
 | `nebula-mcp-core` | TOML config + hot reload, permission engine, telemetry/metrics, the `Tool` trait + registry + per-call context |
-| `nebula-mcp-tools` | all 119 tool implementations, grouped by category |
+| `nebula-mcp-tools` | all 120 tool implementations, grouped by category |
 | `nebula-mcp-server` | dispatch engine + **stdio and HTTP transports** + `nebula-mcp` CLI |
 
 See [ARCHITECTURE.md](ARCHITECTURE.md).
